@@ -1474,6 +1474,10 @@ def _log_green(message: str) -> None:
     print(f"\033[92m{message}\033[0m", flush=True)
 
 
+def _log_dark_green(message: str) -> None:
+    print(f"\033[32m{message}\033[0m", flush=True)
+
+
 def _log_field_list(title: str, fields: list[str] | tuple[str, ...]) -> None:
     _log(f"{title}: {len(fields)} 个")
     if not fields:
@@ -1530,7 +1534,10 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
                 try:
                     batch_result = _translate_ai_batch(batch, cfg, strategy, batch_index, len(batches))
                 except Exception as exc:
-                    _log(f"[翻译] AI batch={batch_index}/{len(batches)} 失败，将本批回落到 {cfg.translate_provider}: {exc}")
+                    _log_dark_green(
+                        f"[翻译] AI batch={batch_index}/{len(batches)} "
+                        f"失败，将本批回落到 {cfg.translate_provider}: {exc}"
+                    )
                     continue
                 finally:
                     wait_stop.set()
