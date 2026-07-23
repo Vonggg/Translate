@@ -213,6 +213,8 @@ workspace/FinalResult/Bundle/catalog.json
 ```
 
 当前默认策略是匹配最终 Bundle 后把对应 catalog 条目的 CRC 置为 `0`。
+回打成功后会自动覆盖源 `game/assets/aa/catalog.json`；所有直接写入游戏源目录的操作均以橙色
+`[源文件已修改]` 日志提示。
 
 ## main.py 菜单说明
 
@@ -385,6 +387,7 @@ game/assets/bin/Data   -> workspace/input_sources/bin/Data
 - 可确定完整 URL 时，自动把本地缺失资源下载到游戏的 `assets/aa/Android`。
 - 全部下载成功后用绿色日志汇总；失败时只用红色日志列出失败项。每项结果记录在 `workspace/resource_state/addressables_remote_resources.json`。
 - 下载文件完整落地后，把 catalog 中对应的远程 URL 改为 `{UnityEngine.AddressableAssets.Addressables.RuntimePath}/Android/...` 本地加载路径。
+- 远程资源下载、catalog 本地化、Managed DLL 自动补齐等直接修改游戏源目录的操作，都会输出橙色 `[源文件已修改]` 提示。
 - 远程条目不是完整 HTTP/HTTPS 下载链接时停止，并写出 `workspace/resource_state/addressables_remote_resources.json`。
 - 强制清空并重建 `workspace/input_sources`。
 - 在暂存区自动合并 `.splitN`，不询问、不修改游戏原目录。

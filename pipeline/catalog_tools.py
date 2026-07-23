@@ -33,6 +33,10 @@ def _log_green(message: str) -> None:
     print(f"\033[92m{message}\033[0m", flush=True)
 
 
+def _log_orange(message: str) -> None:
+    print(f"\033[38;5;208m{message}\033[0m", flush=True)
+
+
 def printable_ascii_runs(data: bytes, min_len: int = 4) -> list[tuple[int, str]]:
     rows: list[tuple[int, str]] = []
     for match in re.finditer(rb"[\x20-\x7e]{%d,}" % min_len, data):
@@ -922,4 +926,6 @@ def auto_patch_and_repack_catalog_after_import(
     final_catalog_path = final_result_root / "Bundle" / "catalog.json"
     repacked_path = repack_expanded_catalog(expanded_path, final_catalog_path)
     _log_green(f"[catalog] 已回打 catalog 并输出到: {repacked_path}")
+    shutil.copy2(repacked_path, cfg.catalog_source_path)
+    _log_orange(f"[源文件已修改] 已用最终 catalog 覆盖源文件: {cfg.catalog_source_path}")
     return repacked_path

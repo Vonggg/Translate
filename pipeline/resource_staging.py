@@ -30,6 +30,10 @@ def _log_red(message: str) -> None:
     print(f"\033[91m{message}\033[0m", flush=True)
 
 
+def _log_orange(message: str) -> None:
+    print(f"\033[38;5;208m{message}\033[0m", flush=True)
+
+
 def resource_state_root(cfg: PipelineConfig) -> Path:
     return cfg.root_dir / "workspace" / "resource_state"
 
@@ -360,6 +364,10 @@ def inspect_and_download_catalog_resources(cfg: PipelineConfig) -> bool:
     _write_json(report_path, report)
     if downloads:
         _log_green(f"[catalog] 远程资源全部下载成功: {len(downloads)} 个。")
+        _log_orange(
+            f"[源文件已修改] 已将 {len(downloads)} 个远程资源写入: "
+            f"{_addressables_android_root(cfg)}"
+        )
     elif remote_internal_ids:
         _log_green(f"[catalog] catalog 中的远程资源已全部存在于本地: {len(remote_internal_ids)} 个。")
     else:
@@ -367,8 +375,8 @@ def inspect_and_download_catalog_resources(cfg: PipelineConfig) -> bool:
     if remote_internal_ids:
         _log_green(f"[catalog] 下载/本地资源保存目录: {_addressables_android_root(cfg)}")
     if localized:
-        _log_green(f"[catalog] 已将 {len(localized)} 个远程 InternalId 改为本地 RuntimePath。")
-        _log_green(f"[catalog] 已更新游戏 catalog: {catalog_path}")
+        _log_orange(f"[源文件已修改] 已将 {len(localized)} 个远程 InternalId 改为本地 RuntimePath。")
+        _log_orange(f"[源文件已修改] 已更新游戏 catalog: {catalog_path}")
         try:
             parse_catalog_to_output(cfg)
         except Exception as exc:

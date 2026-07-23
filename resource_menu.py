@@ -25,6 +25,10 @@ def prompt_input(message: str) -> str:
     return input(f"\033[96m{message}\033[0m")
 
 
+def log_source_modified(message: str) -> None:
+    print(f"\033[38;5;208m[源文件已修改] {message}\033[0m", flush=True)
+
+
 def workspace_root(cfg) -> Path:
     return cfg.root_dir / "workspace"
 
@@ -85,6 +89,7 @@ def prepare_managed_dlls(cfg) -> None:
     print(f"[Managed] Managed 下没有 DLL，已从 DummyDll 自动复制: {copied} 个")
     print(f"[Managed] 来源: {dummy_root}")
     print(f"[Managed] 目标: {managed_root}")
+    log_source_modified(f"已向游戏 Managed 目录写入 {copied} 个 DLL: {managed_root}")
 
 
 class Tee:
