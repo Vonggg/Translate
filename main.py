@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 from support.config import load_config
@@ -24,6 +24,7 @@ from pipeline.translation import (
 
 CONFIG_PATH = Path("config.json")
 SDF_FINALIZE_ARGUMENT = "--finish-sdf"
+RUN_STEP_ARGUMENT = "--run-step"
 UNITY_NATIVE_CRASH_CODES = {0xC0000005, 0xFFFFFFFF}
 UNITY_GENERATOR_ENTRY_MARKER = "[TMP] Generator entry reached"
 
@@ -114,11 +115,56 @@ def _run_sdf_finalize_in_fresh_process(cfg) -> int:
     return 0
 
 
-def _handoff_sdf_finalize_to_fresh_process() -> None:
+def _run_noninteractive_step(cfg, step: str) -> int:
+    if step == "0":
+        return scan_and_record(cfg) or 0
+    if step == "1":
+        return apply_ai_field_selection_to_records(cfg) or 0
+    if step == "2":
+        return translate_from_scan_records(cfg) or 0
+    if step == "4":
+        return export_translated_files(cfg) or 0
+    if step == "5":
+        return disable_translated_text_effect_components(cfg) or 0
+    if step == "6":
+        build_ttf_replacements(cfg)
+        return 0
+    if step == "7":
+        build_merged_tmp_chars(cfg)
+        return 0
+    print(f"[全部执行][停止] 不支持的内部步骤: {step}")
+    return 1
+
+
+def _run_full_pipeline_in_isolated_processes(cfg) -> int:
     script_path = Path(__file__).resolve()
-    print("[TMP] 步骤 0-7 已完成，正在交接到全新进程执行步骤 8 和步骤 9。")
+    steps = ["0"]
+    if cfg.enable_ai_field_review:
+        steps.append("1")
+    steps.extend(["2", "4", "5", "6", "7"])
+
+    for index, step in enumerate(steps, start=1):
+        print(f"[全部执行] 启动独立步骤 {step}（{index}/{len(steps)}）")
+        sys.stdout.flush()
+        result = subprocess.run(
+            [sys.executable, str(script_path), RUN_STEP_ARGUMENT, step],
+            cwd=str(cfg.root_dir),
+        )
+        if result.returncode != 0:
+            print(f"[全部执行][停止] 步骤 {step} 失败，返回码={result.returncode}。")
+            return 1
+
+    print("[全部执行] 步骤 0-7 已完成，启动独立进程执行步骤 8 和步骤 9。")
     sys.stdout.flush()
-    os.execv(sys.executable, [sys.executable, str(script_path), SDF_FINALIZE_ARGUMENT])
+    result = subprocess.run(
+        [sys.executable, str(script_path), SDF_FINALIZE_ARGUMENT],
+        cwd=str(cfg.root_dir),
+    )
+    if result.returncode != 0:
+        print(f"[全部执行][停止] 步骤 8-9 失败，返回码={result.returncode}。")
+        return 1
+    print("[完成] 脚本 10 全部步骤执行结束。")
+    return 0
 
 
 def print_menu() -> None:
@@ -175,6 +221,8 @@ def main() -> int:
     cfg = load_config(CONFIG_PATH)
     if len(sys.argv) > 1 and sys.argv[1] == SDF_FINALIZE_ARGUMENT:
         return _run_sdf_finalize_in_fresh_process(cfg)
+    if len(sys.argv) > 2 and sys.argv[1] == RUN_STEP_ARGUMENT:
+        return _run_noninteractive_step(cfg, sys.argv[2])
 
     print(f"资源输入目录: {cfg.resource_input_root}")
 
@@ -224,16 +272,7 @@ def main() -> int:
             else:
                 print("已取消清空，继续保留现有记录文件。")
                 print()
-            scan_and_record(cfg)
-            if cfg.enable_ai_field_review:
-                apply_ai_field_selection_to_records(cfg)
-            translate_from_scan_records(cfg)
-            export_translated_files(cfg)
-            disable_translated_text_effect_components(cfg)
-            build_ttf_replacements(cfg)
-            build_merged_tmp_chars(cfg)
-            _handoff_sdf_finalize_to_fresh_process()
-            return 1
+            return _run_full_pipeline_in_isolated_processes(cfg)
         if choice in {"q", "quit", "exit"}:
             return 0
 
