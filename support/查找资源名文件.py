@@ -2,30 +2,39 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
+import sys
 from pathlib import Path
 
-from config import load_config
-from image_import_utils import copy_image_for_import
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from support.config import load_config
+from support.image_import_utils import copy_image_for_import
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".webp"}
 
 
-def normalize_path_id(raw: str) -> str:
-    text = raw.strip()
-    if text.lower().startswith("0x"):
-        return str(int(text, 16))
-    return str(int(text))
+def normalize_name(raw: str) -> str:
+    return raw.strip()
 
 
-def iter_manifest_matches(input_root: Path, path_id: str):
+def name_matches(value: str, query: str, exact: bool) -> bool:
+    value_folded = value.casefold()
+    query_folded = query.casefold()
+    if exact:
+        return value_folded == query_folded
+    return query_folded in value_folded
+
+
+def iter_manifest_matches(input_root: Path, query_name: str, exact: bool):
     manifest_paths = sorted(input_root.rglob("manifest.json"))
-    print(f"[查找PathID] manifest 数: {len(manifest_paths)}", flush=True)
+    print(f"[查找资源名] manifest 数: {len(manifest_paths)}", flush=True)
     for index, manifest_path in enumerate(manifest_paths, start=1):
         if index == 1 or index % 20 == 0 or index == len(manifest_paths):
-            print(f"[查找PathID] manifest 进度: {index}/{len(manifest_paths)}", flush=True)
+            print(f"[查找资源名] manifest 进度: {index}/{len(manifest_paths)}", flush=True)
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
         except Exception:
@@ -38,7 +47,8 @@ def iter_manifest_matches(input_root: Path, path_id: str):
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if str(item.get("PathId")) != path_id:
+            asset_name = item.get("AssetName")
+            if not isinstance(asset_name, str) or not name_matches(asset_name, query_name, exact):
                 continue
 
             relative_path = item.get("RelativePath")
@@ -48,17 +58,17 @@ def iter_manifest_matches(input_root: Path, path_id: str):
             yield manifest_path.parent / relative_path
 
 
-def iter_loose_filename_matches(input_root: Path, path_id: str):
-    suffix_pattern = re.compile(rf"_{re.escape(path_id)}(?:\.[^.]+)?$", re.IGNORECASE)
+def iter_loose_filename_matches(input_root: Path, query_name: str, exact: bool):
     paths = sorted(input_root.rglob("*"))
-    print(f"[查找PathID] 文件名宽松匹配扫描条目: {len(paths)}", flush=True)
+    print(f"[查找资源名] 文件名宽松匹配扫描条目: {len(paths)}", flush=True)
     matched = 0
     for index, path in enumerate(paths, start=1):
         if index == 1 or index % 2000 == 0 or index == len(paths):
-            print(f"[查找PathID] 文件名扫描进度: {index}/{len(paths)}，当前命中: {matched}", flush=True)
+            print(f"[查找资源名] 文件名扫描进度: {index}/{len(paths)}，当前命中: {matched}", flush=True)
         if not path.is_file() or path.name == "manifest.json":
             continue
-        if suffix_pattern.search(path.name):
+        stem = path.stem
+        if name_matches(stem, query_name, exact):
             matched += 1
             yield path
 
@@ -150,8 +160,8 @@ def prompt_copy_images(image_paths: list[Path], input_root: Path, output_root: P
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="从 workspace/input 中查找指定 PathID 对应的导出文件路径。")
-    parser.add_argument("path_id", nargs="?", help="要查找的 PathID，支持十进制或 0x 十六进制。")
+    parser = argparse.ArgumentParser(description="从 workspace/input 中查找指定资源名对应的导出文件路径。")
+    parser.add_argument("asset_name", nargs="?", help="要查找的资源名；默认不区分大小写并支持包含匹配。")
     parser.add_argument(
         "--input-root",
         default=None,
@@ -160,7 +170,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--manifest-only",
         action="store_true",
-        help="只按 manifest.json 的 PathId 查找，不做文件名后缀宽松匹配。",
+        help="只按 manifest.json 的 AssetName 查找，不做文件名宽松匹配。",
+    )
+    parser.add_argument(
+        "--exact",
+        action="store_true",
+        help="资源名必须完全相同；默认使用包含匹配。",
     )
     parser.add_argument(
         "--no-copy-prompt",
@@ -177,15 +192,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    raw_path_id = args.path_id or input("请输入 PathID: ").strip()
-    if not raw_path_id:
-        print("PathID 不能为空。")
-        return 1
-
-    try:
-        path_id = normalize_path_id(raw_path_id)
-    except ValueError:
-        print(f"无效 PathID: {raw_path_id}")
+    raw_asset_name = args.asset_name or input("请输入资源名: ").strip()
+    asset_name = normalize_name(raw_asset_name)
+    if not asset_name:
+        print("资源名不能为空。")
         return 1
 
     cfg = load_config()
@@ -195,17 +205,18 @@ def main() -> int:
         print(f"input 目录不存在: {input_root}")
         return 1
 
-    print(f"[查找PathID] input 目录: {input_root}", flush=True)
-    print(f"[查找PathID] 查询 PathID: {path_id}", flush=True)
-    matches = list(iter_manifest_matches(input_root, path_id))
+    match_mode = "精确" if args.exact else "包含"
+    print(f"[查找资源名] input 目录: {input_root}", flush=True)
+    print(f"[查找资源名] 查询资源名: {asset_name}，模式={match_mode}", flush=True)
+    matches = list(iter_manifest_matches(input_root, asset_name, args.exact))
     if not args.manifest_only:
-        matches.extend(iter_loose_filename_matches(input_root, path_id))
+        matches.extend(iter_loose_filename_matches(input_root, asset_name, args.exact))
 
     paths = list(unique_paths(matches))
     for path in paths:
         print(path)
 
-    print(f"完成，PathID={path_id}，命中 {len(paths)} 个路径。")
+    print(f"完成，资源名={asset_name}，模式={match_mode}，命中 {len(paths)} 个路径。")
     if paths and not args.no_copy_prompt:
         prompt_copy_images(filter_image_paths(paths), input_root, image_output_root)
     return 0 if paths else 2

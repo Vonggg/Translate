@@ -455,8 +455,10 @@ Unity Localization 里有两类资源最容易混：
   - 一键导出和一键导入。
 - `工具脚本.py`
   - 排查、修补、catalog、AI 补批等辅助工具。
-- `config.py`
-  - 加载并规范化 `config.json`。
+- `support/config.py`
+  - 加载并规范化根目录的 `config.json`。
+- `support/`
+  - 放不需要直接从根目录运行的辅助模块和查找脚本。
 - `pipeline/translation.py`
   - 扫描、字段判断、翻译、导出文本替换。
 - `pipeline/font_ttf.py`

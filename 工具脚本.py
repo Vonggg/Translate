@@ -9,8 +9,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from config import load_config
-from image_import_utils import copy_image_for_import
+from support.config import load_config
+from support.image_import_utils import copy_image_for_import
 from pipeline.ai_translation_strategy import get_strategy
 from pipeline.catalog_tools import (
     auto_patch_and_repack_catalog_after_import,
@@ -36,8 +36,8 @@ DEFAULT_ALL_IMAGE_MAP = DEFAULT_ALL_IMAGE_ROOT / "_allpng_map.json"
 DEFAULT_MISSING_TTF_CHARS_FILE = SCRIPT_DIR / "workspace" / "records" / "translation_chars_missing_from_ttf.txt"
 DEFAULT_TRANS_JSON = SCRIPT_DIR / "workspace" / "records" / "trans.json"
 DEFAULT_RECORDS_JSON = SCRIPT_DIR / "workspace" / "records" / "records.json"
-FIND_PATH_ID_SCRIPT = SCRIPT_DIR / "查找PathID文件.py"
-FIND_ASSET_NAME_SCRIPT = SCRIPT_DIR / "查找资源名文件.py"
+FIND_PATH_ID_SCRIPT = SCRIPT_DIR / "support" / "查找PathID文件.py"
+FIND_ASSET_NAME_SCRIPT = SCRIPT_DIR / "support" / "查找资源名文件.py"
 AI_TRANSLATION_BATCH_TOOL = SCRIPT_DIR / "tools" / "ai_translation_batch_tool.py"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".webp"}
 M_NAME_JSON_RE = re.compile(r'("m_Name"\s*:\s*)"(?:\\.|[^"\\])*"')

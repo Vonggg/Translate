@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 import lz4.block
 
-from config import PipelineConfig
+from support.config import PipelineConfig
 
 
 CATALOG_FIELDS = (

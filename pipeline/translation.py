@@ -16,7 +16,7 @@ from typing import Any
 from .shared import ScanRecord, atomic_write_json, collect_json_files, read_json, unique_preserve_order, write_json
 from .manifest_index import build_tmp_manifest_index, tmp_manifest_index_path
 from .ai_translation_strategy import get_strategy
-from config import PipelineConfig
+from support.config import PipelineConfig
 
 
 AI_FIELD_REVIEW_MAX_BATCH_BYTES = 150 * 1024

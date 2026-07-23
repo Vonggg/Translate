@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 
-from config import load_config
+from support.config import load_config
 from pipeline.font_ttf import build_ttf_replacements
 from pipeline.tmp_pipeline import (
     build_merged_tmp_chars,

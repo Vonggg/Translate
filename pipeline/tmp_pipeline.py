@@ -11,7 +11,7 @@ import zlib
 from pathlib import Path
 from typing import Any
 
-from config import PipelineConfig
+from support.config import PipelineConfig
 from .manifest_index import load_tmp_manifest_index, tmp_manifest_index_path
 from .shared import collect_json_files, is_visible_char, read_json, unique_preserve_order, write_json
 

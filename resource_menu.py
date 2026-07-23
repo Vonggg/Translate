@@ -6,7 +6,7 @@ import sys
 import shutil
 from pathlib import Path
 
-from config import load_config
+from support.config import load_config
 from pipeline.catalog_tools import auto_patch_and_repack_catalog_after_import
 from pipeline.manifest_index import load_tmp_manifest_index, tmp_manifest_index_path
 from pipeline.split_bundle import find_split_bundle_groups, merge_split_bundle_groups, print_split_bundle_report

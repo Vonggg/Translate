@@ -4,7 +4,7 @@ import json
 import shutil
 from pathlib import Path
 
-from config import PipelineConfig
+from support.config import PipelineConfig
 from .manifest_index import load_tmp_manifest_index, tmp_manifest_index_path
 
 

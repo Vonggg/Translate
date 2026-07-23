@@ -74,7 +74,7 @@ DEFAULT_STRING_FIELD_BLACKLIST = [
 
 
 def _default_home() -> Path:
-    return Path(__file__).resolve().parent
+    return Path(__file__).resolve().parent.parent
 
 
 def _resolve(base: Path, value: str | Path) -> Path:

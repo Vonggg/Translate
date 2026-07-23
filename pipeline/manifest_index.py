@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from config import PipelineConfig
+from support.config import PipelineConfig
 from .shared import read_json, write_json
 
 
