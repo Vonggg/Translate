@@ -543,6 +543,7 @@ def validate_catalog_crc_algorithm(
     checked = 0
     passed = 0
     failures: list[dict] = []
+    handled_final_paths: set[Path] = set()
     for row in options:
         if not isinstance(row, dict):
             continue
@@ -558,6 +559,7 @@ def validate_catalog_crc_algorithm(
                 break
         if matched_final is None:
             continue
+        handled_final_paths.add(matched_final.resolve())
 
         try:
             relative_path = matched_final.relative_to(final_bundle_root)
@@ -598,6 +600,69 @@ def validate_catalog_crc_algorithm(
             "actual_crc": actual_crc,
             "expected_hex": f"0x{expected_crc:08x}",
             "actual_hex": f"0x{actual_crc:08x}",
+            "relative_path": relative_path.as_posix(),
+            "source_bundle": str(source_bundle_path),
+            "final_bundle": str(matched_final),
+        })
+
+    option_by_crc_size: dict[tuple[int, int], list[dict]] = {}
+    for row in options:
+        if not isinstance(row, dict):
+            continue
+        row_crc = row.get("m_Crc")
+        row_size = row.get("m_BundleSize")
+        if isinstance(row_crc, int) and isinstance(row_size, int):
+            option_by_crc_size.setdefault((row_crc, row_size), []).append(row)
+
+    source_bundles_by_name: dict[str, list[Path]] = {}
+    if source_bundle_root.is_dir():
+        for source_bundle in sorted(source_bundle_root.rglob("*.bundle")):
+            source_bundles_by_name.setdefault(source_bundle.name, []).append(source_bundle)
+
+    for matched_final in sorted(final_bundle_files.values(), key=lambda path: path.as_posix().lower()):
+        if matched_final.resolve() in handled_final_paths:
+            continue
+        handled_final_paths.add(matched_final.resolve())
+        source_candidates = source_bundles_by_name.get(matched_final.name, [])
+        if len(source_candidates) != 1:
+            failures.append({
+                "reason": "source_bundle_name_missing" if not source_candidates else "source_bundle_name_ambiguous",
+                "bundle_name": matched_final.name,
+                "source_candidates": [str(path) for path in source_candidates],
+                "final_bundle": str(matched_final),
+            })
+            continue
+
+        source_bundle_path = source_candidates[0]
+        try:
+            relative_path = matched_final.relative_to(final_bundle_root)
+        except ValueError:
+            relative_path = Path(matched_final.name)
+        checked += 1
+        try:
+            actual_crc = calculate_unityfs_uncompressed_crc(source_bundle_path)
+        except Exception as exc:
+            failures.append({
+                "reason": "source_crc_calculate_failed",
+                "bundle_name": matched_final.name,
+                "relative_path": relative_path.as_posix(),
+                "source_bundle": str(source_bundle_path),
+                "error": str(exc),
+            })
+            continue
+
+        source_size = source_bundle_path.stat().st_size
+        candidates = option_by_crc_size.get((actual_crc, source_size), [])
+        if len(candidates) == 1:
+            passed += 1
+            continue
+        failures.append({
+            "reason": "catalog_crc_size_not_found" if not candidates else "catalog_crc_size_ambiguous",
+            "bundle_name": matched_final.name,
+            "actual_crc": actual_crc,
+            "actual_hex": f"0x{actual_crc:08x}",
+            "source_size": source_size,
+            "candidate_count": len(candidates),
             "relative_path": relative_path.as_posix(),
             "source_bundle": str(source_bundle_path),
             "final_bundle": str(matched_final),
