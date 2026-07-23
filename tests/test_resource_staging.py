@@ -78,17 +78,17 @@ class ResourceStagingTests(unittest.TestCase):
             self.assertEqual((split_root / "remote.bundle.split1").read_bytes(), b"YZ12")
 
             relative_catalog = {"m_InternalIds": ["http/missing.bundle"]}
-            downloads, unresolved, _base_url, _source = _build_remote_downloads(cfg, relative_catalog)
+            downloads, unresolved = _build_remote_downloads(cfg, relative_catalog)
             self.assertEqual(downloads, [])
             self.assertEqual(len(unresolved), 1)
 
-            remote_cfg = replace(cfg, addressables_remote_base_url="https://cdn.example/game/Android/")
-            downloads, unresolved, base_url, source = _build_remote_downloads(remote_cfg, relative_catalog)
+            full_url_catalog = {
+                "m_InternalIds": ["https://cdn.example/game/Android/missing.bundle"]
+            }
+            downloads, unresolved = _build_remote_downloads(cfg, full_url_catalog)
             self.assertEqual(len(downloads), 1)
             self.assertEqual(unresolved, [])
             self.assertEqual(downloads[0].url, "https://cdn.example/game/Android/missing.bundle")
-            self.assertEqual(base_url, "https://cdn.example/game/Android/")
-            self.assertEqual(source, "config.addressables_remote_base_url")
 
 
 if __name__ == "__main__":

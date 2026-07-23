@@ -15,7 +15,6 @@ from .catalog_tools import parse_catalog_to_output
 from .split_bundle import find_split_bundle_groups, merge_split_bundle_group
 
 
-REMOTE_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 REMOTE_PLACEHOLDER_RE = re.compile(r"\{[^}]*RemoteLoadPath[^}]*\}", re.IGNORECASE)
 
 
@@ -95,75 +94,6 @@ def _is_remote_internal_id(value: str) -> bool:
     )
 
 
-def _walk_strings(value: Any):
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, list):
-        for item in value:
-            yield from _walk_strings(item)
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from _walk_strings(item)
-
-
-def _normalize_base_url(value: str) -> str:
-    value = value.strip()
-    return value if not value or value.endswith("/") else value + "/"
-
-
-def _discover_remote_base_url(cfg: PipelineConfig, catalog: dict[str, Any]) -> tuple[str, str]:
-    if cfg.addressables_remote_base_url:
-        return _normalize_base_url(cfg.addressables_remote_base_url), "config.addressables_remote_base_url"
-
-    prefixes = catalog.get("m_InternalIdPrefixes")
-    for value in _walk_strings(prefixes):
-        if value.lower().startswith(("http://", "https://")):
-            return _normalize_base_url(value), "catalog.m_InternalIdPrefixes"
-
-    for value in _walk_strings(catalog):
-        for match in REMOTE_URL_RE.finditer(value):
-            url = match.group(0)
-            android_match = re.match(r"(.*/Android/)", url, re.IGNORECASE)
-            if android_match:
-                return _normalize_base_url(android_match.group(1)), "catalog URL"
-
-    catalog_dir = cfg.catalog_source_path.parent
-    for candidate in sorted(catalog_dir.glob("*.json")):
-        if candidate.resolve() == cfg.catalog_source_path.resolve():
-            continue
-        try:
-            text = candidate.read_text(encoding="utf-8-sig", errors="ignore")
-        except OSError:
-            continue
-        for match in REMOTE_URL_RE.finditer(text):
-            url = match.group(0)
-            android_match = re.match(r"(.*/Android/)", url, re.IGNORECASE)
-            if android_match:
-                return _normalize_base_url(android_match.group(1)), str(candidate)
-
-    if cfg.log_dir.is_dir():
-        log_candidates = sorted(
-            (
-                path
-                for path in cfg.log_dir.rglob("*")
-                if path.is_file() and path.suffix.lower() in {".log", ".txt"}
-            ),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        for candidate in log_candidates:
-            try:
-                text = candidate.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            for match in REMOTE_URL_RE.finditer(text):
-                url = match.group(0)
-                android_match = re.match(r"(.*/Android/)", url, re.IGNORECASE)
-                if android_match:
-                    return _normalize_base_url(android_match.group(1)), str(candidate)
-    return "", ""
-
-
 @dataclass(frozen=True)
 class RemoteDownload:
     internal_id: str
@@ -175,12 +105,11 @@ class RemoteDownload:
 def _build_remote_downloads(
     cfg: PipelineConfig,
     catalog: dict[str, Any],
-) -> tuple[list[RemoteDownload], list[dict[str, str]], str, str]:
+) -> tuple[list[RemoteDownload], list[dict[str, str]]]:
     internal_ids = catalog.get("m_InternalIds")
     if not isinstance(internal_ids, list):
-        return [], [], "", ""
+        return [], []
 
-    base_url, base_source = _discover_remote_base_url(cfg, catalog)
     android_root = _addressables_android_root(cfg)
     downloads: list[RemoteDownload] = []
     unresolved: list[dict[str, str]] = []
@@ -197,23 +126,10 @@ def _build_remote_downloads(
         if destination.is_file() and destination.stat().st_size > 0:
             continue
 
-        if raw_value.lower().startswith(("http://", "https://")):
-            url = raw_value
-        elif base_url:
-            value = raw_value
-            if value.lower().startswith("http/"):
-                value = value[5:]
-            elif value.lower().startswith("https/"):
-                value = value[6:]
-            else:
-                value = REMOTE_PLACEHOLDER_RE.sub("", value)
-            value = value.lstrip("/")
-            if value.lower().startswith("android/"):
-                value = value[len("Android/"):]
-            url = urllib.parse.urljoin(base_url, value)
-        else:
-            unresolved.append({"internal_id": raw_value, "reason": "缺少远程 BASE_URL"})
+        if not raw_value.lower().startswith(("http://", "https://")):
+            unresolved.append({"internal_id": raw_value, "reason": "catalog 未提供完整 HTTP/HTTPS 下载链接"})
             continue
+        url = raw_value
 
         destination_key = destination.resolve()
         if destination_key in seen_destinations:
@@ -227,7 +143,7 @@ def _build_remote_downloads(
                 destination=destination,
             )
         )
-    return downloads, unresolved, base_url, base_source
+    return downloads, unresolved
 
 
 def _download_remote_file(task: RemoteDownload, timeout: int) -> tuple[bool, str]:
@@ -279,14 +195,12 @@ def inspect_and_download_catalog_resources(cfg: PipelineConfig) -> bool:
         for value in internal_ids
         if isinstance(value, str) and _is_remote_internal_id(value)
     ] if isinstance(internal_ids, list) else []
-    downloads, unresolved, base_url, base_source = _build_remote_downloads(cfg, catalog)
+    downloads, unresolved = _build_remote_downloads(cfg, catalog)
     report: dict[str, Any] = {
         "catalog": str(catalog_path),
         "android_destination": str(_addressables_android_root(cfg)),
         "remote_internal_id_count": len(remote_internal_ids),
         "remote_internal_ids": remote_internal_ids,
-        "base_url": base_url,
-        "base_url_source": base_source,
         "download_count": len(downloads),
         "unresolved_count": len(unresolved),
         "downloads": [
@@ -308,8 +222,7 @@ def inspect_and_download_catalog_resources(cfg: PipelineConfig) -> bool:
     )
 
     if unresolved:
-        print(f"[catalog][停止] 发现 {len(unresolved)} 个本地缺失的远程资源，但无法确定完整下载地址。")
-        print("[catalog][停止] 可在 config.json 设置 addressables_remote_base_url 后重新导出。")
+        print(f"[catalog][停止] 发现 {len(unresolved)} 个本地缺失的远程资源，但 catalog 没有提供完整下载链接。")
         print(f"[catalog][停止] 详情: {report_path}")
         return False
 
@@ -317,8 +230,6 @@ def inspect_and_download_catalog_resources(cfg: PipelineConfig) -> bool:
         print("[catalog] 没有需要下载的远程资源。")
         return True
 
-    if base_url:
-        print(f"[catalog] 远程 BASE_URL: {base_url}（来源: {base_source}）")
     print(
         f"[catalog] 需要下载远程资源: {len(downloads)} 个 -> "
         f"{_addressables_android_root(cfg)}"

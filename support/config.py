@@ -98,7 +98,6 @@ class PipelineConfig:
     import_overlay_dir: Path
     image_import_dir: Path
     resource_staging_root: Path = Path("workspace/input_sources")
-    addressables_remote_base_url: str = ""
     addressables_download_workers: int = 5
     addressables_download_timeout: int = 60
     translation_mode: str = "translate"
@@ -235,7 +234,6 @@ def load_config(config_path: str | Path | None = None) -> PipelineConfig:
         import_overlay_dir=_resolve(root_dir, get_value("import_overlay_dir", "workspace/output/Font/SDF/ToImport")),
         image_import_dir=_resolve(root_dir, get_value("image_import_dir", "workspace/output/Image/ToImport")),
         resource_staging_root=_resolve(root_dir, get_value("resource_staging_root", "workspace/input_sources")),
-        addressables_remote_base_url=str(get_value("addressables_remote_base_url", "") or "").strip(),
         addressables_download_workers=max(1, int(get_value("addressables_download_workers", 5) or 5)),
         addressables_download_timeout=max(1, int(get_value("addressables_download_timeout", 60) or 60)),
         translation_mode=get_value("translation_mode", "translate"),

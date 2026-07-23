@@ -21,9 +21,6 @@ Unity 游戏资源汉化工具链。主要流程是：导出资源到 `workspace
 - `resource_staging_root`
   - 一键导出使用的统一原始资源暂存目录，默认 `workspace/input_sources`。
   - 每次一键导出都会清空重建，不要在其中保存手工文件。
-- `addressables_remote_base_url`
-  - 可选。catalog 只记录 `http/...` 或 RemoteLoadPath 相对地址、无法自动推导 CDN 地址时填写。
-  - 如果 catalog 已含完整 URL，或能从 `m_InternalIdPrefixes`、同目录设置 JSON、`workspace/logs` 中的资源 URL 推导，可以留空。
 - `addressables_download_workers` / `addressables_download_timeout`
   - 远程 Addressables 下载线程数和单次请求超时，默认 `5` 和 `60` 秒。
 - `stringliteral_json_subpath`  （现在暂未使用）
@@ -383,7 +380,7 @@ game/assets/bin/Data   -> workspace/input_sources/bin/Data
 - 清理 `workspace/temp`。
 - 如果 catalog 存在，先解析并检查远程 InternalId。
 - 可确定完整 URL 时，自动把本地缺失资源下载到游戏的 `assets/aa/Android`。
-- 无法确定远程 BASE_URL 时停止，并写出 `workspace/resource_state/addressables_remote_resources.json`。
+- 远程条目不是完整 HTTP/HTTPS 下载链接时停止，并写出 `workspace/resource_state/addressables_remote_resources.json`。
 - 强制清空并重建 `workspace/input_sources`。
 - 在暂存区自动合并 `.splitN`，不询问、不修改游戏原目录。
 - 检查 Managed DLL，必要时从 DummyDll 补齐。
