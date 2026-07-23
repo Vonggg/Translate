@@ -23,6 +23,7 @@ from pipeline.catalog_tools import (
     _source_catalog_android_root,
 )
 from pipeline.translation import _is_blacklisted_string_field
+from pipeline.tmp_pipeline import sync_generated_tmp_material_parameters
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -1158,6 +1159,24 @@ def run_clean_blacklisted_records() -> None:
     print(f"[清理黑名单] 清理报告: {report_path}")
 
 
+def run_sync_generated_tmp_material_parameters() -> None:
+    cfg = load_config()
+    print()
+    print("同步生成字体的 SDF 材质参数")
+    print("说明: 主流程默认保留原游戏材质。本工具只在 SDF/ToImport 中新增 Material 替换 JSON。")
+    print("      保留原游戏材质的 PathID、Shader、纹理、颜色和遮罩设置，只同步影响 SDF 边缘的数值参数。")
+    print("      重新执行主流程的 SDF 待导入准备步骤，会清空本工具生成的材质替换。")
+    print()
+    confirm = input("确认同步生成材质参数到当前 SDF/ToImport ? 输入 y 确认，其它任意键取消: ").strip().lower()
+    if confirm != "y":
+        print("[TMP材质] 已取消，未修改文件。")
+        return
+    try:
+        sync_generated_tmp_material_parameters(cfg)
+    except Exception as exc:
+        print(f"[TMP材质] 处理失败: {exc}")
+
+
 def run_parse_catalog() -> None:
     cfg = load_config()
     print()
@@ -1362,6 +1381,9 @@ def main() -> int:
         if command in {"clean-blacklisted-records", "clean-records-blacklist"}:
             run_clean_blacklisted_records()
             return 0
+        if command in {"sync-generated-sdf-material", "sync-sdf-material"}:
+            run_sync_generated_tmp_material_parameters()
+            return 0
         if command in {"parse-catalog", "catalog"}:
             run_parse_catalog()
             return 0
@@ -1388,6 +1410,7 @@ def main() -> int:
         print(f"或: python {Path(__file__).name} resend-ai-batch <ai_translation_request_batch_XXX.json>")
         print(f"或: python {Path(__file__).name} clean-unsupported-ttf-chars")
         print(f"或: python {Path(__file__).name} clean-blacklisted-records")
+        print(f"或: python {Path(__file__).name} sync-generated-sdf-material")
         print(f"或: python {Path(__file__).name} parse-catalog")
         print(f"或: python {Path(__file__).name} repack-catalog [Output.json] [catalog.repacked.json]")
         print(f"或: python {Path(__file__).name} auto-patch-catalog")
@@ -1412,6 +1435,7 @@ def main() -> int:
         print("13. 按最终 Bundle 自动修正并回打 catalog（CRC 置 0）")
         print("14. 按最终 Bundle 真实 CRC 修正 catalog（长度溢出时询问）")
         print("15. 清理 records.json 中当前黑名单字段，并同步清理 trans.json")
+        print("16. 同步生成字体的 SDF 材质参数到待导入目录（可选实验）")
         print("q. 退出")
         try:
             choice = input("请选择: ").strip().lower()
@@ -1451,6 +1475,9 @@ def main() -> int:
         if choice == "15":
             run_clean_blacklisted_records()
             continue
+        if choice == "16":
+            run_sync_generated_tmp_material_parameters()
+            continue
         if choice == "11":
             run_parse_catalog()
             continue
@@ -1466,7 +1493,7 @@ def main() -> int:
         if choice in {"q", "quit", "exit"}:
             return 0
 
-        print("无效选择，请输入 1、2、3、4、5、6、7、8、9、10、11、12、13、14、15 或 q。")
+        print("无效选择，请输入 1、2、3、4、5、6、7、8、9、10、11、12、13、14、15、16 或 q。")
     return 0
 
 

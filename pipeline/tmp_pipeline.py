@@ -60,6 +60,28 @@ TMP_SOURCE_DOTTED_PATHS = [
     "m_FaceInfo.m_UnitsPerEM",
 ]
 
+TMP_SDF_MATERIAL_FLOAT_KEYS = {
+    "_FaceDilate",
+    "_GradientScale",
+    "_OutlineSoftness",
+    "_OutlineWidth",
+    "_PerspectiveFilter",
+    "_ScaleRatioA",
+    "_ScaleRatioB",
+    "_ScaleRatioC",
+    "_Sharpness",
+    "_TextureHeight",
+    "_TextureWidth",
+    "_UnderlayDilate",
+    "_UnderlayOffsetX",
+    "_UnderlayOffsetY",
+    "_UnderlaySoftness",
+    "_VertexOffsetX",
+    "_VertexOffsetY",
+    "_WeightBold",
+    "_WeightNormal",
+}
+
 RICH_TEXT_TAG_RE = re.compile(r"<[^>]*>")
 
 
@@ -589,6 +611,75 @@ def _build_tmp_font_replacement(template: dict[str, Any], old: dict[str, Any]) -
         if isinstance(glyph, dict):
             glyph["m_ClassDefinitionType"] = 0
     return new
+
+
+def _generated_tmp_material_floats(asset_path: Path) -> dict[str, Any]:
+    if not asset_path.is_file():
+        return {}
+
+    yaml = _load_yaml_module()
+    text = asset_path.read_text(encoding="utf-8-sig")
+    documents = _split_unity_yaml_documents(text)
+    material_document = next(
+        (body for class_id, _, body in documents if class_id == 21 and body.startswith("Material:")),
+        None,
+    )
+    if material_document is None:
+        return {}
+
+    loaded = yaml.safe_load(material_document)
+    material = loaded.get("Material") if isinstance(loaded, dict) else None
+    saved_properties = material.get("m_SavedProperties") if isinstance(material, dict) else None
+    floats = saved_properties.get("m_Floats") if isinstance(saved_properties, dict) else None
+    if not isinstance(floats, list):
+        return {}
+
+    values: dict[str, Any] = {}
+    for item in floats:
+        if not isinstance(item, dict) or len(item) != 1:
+            continue
+        name, value = next(iter(item.items()))
+        if name in TMP_SDF_MATERIAL_FLOAT_KEYS and isinstance(value, (int, float)):
+            values[name] = value
+    return values
+
+
+def _material_path_id(font_json: dict[str, Any]) -> tuple[int, int] | None:
+    material = font_json.get("m_Material")
+    if not isinstance(material, dict):
+        material = font_json.get("material")
+    if not isinstance(material, dict):
+        return None
+    try:
+        return (
+            int(material.get("m_FileID", 0) or 0),
+            int(material.get("m_PathID", 0) or 0),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_generated_sdf_material_floats(
+    source_material: dict[str, Any],
+    generated_values: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    replacement = copy.deepcopy(source_material)
+    saved_properties = replacement.get("m_SavedProperties")
+    floats = saved_properties.get("m_Floats") if isinstance(saved_properties, dict) else None
+    array = floats.get("Array") if isinstance(floats, dict) else None
+    if not isinstance(array, list):
+        return replacement, []
+
+    updated: list[str] = []
+    for item in array:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("first")
+        if name not in generated_values or "second" not in item:
+            continue
+        item["second"] = copy.deepcopy(generated_values[name])
+        updated.append(name)
+    return replacement, updated
 
 
 def _load_yaml_module():
@@ -1150,6 +1241,128 @@ def prepare_generated_tmp_import_replacements(
         "missing_texture_refs": len(missing_textures),
         "skipped_texture_refs": len(skipped_textures),
         "skipped_font_replacements": len(skipped_fonts),
+    }
+
+
+def sync_generated_tmp_material_parameters(cfg: PipelineConfig) -> dict[str, int]:
+    """Optionally copy generated SDF numeric properties into game Material replacements."""
+    generated_asset_path = _sdf_generated_asset_path(cfg)
+    summary_path = _sdf_replacement_summary_path(cfg)
+    if not generated_asset_path.is_file():
+        raise FileNotFoundError(f"Generated TMP asset not found: {generated_asset_path}")
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"TMP replacement summary not found: {summary_path}")
+
+    generated_values = _generated_tmp_material_floats(generated_asset_path)
+    if not generated_values:
+        raise ValueError(f"Generated TMP material floats were not found: {generated_asset_path}")
+
+    summary = read_json(summary_path)
+    summary_items = summary.get("items") if isinstance(summary, dict) else None
+    if not isinstance(summary_items, list):
+        raise ValueError(f"TMP replacement summary has no items: {summary_path}")
+
+    manifest_items = _iter_manifest_items(cfg)
+    font_contexts: dict[Path, tuple[Path, str]] = {}
+    material_items: dict[tuple[Path, str, int], tuple[Path, dict[str, Any]]] = {}
+    for manifest_path, manifest_dir, item in manifest_items:
+        type_name = str(_manifest_item_value(item, "TypeName", "") or "")
+        path_id = _item_path_id(item)
+        if type_name == "Material" and path_id is not None:
+            material_items[(manifest_path, _item_bundle_entry(item), path_id)] = (manifest_dir, item)
+        elif type_name == "MonoBehaviour":
+            item_path = _resolve_manifest_item_path(manifest_dir, item)
+            if item_path is not None:
+                font_contexts[item_path.resolve()] = (manifest_path, _item_bundle_entry(item))
+
+    written: set[Path] = set()
+    changed_count = 0
+    skipped_count = 0
+    updated_parameter_count = 0
+    records: list[dict[str, Any]] = []
+
+    for item in summary_items:
+        source_value = item.get("source_json") if isinstance(item, dict) else None
+        if not isinstance(source_value, str) or not source_value:
+            skipped_count += 1
+            continue
+        source_font_path = Path(source_value)
+        context = font_contexts.get(source_font_path.resolve())
+        if context is None or not source_font_path.is_file():
+            skipped_count += 1
+            continue
+
+        font_json = read_json(source_font_path)
+        material_ref = _material_path_id(font_json)
+        if material_ref is None:
+            skipped_count += 1
+            continue
+        material_file_id, material_path_id = material_ref
+        if material_file_id != 0 or material_path_id == 0:
+            skipped_count += 1
+            continue
+
+        manifest_path, bundle_entry = context
+        material_entry = material_items.get((manifest_path, bundle_entry, material_path_id))
+        if material_entry is None:
+            skipped_count += 1
+            continue
+        material_manifest_dir, material_item = material_entry
+        source_material_path = _resolve_manifest_item_path(material_manifest_dir, material_item)
+        if source_material_path is None or not source_material_path.is_file():
+            skipped_count += 1
+            continue
+
+        target_material_path = _overlay_path_for_input_path(cfg, source_material_path)
+        if target_material_path in written:
+            continue
+
+        source_material = read_json(source_material_path)
+        replacement, updated = _apply_generated_sdf_material_floats(source_material, generated_values)
+        if not updated:
+            skipped_count += 1
+            continue
+
+        write_json(target_material_path, replacement)
+        written.add(target_material_path)
+        changed_count += 1
+        updated_parameter_count += len(updated)
+        records.append(
+            {
+                "source_material": str(source_material_path),
+                "replacement_material": str(target_material_path),
+                "material_path_id": material_path_id,
+                "updated_parameters": updated,
+            }
+        )
+        print(
+            f"[TMP材质] {source_material_path} -> {target_material_path}（同步 {len(updated)} 项）",
+            flush=True,
+        )
+
+    report_path = _sdf_generated_template_dir(cfg).parent / "tmp_material_parameter_sync.json"
+    write_json(
+        report_path,
+        {
+            "generated_asset": str(generated_asset_path),
+            "replacement_summary": str(summary_path),
+            "material_replacements": changed_count,
+            "skipped": skipped_count,
+            "updated_parameter_count": updated_parameter_count,
+            "generated_parameters": generated_values,
+            "items": records,
+        },
+    )
+    print(
+        f"[TMP材质] 完成: 材质={changed_count}, 参数={updated_parameter_count}, "
+        f"跳过={skipped_count}",
+        flush=True,
+    )
+    print(f"[TMP材质] 报告: {report_path}", flush=True)
+    return {
+        "material_replacements": changed_count,
+        "updated_parameter_count": updated_parameter_count,
+        "skipped": skipped_count,
     }
 
 

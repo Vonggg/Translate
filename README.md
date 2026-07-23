@@ -158,6 +158,7 @@ python .\工具脚本.py
 - AI 翻译单批补跑：菜单 9
 - 清理模板 TTF 不支持字符：菜单 10
 - 清理 records/trans 中当前黑名单字段：菜单 15  （新增黑名单但不想重扫描翻译等就用这个）
+- 可选同步生成字体的 SDF 材质参数：菜单 16
 - catalog 解析/回打/CRC 修正：菜单 11、12、13、14
 
 ### 4. 一键导入
@@ -417,6 +418,10 @@ workspace/FinalResult
   - 写真实 CRC；如果原位写入会导致片段变长，则询问置 0 或跳过。
 - `15. 清理 records.json 中当前黑名单字段，并同步清理 trans.json`
   - 适合新增黑名单后使用，不必重新跑完整扫描。
+- `16. 同步生成字体的 SDF 材质参数到待导入目录（可选实验）`
+  - 主流程默认保留原游戏材质；执行本项后，才会在 `workspace/output/Font/SDF/ToImport` 中生成 Material 替换 JSON。
+  - 保留原材质的 PathID、Shader、纹理、颜色和遮罩，只同步影响 SDF 边缘和笔画粗细的数值参数。
+  - 重新执行主流程的 SDF 待导入准备步骤，即可清除实验材质并恢复默认行为。
 
 ## Unity Localization 规则
 
