@@ -29,6 +29,10 @@ CRC_MISMATCH_RE = re.compile(
 )
 
 
+def _log_green(message: str) -> None:
+    print(f"\033[92m{message}\033[0m", flush=True)
+
+
 def printable_ascii_runs(data: bytes, min_len: int = 4) -> list[tuple[int, str]]:
     rows: list[tuple[int, str]] = []
     for match in re.finditer(rb"[\x20-\x7e]{%d,}" % min_len, data):
@@ -537,7 +541,10 @@ def validate_catalog_crc_algorithm(
 
     final_bundle_files = collect_final_bundle_files(final_bundle_root)
     if not final_bundle_files:
-        print(f"[catalog] 最终 bundle 目录没有 bundle，跳过 CRC 自校验: {final_bundle_root}")
+        _log_green(
+            f"[catalog] 本次没有修改 bundle 文件，无需修改 catalog，已正常跳过: "
+            f"{final_bundle_root}"
+        )
         return False
 
     checked = 0
@@ -682,7 +689,7 @@ def validate_catalog_crc_algorithm(
         save_catalog_crc_sample(cfg, output_dir, source_bundle_root, final_bundle_root, failures)
         return False
 
-    print(f"[catalog] CRC 算法自校验通过: checked={checked}, passed={passed}")
+    _log_green(f"[catalog] CRC 算法自校验通过: checked={checked}, passed={passed}")
     return True
 
 
@@ -870,14 +877,21 @@ def patch_expanded_catalog_from_final_bundles(
 
 def auto_patch_and_repack_catalog_after_import(cfg: PipelineConfig, final_result_root: Path, log_paths: Iterable[Path] = ()) -> Path | None:
     if not cfg.catalog_source_path.is_file():
-        print(f"[catalog] 未找到 catalog，跳过自动修正: {cfg.catalog_source_path}")
+        _log_green(f"[catalog] 未找到 catalog，无需自动修正，已正常跳过: {cfg.catalog_source_path}")
+        return None
+
+    bundle_root = final_result_root / "Bundle" / "Android"
+    if not collect_final_bundle_files(bundle_root):
+        _log_green(
+            f"[catalog] 本次没有修改 bundle 文件，无需修改 catalog，已正常跳过: "
+            f"{bundle_root}"
+        )
         return None
 
     output_dir = cfg.result_dir / "catalog"
     print(f"[catalog] 检测到 catalog，开始解析: {cfg.catalog_source_path}")
     _formatted_path, expanded_path = parse_catalog_to_output(cfg, cfg.catalog_source_path, output_dir)
 
-    bundle_root = final_result_root / "Bundle" / "Android"
     source_bundle_root = _source_catalog_android_root(cfg)
     if not validate_catalog_crc_algorithm(cfg, expanded_path, source_bundle_root, bundle_root, output_dir):
         print("[catalog][停止] 未修改 catalog。请先确认 CRC 算法或样本。")
@@ -893,10 +907,10 @@ def auto_patch_and_repack_catalog_after_import(cfg: PipelineConfig, final_result
         source_bundle_root=source_bundle_root,
         zero_crc=True,
     )
-    print(f"[catalog] 已按最终 bundle 修正 Output.json: size={size_updates}, crc置0={crc_updates}")
-    print(f"[catalog] Output.json 自动修正前备份: {backup_path}")
+    _log_green(f"[catalog] 已按最终 bundle 修正 Output.json: size={size_updates}, crc置0={crc_updates}")
+    _log_green(f"[catalog] Output.json 自动修正前备份: {backup_path}")
 
     final_catalog_path = final_result_root / "Bundle" / "catalog.json"
     repacked_path = repack_expanded_catalog(expanded_path, final_catalog_path)
-    print(f"[catalog] 已回打 catalog 并输出到: {repacked_path}")
+    _log_green(f"[catalog] 已回打 catalog 并输出到: {repacked_path}")
     return repacked_path
