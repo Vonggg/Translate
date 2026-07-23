@@ -1,0 +1,147 @@
+﻿using AssetsTools.NET.Extra;
+using System.Collections.Generic;
+
+namespace AssetsTools.NET
+{
+    public class RefTypeManager
+    {
+        private Dictionary<AssetTypeReference, AssetTypeTemplateField> typeTreeLookup;
+        private Dictionary<AssetTypeReference, AssetTypeTemplateField> monoTemplateLookup;
+        private IMonoBehaviourTemplateGenerator monoTemplateGenerator;
+        private UnityVersion unityVersion;
+
+        public RefTypeManager()
+        {
+            typeTreeLookup = new Dictionary<AssetTypeReference, AssetTypeTemplateField>();
+            monoTemplateLookup = new Dictionary<AssetTypeReference, AssetTypeTemplateField>();
+        }
+
+        /// <summary>
+        /// Clear the ref type lookup dictionaries.
+        /// </summary>
+        public void Clear()
+        {
+            typeTreeLookup.Clear();
+            monoTemplateLookup.Clear();
+        }
+
+        /// <summary>
+        /// Load the lookup from the type tree ref types of a serialized file.
+        /// </summary>
+        /// <param name="metadata">The metadata to load from.</param>
+        public void FromTypeTree(AssetsFileMetadata metadata, IDictionary<Hash128, TypeTreeBlob> typeBlobLookup = null)
+        {
+            if (!metadata.TypeTreeEnabled || metadata.RefTypes == null)
+            {
+                return;
+            }
+
+            foreach (TypeTreeType type in metadata.RefTypes)
+            {
+                if (!type.IsRefType)
+                    continue;
+
+                AssetTypeTemplateField templateField;
+                if (type.TypeBlobIsDefinition)
+                {
+                    templateField = new AssetTypeTemplateField();
+                    templateField.FromTypeTree(type);
+                    RemoveRedundantRegistry(templateField);
+                }
+                else
+                {
+                    // can't do anything if the external type blob is not loaded
+                    if (typeBlobLookup == null)
+                        continue;
+
+                    if (!typeBlobLookup.TryGetValue(type.ExtTypeHash, out TypeTreeBlob typeBlob))
+                        continue;
+
+                    templateField = new AssetTypeTemplateField();
+                    templateField.FromTypeBlob(typeBlob);
+                    RemoveRedundantRegistry(templateField);
+                }
+
+                typeTreeLookup[type.TypeReference] = templateField;
+            }
+        }
+
+        /// <summary>
+        /// Initialize a lookup for MonoBehaviours.
+        /// </summary>
+        /// <param name="metadata">The metadata to load from.</param>
+        /// <param name="monoTemplateGenerator">The mono template generator to use.</param>
+        /// <param name="monoTemplateFieldCache">The cache to use.</param>
+        public void WithMonoTemplateGenerator(
+            AssetsFileMetadata metadata, IMonoBehaviourTemplateGenerator monoTemplateGenerator,
+            IDictionary<AssetTypeReference, AssetTypeTemplateField> monoTemplateFieldCache = null)
+        {
+            this.monoTemplateGenerator = monoTemplateGenerator;
+            unityVersion = new UnityVersion(metadata.UnityVersion);
+            monoTemplateLookup = monoTemplateFieldCache != null
+                ? new Dictionary<AssetTypeReference, AssetTypeTemplateField>(monoTemplateFieldCache)
+                : new Dictionary<AssetTypeReference, AssetTypeTemplateField>();
+        }
+
+        /// <summary>
+        /// Gets the template field from a reference.
+        /// </summary>
+        /// <param name="type">The type reference to use.</param>
+        /// <returns>A template field for this reference.</returns>
+        public AssetTypeTemplateField GetTemplateField(AssetTypeReference type)
+        {
+            if (type == null || (string.IsNullOrEmpty(type.ClassName) && string.IsNullOrEmpty(type.Namespace) && string.IsNullOrEmpty(type.AsmName)) || type.Equals(AssetTypeReference.TERMINUS))
+            {
+                return null;
+            }
+
+            if (typeTreeLookup.TryGetValue(type, out AssetTypeTemplateField templateField))
+            {
+                return templateField;
+            }
+
+            if (monoTemplateGenerator != null)
+            {
+                if (monoTemplateLookup.TryGetValue(type, out templateField))
+                {
+                    return templateField;
+                }
+
+                templateField = new AssetTypeTemplateField
+                {
+                    Name = "Base",
+                    Type = type.ClassName,
+                    ValueType = AssetValueType.None,
+                    IsArray = false,
+                    IsAligned = false,
+                    HasValue = false,
+                    Children = new List<AssetTypeTemplateField>(0)
+                };
+                templateField = monoTemplateGenerator.GetTemplateField(templateField, type.AsmName, type.Namespace, type.ClassName, unityVersion);
+                if (templateField != null)
+                {
+                    RemoveRedundantRegistry(templateField);
+                    monoTemplateLookup[type] = templateField;
+                    return templateField;
+                }
+            }
+
+            return null;
+        }
+
+        private void RemoveRedundantRegistry(AssetTypeTemplateField templateField)
+        {
+            // if ref type has fields with [SerializeReference] it can contain its own registry,
+            // but it shouldn't be there, as the registry is only available at the root type
+            if (templateField.Children.Count == 0)
+                return;
+
+            int lastChildIdx = templateField.Children.Count - 1;
+            AssetTypeTemplateField lastChild = templateField[lastChildIdx];
+            if (lastChild.ValueType == AssetValueType.ManagedReferencesRegistry)
+            {
+                templateField.Children.RemoveAt(lastChildIdx);
+            }
+        }
+    }
+}

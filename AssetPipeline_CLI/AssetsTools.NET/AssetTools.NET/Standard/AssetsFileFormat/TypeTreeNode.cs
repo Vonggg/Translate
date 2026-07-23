@@ -1,0 +1,144 @@
+﻿using System;
+using System.Text;
+
+namespace AssetsTools.NET
+{
+    public class TypeTreeNode
+    {
+        /// <summary>
+        /// Version of the node.
+        /// </summary>
+        public ushort Version { get; set; }
+        /// <summary>
+        /// Level of the node (0 for root, 1 for child, etc.)
+        /// </summary>
+        public byte Level { get; set; }
+        /// <summary>
+        /// Information about whether the node is an array, registry, etc.
+        /// </summary>
+        public TypeTreeNodeFlags TypeFlags { get; set; }
+        /// <summary>
+        /// Offset of the type string in the string table.
+        /// </summary>
+        public uint TypeStrOffset { get; set; }
+        /// <summary>
+        /// Offset of the name string in the string table.
+        /// </summary>
+        public uint NameStrOffset { get; set; }
+        /// <summary>
+        /// Byte size of the field's type (for example, int is 4).
+        /// If the field isn't a value type, then this value is a sum of all children sizes.
+        /// If the size is variable, this is set to -1.
+        /// </summary>
+        public int ByteSize { get; set; }
+        /// <summary>
+        /// Index in the type tree. This should always be the same as the index in the array.
+        /// </summary>
+        public uint Index { get; set; }
+        /// <summary>
+        /// 0x4000 if aligned.
+        /// </summary>
+        public uint MetaFlags { get; set; }
+        /// <summary>
+        /// Unknown.
+        /// </summary>
+        public ulong RefTypeHash { get; set; }
+
+        /// <summary>
+        /// Read the <see cref="TypeTreeNode"/> with the provided reader and format version.
+        /// </summary>
+        /// <param name="reader">The reader to use.</param>
+        /// <param name="version">The version of the file.</param>
+        public void Read(AssetsFileReader reader, uint version)
+        {
+            Version = reader.ReadUInt16();
+            Level = reader.ReadByte();
+            TypeFlags = (TypeTreeNodeFlags)reader.ReadByte();
+            TypeStrOffset = reader.ReadUInt32();
+            NameStrOffset = reader.ReadUInt32();
+            ByteSize = reader.ReadInt32();
+            Index = reader.ReadUInt32();
+            MetaFlags = reader.ReadUInt32();
+            if (version >= 18)
+            {
+                RefTypeHash = reader.ReadUInt64();
+            }
+        }
+
+        /// <summary>
+        /// Write the <see cref="TypeTreeNode"/> with the provided writer and format version.
+        /// </summary>
+        /// <param name="writer">The writer to use.</param>
+        /// <param name="version">The version of the file.</param>
+        public void Write(AssetsFileWriter writer, uint version)
+        {
+            writer.Write(Version);
+            writer.Write(Level);
+            writer.Write((byte)TypeFlags);
+            writer.Write(TypeStrOffset);
+            writer.Write(NameStrOffset);
+            writer.Write(ByteSize);
+            writer.Write(Index);
+            writer.Write(MetaFlags);
+            if (version >= 18)
+            {
+                writer.Write(RefTypeHash);
+            }
+        }
+
+        // todo: these two GetXXXString methods should be using caching
+
+        /// <summary>
+        /// Get the type name from the string table (from <see cref="TypeTreeType.StringBuffer"/>).
+        /// </summary>
+        /// <param name="stringTable">The string table to use.</param>
+        /// <param name="commonStringTable">
+        /// The common string table to use, if the builtin one is outdated.
+        /// See <see cref="ClassDatabaseFile.CommonStringBufferIndices"/>.
+        /// </param>
+        /// <returns>The node type name.</returns>
+        public string GetTypeString(byte[] stringTable, byte[] commonStringTable = null)
+        {
+            return ReadStringTableString(stringTable, commonStringTable ?? TypeTreeType.COMMON_STRING_TABLE, TypeStrOffset);
+        }
+
+        /// <summary>
+        /// Get the name name from the string table (from <see cref="TypeTreeType.StringBuffer"/>).
+        /// </summary>
+        /// <param name="stringTable">The string table to use.</param>
+        /// <param name="commonStringTable">
+        /// The common string table to use, if the builtin one is outdated.
+        /// See <see cref="ClassDatabaseFile.CommonStringBufferIndices"/>.
+        /// </param>
+        /// <returns>The node name.</returns>
+        public string GetNameString(byte[] stringTable, byte[] commonStringTable = null)
+        {
+            return ReadStringTableString(stringTable, commonStringTable ?? TypeTreeType.COMMON_STRING_TABLE, NameStrOffset);
+        }
+
+        /// <summary>
+        /// Get the maximum size of this type tree node for a version.
+        /// </summary>
+        /// <param name="version">The version of the file.</param>
+        public static long GetSize(uint version)
+        {
+            long size = 24;
+            if (version >= 0x12)
+                size += 8;
+
+            return size;
+        }
+
+        private string ReadStringTableString(byte[] stringTable, byte[] commonStringTable, uint offset)
+        {
+            if ((offset & 0x80000000) != 0)
+            {
+                offset &= ~0x80000000;
+                stringTable = commonStringTable;
+            }
+
+            var endIdx = Array.IndexOf(stringTable, (byte)0, (int)offset);
+            return Encoding.UTF8.GetString(stringTable, (int)offset, (int)(endIdx - offset));
+        }
+    }
+}

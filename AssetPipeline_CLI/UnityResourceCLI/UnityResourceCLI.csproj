@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>UnityResourceCLI</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AssetsTools.NET\AssetTools.NET\AssetsTools.NET.csproj" />
+    <ProjectReference Include="..\AssetsTools.NET\AssetsTools.NET.Texture\AssetsTools.NET.Texture.csproj" />
+    <ProjectReference Include="..\AssetsTools.NET\AssetsTools.NET.MonoCecil\AssetsTools.NET.MonoCecil.csproj" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\UABEA\UABEAvalonia\Logic\FileTypeDetector.cs" Link="UABEAvalonia\Logic\FileTypeDetector.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\UABEA\ReleaseFiles\classdata.tpk" Link="classdata.tpk" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

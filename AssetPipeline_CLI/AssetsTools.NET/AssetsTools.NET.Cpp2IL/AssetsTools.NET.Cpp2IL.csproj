@@ -1,0 +1,17 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>9</LangVersion>
+    <Nullable>Disable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Samboy063.LibCpp2IL" Version="2022.1.0-pre-release.21" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AssetTools.NET\AssetsTools.NET.csproj" />
+  </ItemGroup>
+
+</Project>

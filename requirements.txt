@@ -1,0 +1,4 @@
+requests
+fonttools
+UnityPy
+PyYAML
