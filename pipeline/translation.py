@@ -491,7 +491,16 @@ def _is_ai_selected_text_field(cfg: PipelineConfig, field_path: str, selected_fi
 def _iter_reference_types(data: Any) -> Iterable[dict[str, Any]]:
     if not isinstance(data, dict):
         return
-    array = data.get("references", {}).get("RefIds", {}).get("Array", [])
+    references = data.get("references")
+    if not isinstance(references, dict):
+        return
+    ref_ids = references.get("RefIds", [])
+    if isinstance(ref_ids, dict):
+        array = ref_ids.get("Array", [])
+    elif isinstance(ref_ids, list):
+        array = ref_ids
+    else:
+        return
     if not isinstance(array, list):
         return
     for item in array:
