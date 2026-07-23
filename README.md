@@ -378,8 +378,11 @@ game/assets/bin/Data   -> workspace/input_sources/bin/Data
 导出前会：
 
 - 清理 `workspace/temp`。
+- 把当前 `game/assets/aa` 完整备份到 `game-name/bak/aa_before_resource_export`；下次导出会用新的操作前快照覆盖该备份。
 - 如果 catalog 存在，先解析并检查远程 InternalId。
 - 可确定完整 URL 时，自动把本地缺失资源下载到游戏的 `assets/aa/Android`。
+- 全部下载成功后用绿色日志汇总；失败时只用红色日志列出失败项。每项结果记录在 `workspace/resource_state/addressables_remote_resources.json`。
+- 下载文件完整落地后，把 catalog 中对应的远程 URL 改为 `{UnityEngine.AddressableAssets.Addressables.RuntimePath}/Android/...` 本地加载路径。
 - 远程条目不是完整 HTTP/HTTPS 下载链接时停止，并写出 `workspace/resource_state/addressables_remote_resources.json`。
 - 强制清空并重建 `workspace/input_sources`。
 - 在暂存区自动合并 `.splitN`，不询问、不修改游戏原目录。
@@ -419,6 +422,11 @@ workspace/FinalResult/SplitBundles/Parts
 ```
 
 其中 `Parts` 可按原路径同步替换原 split。若不替换，程序可能继续读取 split 缓存而忽略修改后的合并资源。
+
+导入完成后会再次用绿色日志提醒替换顺序：
+
+1. 先把已下载资源和本地化 catalog 所在的 `game/assets/aa` 同步到实际项目的 `assets/aa`。
+2. 再用 `workspace/FinalResult` 中的修改资源覆盖实际项目对应文件。
 
 ## 工具脚本.py 菜单说明
 

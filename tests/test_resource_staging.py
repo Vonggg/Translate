@@ -10,6 +10,7 @@ from pipeline.resource_staging import (
     _build_remote_downloads,
     prepare_split_sync_outputs,
     prepare_unified_resource_source,
+    remote_resource_report_path,
     resource_source_map_path,
     restore_imported_resource_paths,
 )
@@ -32,6 +33,13 @@ class ResourceStagingTests(unittest.TestCase):
             (data_root / "globalgamemanagers").write_bytes(b"data")
             (android_root / "remote.bundle.split0").write_bytes(b"AB")
             (android_root / "remote.bundle.split1").write_bytes(b"CD")
+            (android_root / "downloaded.bundle").write_bytes(b"LOCAL")
+            catalog_path = game_root / "assets" / "aa" / "catalog.json"
+            remote_id = "https://cdn.example/game/Android/downloaded.bundle"
+            catalog_path.write_text(
+                json.dumps({"m_InternalIds": [remote_id]}),
+                encoding="utf-8",
+            )
 
             cfg = replace(
                 load_config(),
@@ -55,6 +63,29 @@ class ResourceStagingTests(unittest.TestCase):
             self.assertEqual((staging_root / "aa" / "Android" / "remote.bundle").read_bytes(), b"ABCD")
             self.assertTrue((android_root / "remote.bundle.split0").is_file())
             self.assertTrue((android_root / "remote.bundle.split1").is_file())
+            localized_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                localized_catalog["m_InternalIds"],
+                [
+                    "{UnityEngine.AddressableAssets.Addressables.RuntimePath}"
+                    "/Android/downloaded.bundle"
+                ],
+            )
+
+            backup_root = project_dir / "game-name" / "bak" / "aa_before_resource_export"
+            backup_catalog = json.loads((backup_root / "catalog.json").read_text(encoding="utf-8"))
+            self.assertEqual(backup_catalog["m_InternalIds"], [remote_id])
+            self.assertEqual((backup_root / "Android" / "downloaded.bundle").read_bytes(), b"LOCAL")
+
+            remote_report = json.loads(
+                remote_resource_report_path(cfg).read_text(encoding="utf-8")
+            )
+            self.assertEqual(remote_report["success_count"], 0)
+            self.assertEqual(len(remote_report["localized_internal_ids"]), 1)
+            self.assertEqual(
+                remote_report["localized_internal_ids"][0]["remote_internal_id"],
+                remote_id,
+            )
 
             state = json.loads(resource_source_map_path(cfg).read_text(encoding="utf-8"))
             split_entries = [entry for entry in state["entries"] if entry.get("split_parts")]

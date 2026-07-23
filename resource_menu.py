@@ -11,6 +11,7 @@ from pipeline.catalog_tools import auto_patch_and_repack_catalog_after_import
 from pipeline.manifest_index import load_tmp_manifest_index, tmp_manifest_index_path
 from pipeline.resource_staging import (
     load_prepared_resource_source,
+    print_final_addressables_sync_reminder,
     prepare_split_sync_outputs,
     prepare_unified_resource_source,
     restore_imported_resource_paths,
@@ -729,6 +730,7 @@ def main() -> int:
                     catalog_logs,
                     source_root / "aa" / "Android",
                 )
+                print_final_addressables_sync_reminder(cfg, import_result_root)
             return result
         if choice in {"q", "quit", "exit"}:
             return 0

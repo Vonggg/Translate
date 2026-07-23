@@ -22,6 +22,14 @@ def _log_blue(message: str) -> None:
     print(f"\033[94m{message}\033[0m", flush=True)
 
 
+def _log_green(message: str) -> None:
+    print(f"\033[92m{message}\033[0m", flush=True)
+
+
+def _log_red(message: str) -> None:
+    print(f"\033[91m{message}\033[0m", flush=True)
+
+
 def resource_state_root(cfg: PipelineConfig) -> Path:
     return cfg.root_dir / "workspace" / "resource_state"
 
@@ -52,6 +60,14 @@ def _game_root(cfg: PipelineConfig) -> Path:
 
 def _addressables_android_root(cfg: PipelineConfig) -> Path:
     return cfg.catalog_source_path.parent / "Android"
+
+
+def _addressables_root(cfg: PipelineConfig) -> Path:
+    return cfg.catalog_source_path.parent
+
+
+def _addressables_backup_root(cfg: PipelineConfig) -> Path:
+    return _game_root(cfg).parent / "bak" / "aa_before_resource_export"
 
 
 def _safe_relative_path(value: str) -> Path | None:
@@ -122,12 +138,12 @@ def _build_remote_downloads(
         if relative_path is None:
             unresolved.append({"internal_id": raw_value, "reason": "无法提取本地相对路径"})
             continue
-        destination = android_root / relative_path
-        if destination.is_file() and destination.stat().st_size > 0:
-            continue
 
         if not raw_value.lower().startswith(("http://", "https://")):
             unresolved.append({"internal_id": raw_value, "reason": "catalog 未提供完整 HTTP/HTTPS 下载链接"})
+            continue
+        destination = android_root / relative_path
+        if destination.is_file() and destination.stat().st_size > 0:
             continue
         url = raw_value
 
@@ -170,6 +186,68 @@ def _download_remote_file(task: RemoteDownload, timeout: int) -> tuple[bool, str
             except OSError:
                 pass
         return False, str(exc)
+
+
+def backup_game_addressables(cfg: PipelineConfig) -> Path | None:
+    source_root = _addressables_root(cfg)
+    if not source_root.is_dir():
+        print(f"[Addressables备份] 未找到 assets/aa，跳过备份: {source_root}")
+        return None
+
+    backup_root = _addressables_backup_root(cfg)
+    if backup_root.exists():
+        shutil.rmtree(backup_root)
+    backup_root.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_root, backup_root)
+    _log_green(f"[Addressables备份] 已在操作前备份: {source_root} -> {backup_root}")
+    return backup_root
+
+
+def _local_internal_id(relative_path: Path) -> str:
+    return (
+        "{UnityEngine.AddressableAssets.Addressables.RuntimePath}/Android/"
+        + relative_path.as_posix()
+    )
+
+
+def _localize_downloaded_catalog_resources(
+    cfg: PipelineConfig,
+    catalog: dict[str, Any],
+) -> list[dict[str, str]]:
+    internal_ids = catalog.get("m_InternalIds")
+    if not isinstance(internal_ids, list):
+        return []
+
+    changes: list[dict[str, str]] = []
+    android_root = _addressables_android_root(cfg)
+    for index, raw_value in enumerate(internal_ids):
+        if not isinstance(raw_value, str) or not raw_value.lower().startswith(("http://", "https://")):
+            continue
+        relative_path = _remote_relative_path(raw_value)
+        if relative_path is None:
+            continue
+        local_file = android_root / relative_path
+        if not local_file.is_file() or local_file.stat().st_size <= 0:
+            raise FileNotFoundError(f"远程资源尚未完整落地，不能本地化 catalog: {local_file}")
+        local_id = _local_internal_id(relative_path)
+        internal_ids[index] = local_id
+        changes.append(
+            {
+                "index": str(index),
+                "remote_internal_id": raw_value,
+                "local_internal_id": local_id,
+                "local_file": str(local_file),
+            }
+        )
+
+    if not changes:
+        return []
+
+    catalog_path = cfg.catalog_source_path
+    temp_path = catalog_path.with_name(catalog_path.name + ".localize.tmp")
+    temp_path.write_text(json.dumps(catalog, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    temp_path.replace(catalog_path)
+    return changes
 
 
 def inspect_and_download_catalog_resources(cfg: PipelineConfig) -> bool:
@@ -222,43 +300,79 @@ def inspect_and_download_catalog_resources(cfg: PipelineConfig) -> bool:
     )
 
     if unresolved:
-        print(f"[catalog][停止] 发现 {len(unresolved)} 个本地缺失的远程资源，但 catalog 没有提供完整下载链接。")
-        print(f"[catalog][停止] 详情: {report_path}")
+        _log_red(f"[catalog][停止] 发现 {len(unresolved)} 个远程资源，但 catalog 没有提供完整下载链接。")
+        _log_red(f"[catalog][停止] 详情: {report_path}")
         return False
-
-    if not downloads:
-        print("[catalog] 没有需要下载的远程资源。")
-        return True
-
-    print(
-        f"[catalog] 需要下载远程资源: {len(downloads)} 个 -> "
-        f"{_addressables_android_root(cfg)}"
-    )
 
     failures: list[dict[str, str]] = []
-    completed = 0
-    with ThreadPoolExecutor(max_workers=cfg.addressables_download_workers) as executor:
-        futures = {
-            executor.submit(_download_remote_file, task, cfg.addressables_download_timeout): task
-            for task in downloads
-        }
-        for future in as_completed(futures):
-            task = futures[future]
-            ok, error = future.result()
-            completed += 1
-            if ok:
-                print(f"[catalog][下载] {completed}/{len(downloads)} {task.relative_path}", flush=True)
-            else:
-                failures.append({"url": task.url, "destination": str(task.destination), "error": error})
-                print(f"[catalog][下载失败] {task.url}: {error}", flush=True)
+    download_results: list[dict[str, Any]] = []
+    if downloads:
+        print(
+            f"[catalog] 需要下载远程资源: {len(downloads)} 个 -> "
+            f"{_addressables_android_root(cfg)}"
+        )
+        with ThreadPoolExecutor(max_workers=cfg.addressables_download_workers) as executor:
+            futures = {
+                executor.submit(_download_remote_file, task, cfg.addressables_download_timeout): task
+                for task in downloads
+            }
+            for future in as_completed(futures):
+                task = futures[future]
+                ok, error = future.result()
+                result_row = {
+                    "success": ok,
+                    "url": task.url,
+                    "relative_path": str(task.relative_path),
+                    "destination": str(task.destination),
+                    "error": error,
+                }
+                download_results.append(result_row)
+                if not ok:
+                    failures.append(
+                        {"url": task.url, "destination": str(task.destination), "error": error}
+                    )
 
+    report["download_results"] = sorted(
+        download_results,
+        key=lambda item: str(item.get("relative_path", "")),
+    )
     report["failures"] = failures
     report["success_count"] = len(downloads) - len(failures)
-    _write_json(report_path, report)
     if failures:
-        print(f"[catalog][停止] 有 {len(failures)} 个远程资源下载失败，详情: {report_path}")
+        for failure in failures:
+            _log_red(
+                f"[catalog][下载失败] {failure['url']} -> "
+                f"{failure['destination']}: {failure['error']}"
+            )
+        _write_json(report_path, report)
+        _log_red(f"[catalog][停止] 有 {len(failures)} 个远程资源下载失败，详情: {report_path}")
         return False
-    print(f"[catalog] 远程资源下载完成: {len(downloads)} 个。")
+
+    try:
+        localized = _localize_downloaded_catalog_resources(cfg, catalog)
+    except Exception as exc:
+        report["catalog_localization_error"] = str(exc)
+        _write_json(report_path, report)
+        _log_red(f"[catalog][停止] 远程资源已下载，但 catalog 切换为本地加载失败: {exc}")
+        return False
+
+    report["localized_internal_ids"] = localized
+    _write_json(report_path, report)
+    if downloads:
+        _log_green(f"[catalog] 远程资源全部下载成功: {len(downloads)} 个。")
+    elif remote_internal_ids:
+        _log_green(f"[catalog] catalog 中的远程资源已全部存在于本地: {len(remote_internal_ids)} 个。")
+    else:
+        print("[catalog] 没有需要下载的远程资源。")
+    if remote_internal_ids:
+        _log_green(f"[catalog] 下载/本地资源保存目录: {_addressables_android_root(cfg)}")
+    if localized:
+        _log_green(f"[catalog] 已将 {len(localized)} 个远程 InternalId 改为本地 RuntimePath。")
+        _log_green(f"[catalog] 已更新游戏 catalog: {catalog_path}")
+        try:
+            parse_catalog_to_output(cfg)
+        except Exception as exc:
+            print(f"[catalog][提示] 本地化后重新展开 catalog 失败: {exc}")
     return True
 
 
@@ -309,6 +423,11 @@ def _source_info_for_staged_path(
 
 
 def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
+    try:
+        backup_game_addressables(cfg)
+    except Exception as exc:
+        _log_red(f"[Addressables备份][停止] assets/aa 备份失败: {exc}")
+        return None
     if not inspect_and_download_catalog_resources(cfg):
         return None
     if not cfg.resource_source_root.is_dir():
@@ -545,3 +664,19 @@ def prepare_split_sync_outputs(
     _log_blue("[分卷][需要同步] 必须同步替换原 .splitN；否则程序会继续读取 split 缓存，而不是修改后的合并资源。")
     _log_blue(f"[分卷][需要同步] 报告: {report_path}")
     return len(records)
+
+
+def print_final_addressables_sync_reminder(cfg: PipelineConfig, final_root: Path) -> None:
+    source_aa = _addressables_root(cfg)
+    expected_project_aa = (
+        cfg.project_dir / "game-name" / "GAME_hongtu_P" / "assets" / "aa"
+    )
+    target_text = (
+        str(expected_project_aa)
+        if expected_project_aa.parent.is_dir()
+        else "<实际项目目录>/assets/aa"
+    )
+    _log_green(f"[导入完成] 已下载并本地化的 Addressables 位于: {source_aa}")
+    _log_green("[导入完成] 推荐替换顺序:")
+    _log_green(f"[导入完成] 1. 先把 {source_aa} 同步到 {target_text}")
+    _log_green(f"[导入完成] 2. 再用 {final_root} 中的修改资源覆盖实际项目对应文件")
