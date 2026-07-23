@@ -36,6 +36,7 @@ namespace Translate.EditorTools
 
         public static void Run()
         {
+            Debug.Log("[TMP] Generator entry reached");
             var jobPath = GetArgumentValue("--job") ?? DefaultJobPath;
             var job = LoadJob(jobPath);
             Generate(job);

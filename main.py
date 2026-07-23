@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
+import sys
 
 from support.config import load_config
 from pipeline.font_ttf import build_ttf_replacements
@@ -21,6 +23,9 @@ from pipeline.translation import (
 
 
 CONFIG_PATH = Path("config.json")
+SDF_FINALIZE_ARGUMENT = "--finish-sdf"
+UNITY_NATIVE_CRASH_CODES = {0xC0000005, 0xFFFFFFFF}
+UNITY_GENERATOR_ENTRY_MARKER = "[TMP] Generator entry reached"
 
 
 def clean_translation_outputs(cfg) -> None:
@@ -50,6 +55,70 @@ def existing_tmp_chars_path(cfg) -> Path | None:
     print(f"[TMP] 未找到已生成字符文件: {path}")
     print("[TMP] 请先执行菜单 7 生成 tmp_chars.txt，再执行菜单 8。")
     return None
+
+
+def _unity_log_path(cfg) -> Path:
+    return cfg.root_dir / "workspace" / "logs" / "tmp_font_unity.log"
+
+
+def _is_unity_startup_crash(cfg, return_code: int) -> bool:
+    normalized_code = return_code & 0xFFFFFFFF
+    if normalized_code not in UNITY_NATIVE_CRASH_CODES:
+        return False
+    log_path = _unity_log_path(cfg)
+    if not log_path.is_file():
+        return True
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return True
+    return UNITY_GENERATOR_ENTRY_MARKER not in log_text
+
+
+def _clear_stale_unity_lock(cfg) -> bool:
+    lock_path = cfg.unity_font_project / "Temp" / "UnityLockfile"
+    if not lock_path.exists():
+        return True
+    try:
+        lock_path.unlink()
+    except OSError as exc:
+        print(f"[TMP][重试失败] UnityLockfile 仍被占用，未删除: {lock_path} ({exc})")
+        print("[TMP][重试失败] 请关闭正在使用该辅助工程的 Unity 后，再单独执行菜单 8。")
+        return False
+    print(f"[TMP][重试] 已清理失效 UnityLockfile: {lock_path}")
+    return True
+
+
+def _run_sdf_finalize_in_fresh_process(cfg) -> int:
+    tmp_chars_path = existing_tmp_chars_path(cfg)
+    if tmp_chars_path is None:
+        return 1
+
+    print(f"[TMP] 独立进程使用字符文件: {tmp_chars_path}")
+    result = launch_unity_tmp_generator(cfg, tmp_chars_path)
+    if result != 0 and _is_unity_startup_crash(cfg, result):
+        print(
+            f"[TMP][重试] 检测到 Unity 在进入字体生成前原生崩溃，"
+            f"返回码={result}，将清理失效锁后重试一次。"
+        )
+        if not _clear_stale_unity_lock(cfg):
+            return 1
+        result = launch_unity_tmp_generator(cfg, tmp_chars_path)
+
+    if result != 0:
+        print(f"[TMP][停止] Unity TMP 字体生成失败，返回码={result}；不会继续执行步骤 9。")
+        return 1
+
+    prepare_generated_tmp_import_replacements(cfg)
+    print("[完成] 独立进程已完成步骤 8 和步骤 9。")
+    return 0
+
+
+def _handoff_sdf_finalize_to_fresh_process() -> None:
+    script_path = Path(__file__).resolve()
+    print("[TMP] 步骤 0-7 已完成，正在交接到全新进程执行步骤 8 和步骤 9。")
+    sys.stdout.flush()
+    os.execv(sys.executable, [sys.executable, str(script_path), SDF_FINALIZE_ARGUMENT])
 
 
 def print_menu() -> None:
@@ -104,6 +173,9 @@ def print_menu() -> None:
 
 def main() -> int:
     cfg = load_config(CONFIG_PATH)
+    if len(sys.argv) > 1 and sys.argv[1] == SDF_FINALIZE_ARGUMENT:
+        return _run_sdf_finalize_in_fresh_process(cfg)
+
     print(f"资源输入目录: {cfg.resource_input_root}")
 
     while True:
@@ -159,12 +231,9 @@ def main() -> int:
             export_translated_files(cfg)
             disable_translated_text_effect_components(cfg)
             build_ttf_replacements(cfg)
-            tmp_chars_path = build_merged_tmp_chars(cfg)
-            result = launch_unity_tmp_generator(cfg, tmp_chars_path)
-            if result != 0:
-                return result
-            prepare_generated_tmp_import_replacements(cfg)
-            return 0
+            build_merged_tmp_chars(cfg)
+            _handoff_sdf_finalize_to_fresh_process()
+            return 1
         if choice in {"q", "quit", "exit"}:
             return 0
 
