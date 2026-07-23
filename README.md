@@ -18,10 +18,18 @@ Unity 游戏资源汉化工具链。主要流程是：导出资源到 `workspace
   - Managed DLL 目录相对路径，一般是 `game-name/game/assets/bin/Data/Managed`。
 - `catalog_source_subpath`
   - Addressables `catalog.json` 相对路径，一般在 `game-name/game/assets/aa/catalog.json`。
+- `resource_staging_root`
+  - 一键导出使用的统一原始资源暂存目录，默认 `workspace/input_sources`。
+  - 每次一键导出都会清空重建，不要在其中保存手工文件。
+- `addressables_remote_base_url`
+  - 可选。catalog 只记录 `http/...` 或 RemoteLoadPath 相对地址、无法自动推导 CDN 地址时填写。
+  - 如果 catalog 已含完整 URL，或能从 `m_InternalIdPrefixes`、同目录设置 JSON、`workspace/logs` 中的资源 URL 推导，可以留空。
+- `addressables_download_workers` / `addressables_download_timeout`
+  - 远程 Addressables 下载线程数和单次请求超时，默认 `5` 和 `60` 秒。
 - `stringliteral_json_subpath`  （现在暂未使用）
   - 如果有 IL2CPP 字符串导出，可配置到 `game-name/bak/64/stringliteral.json`。
 
-实际资源路径由：
+`bin/Data` 资源路径由：
 
 ```text
 project_root_dir + project_name + resource_source_subpath
@@ -363,17 +371,28 @@ workspace/output/Font/SDF/ToImport
 
 ### 1. 一键导出
 
-从 `config.json` 拼出资源目录，导出到 `workspace/input`。
+先把两处游戏资源汇总到统一暂存区，再导出到 `workspace/input`：
+
+```text
+game/assets/aa/Android -> workspace/input_sources/aa/Android
+game/assets/bin/Data   -> workspace/input_sources/bin/Data
+```
 
 导出前会：
 
 - 清理 `workspace/temp`。
-- 检测并提示是否合并 `.splitN` 分卷。
+- 如果 catalog 存在，先解析并检查远程 InternalId。
+- 可确定完整 URL 时，自动把本地缺失资源下载到游戏的 `assets/aa/Android`。
+- 无法确定远程 BASE_URL 时停止，并写出 `workspace/resource_state/addressables_remote_resources.json`。
+- 强制清空并重建 `workspace/input_sources`。
+- 在暂存区自动合并 `.splitN`，不询问、不修改游戏原目录。
 - 检查 Managed DLL，必要时从 DummyDll 补齐。
 
 导出后会：
 
 - 写入 `workspace/records/file_id_map.json`。
+- 写入 `workspace/resource_state/resource_source_map.json`，记录暂存资源对应的原始路径。
+- 写入 `workspace/resource_state/split_bundle_merges.json`，记录自动合并的 split。
 - 打印 MonoBehaviour 展开统计。
 
 ### 2. 一键导入
@@ -387,6 +406,22 @@ workspace/output/Font/SDF/ToImport
 ```text
 workspace/FinalResult
 ```
+
+导入结果会按映射整理到：
+
+```text
+workspace/FinalResult/Bundle/Android
+workspace/FinalResult/Data
+```
+
+如果修改资源原本来自 `.splitN`，还会额外输出：
+
+```text
+workspace/FinalResult/SplitBundles/Merged
+workspace/FinalResult/SplitBundles/Parts
+```
+
+其中 `Parts` 可按原路径同步替换原 split。若不替换，程序可能继续读取 split 缓存而忽略修改后的合并资源。
 
 ## 工具脚本.py 菜单说明
 

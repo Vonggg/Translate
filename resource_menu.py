@@ -9,7 +9,12 @@ from pathlib import Path
 from support.config import load_config
 from pipeline.catalog_tools import auto_patch_and_repack_catalog_after_import
 from pipeline.manifest_index import load_tmp_manifest_index, tmp_manifest_index_path
-from pipeline.split_bundle import find_split_bundle_groups, merge_split_bundle_groups, print_split_bundle_report
+from pipeline.resource_staging import (
+    load_prepared_resource_source,
+    prepare_split_sync_outputs,
+    prepare_unified_resource_source,
+    restore_imported_resource_paths,
+)
 
 # The Python wrapper that calls UnityResourceCLI.
 PIPELINE_SCRIPT = Path(__file__).resolve().parent / "AssetPipeline_CLI" / "scripts" / "unity_resource_pipeline.py"
@@ -144,32 +149,6 @@ def clean_result_root(result_root: Path) -> None:
     if result_root.exists():
         shutil.rmtree(result_root)
     result_root.mkdir(parents=True, exist_ok=True)
-
-
-def prepare_split_bundles_before_export(source_root: Path) -> bool:
-    groups = find_split_bundle_groups(source_root)
-    if not groups:
-        return True
-
-    print()
-    print_split_bundle_report(groups)
-    invalid_groups = [group for group in groups if not group.is_contiguous_from_zero]
-    if invalid_groups:
-        print("[分卷] 存在序号缺失或不是从 split0 开始的分卷，已取消导出。")
-        print("[分卷] 请先补齐分卷，或手动处理后再执行一键导出。")
-        print()
-        return False
-
-    confirm = input("导出前发现分卷，是否自动合并到原资源目录并删除原 .splitN 分卷？输入 y 确认: ").strip().lower()
-    if confirm != "y":
-        print("[分卷] 已取消自动合并，也取消本次导出。")
-        print()
-        return False
-
-    merged = merge_split_bundle_groups(groups, overwrite=True, delete_parts=True)
-    print(f"[分卷] 合并完成: {merged}/{len(groups)} 组。")
-    print()
-    return True
 
 
 def _path_key(path: Path) -> str:
@@ -636,29 +615,6 @@ def build_filtered_import_work_root(cfg, replacement_root: Path) -> Path | None:
     return work_root
 
 
-def normalize_final_bundle_android_layout(final_result_root: Path) -> None:
-    bundle_root = final_result_root / "Bundle"
-    android_root = bundle_root / "Android"
-    if not bundle_root.is_dir():
-        return
-    move_sources = [
-        path for path in bundle_root.iterdir()
-        if path.name != "Android" and path.name.lower() != "catalog.json"
-    ]
-    if not move_sources:
-        return
-    android_root.mkdir(parents=True, exist_ok=True)
-    for source in move_sources:
-        target = android_root / source.name
-        if target.exists():
-            if target.is_dir():
-                shutil.rmtree(target)
-            else:
-                target.unlink()
-        shutil.move(str(source), str(target))
-    print(f"已整理 Bundle 输出目录: {android_root}")
-
-
 def prompt_import_selection() -> set[str] | None:
     print_import_options()
     raw = input("请选择要导入的内容，可输入多个编号并用逗号分隔: ").strip().lower()
@@ -691,17 +647,16 @@ def print_menu() -> None:
     print("q. 退出")
     print()
     print("说明:")
-    print("  导出: 从 config.json 里的 project_root_dir + project_name 拼出资源目录")
-    print("        导出前会检测 .splitN 分卷；确认后可自动合并到原资源目录再导出")
+    print("  导出: 先解析 catalog 并补齐可自动定位的远程资源，再汇总 aa/Android 与 bin/Data")
+    print("        每次重建 workspace/input_sources；split 只在暂存区自动合并，不修改原游戏目录")
     print("        导出成功后会在 workspace\\records\\file_id_map.json 记录各资源文件的 FileID 外部依赖映射")
-    print("  导入: 仍然从 project_root_dir + project_name 读取原始资源，并按选择读取文本、字体或图片替换结果")
-    print("        导入后的文件会输出到 workspace\\FinalResult\\...，不会覆盖原始文件")
+    print("  导入: 使用导出时的统一资源暂存区，并按记录恢复 aa/Android 与 bin/Data 原始路径")
+    print("        修改过的 split 会额外输出到 FinalResult\\SplitBundles，并以蓝色提示必须同步替换")
     print()
 
 
 def main() -> int:
     cfg = load_config()
-    source_root = cfg.resource_source_root
     input_root = cfg.resource_input_root
     managed_root = cfg.resource_managed_root
     replacement_root = cfg.import_overlay_dir
@@ -713,7 +668,8 @@ def main() -> int:
         choice = input("请选择: ").strip().lower()
         if choice == "1":
             clean_workspace_temp_root(cfg)
-            if not prepare_split_bundles_before_export(source_root):
+            source_root = prepare_unified_resource_source(cfg)
+            if source_root is None:
                 return 1
             confirm = input(f"导出前是否清空目标目录 {input_root} ? 输入 y 确认，其它任意键取消: ").strip().lower()
             if confirm == "y":
@@ -730,6 +686,9 @@ def main() -> int:
             return result
         if choice == "2":
             clean_import_temp_roots(cfg)
+            source_root = load_prepared_resource_source(cfg)
+            if source_root is None:
+                return 1
             selection = prompt_import_selection()
             if selection is None:
                 print("已取消导入。")
@@ -761,9 +720,15 @@ def main() -> int:
                 import_result_root,
             )
             if result == 0:
-                normalize_final_bundle_android_layout(import_result_root)
+                restored_paths = restore_imported_resource_paths(cfg, import_result_root)
+                prepare_split_sync_outputs(cfg, import_result_root, restored_paths)
                 catalog_logs = sorted(log_dir.glob("*.log")) + sorted(log_dir.glob("*.txt"))
-                auto_patch_and_repack_catalog_after_import(cfg, import_result_root, catalog_logs)
+                auto_patch_and_repack_catalog_after_import(
+                    cfg,
+                    import_result_root,
+                    catalog_logs,
+                    source_root / "aa" / "Android",
+                )
             return result
         if choice in {"q", "quit", "exit"}:
             return 0

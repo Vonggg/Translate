@@ -875,7 +875,12 @@ def patch_expanded_catalog_from_final_bundles(
     return size_updates, crc_updates, backup_path
 
 
-def auto_patch_and_repack_catalog_after_import(cfg: PipelineConfig, final_result_root: Path, log_paths: Iterable[Path] = ()) -> Path | None:
+def auto_patch_and_repack_catalog_after_import(
+    cfg: PipelineConfig,
+    final_result_root: Path,
+    log_paths: Iterable[Path] = (),
+    source_bundle_root: Path | None = None,
+) -> Path | None:
     if not cfg.catalog_source_path.is_file():
         _log_green(f"[catalog] 未找到 catalog，无需自动修正，已正常跳过: {cfg.catalog_source_path}")
         return None
@@ -892,7 +897,7 @@ def auto_patch_and_repack_catalog_after_import(cfg: PipelineConfig, final_result
     print(f"[catalog] 检测到 catalog，开始解析: {cfg.catalog_source_path}")
     _formatted_path, expanded_path = parse_catalog_to_output(cfg, cfg.catalog_source_path, output_dir)
 
-    source_bundle_root = _source_catalog_android_root(cfg)
+    source_bundle_root = source_bundle_root or _source_catalog_android_root(cfg)
     if not validate_catalog_crc_algorithm(cfg, expanded_path, source_bundle_root, bundle_root, output_dir):
         print("[catalog][停止] 未修改 catalog。请先确认 CRC 算法或样本。")
         return None
