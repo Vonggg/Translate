@@ -29,7 +29,15 @@ UNITY_NATIVE_CRASH_CODES = {0xC0000005, 0xFFFFFFFF}
 UNITY_GENERATOR_ENTRY_MARKER = "[TMP] Generator entry reached"
 
 
-def clean_translation_outputs(cfg) -> None:
+def prompt_input(message: str) -> str:
+    return input(f"\033[96m{message}\033[0m")
+
+
+def _has_entries(path: Path) -> bool:
+    return path.is_dir() and any(path.iterdir())
+
+
+def clean_scan_records(cfg) -> None:
     preserved_file_id_map = None
     file_id_map_path = cfg.stage_record_dir / cfg.output_file_id_map_json
     if file_id_map_path.is_file():
@@ -44,9 +52,22 @@ def clean_translation_outputs(cfg) -> None:
         file_id_map_path.write_bytes(preserved_file_id_map)
         print(f"[清理] 已保留 FileID 映射: {file_id_map_path}")
 
-    if cfg.stage_dir.exists():
-        shutil.rmtree(cfg.stage_dir)
-    cfg.stage_dir.mkdir(parents=True, exist_ok=True)
+
+def maybe_clean_scan_records(cfg) -> None:
+    if not _has_entries(cfg.record_dir):
+        cfg.record_dir.mkdir(parents=True, exist_ok=True)
+        return
+
+    confirm = prompt_input(
+        f"扫描前 records 目录非空，是否清空 {cfg.record_dir} ? "
+        "输入 y 确认，其它任意键取消: "
+    ).strip().lower()
+    if confirm == "y":
+        print("正在清空已有扫描记录...")
+        clean_scan_records(cfg)
+    else:
+        print("已取消清空，继续保留现有扫描记录。")
+        print()
 
 
 def existing_tmp_chars_path(cfg) -> Path | None:
@@ -228,16 +249,10 @@ def main() -> int:
 
     while True:
         print_menu()
-        choice = input("请选择: ").strip().lower()
+        choice = prompt_input("请选择: ").strip().lower()
 
         if choice == "0":
-            confirm = input(f"扫描前是否清空已有记录文件 ({cfg.record_dir} 和 {cfg.stage_dir}) ? 输入 y 确认，其它任意键取消: ").strip().lower()
-            if confirm == "y":
-                print("正在清空已有记录文件...")
-                clean_translation_outputs(cfg)
-            else:
-                print("已取消清空，继续保留现有记录文件。")
-                print()
+            maybe_clean_scan_records(cfg)
             return scan_and_record(cfg) or 0
         if choice == "1":
             return apply_ai_field_selection_to_records(cfg) or 0
@@ -265,13 +280,7 @@ def main() -> int:
             prepare_generated_tmp_import_replacements(cfg)
             return 0
         if choice == "10":
-            confirm = input(f"扫描前是否清空已有记录文件 ({cfg.record_dir} 和 {cfg.stage_dir}) ? 输入 y 确认，其它任意键取消: ").strip().lower()
-            if confirm == "y":
-                print("正在清空已有记录文件...")
-                clean_translation_outputs(cfg)
-            else:
-                print("已取消清空，继续保留现有记录文件。")
-                print()
+            maybe_clean_scan_records(cfg)
             return _run_full_pipeline_in_isolated_processes(cfg)
         if choice in {"q", "quit", "exit"}:
             return 0

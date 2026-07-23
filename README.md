@@ -222,6 +222,9 @@ workspace/FinalResult/Bundle/catalog.json
 
 读取 `workspace/input` 下的导出 JSON。
 
+扫描前只检查 `workspace/records`：目录不存在或为空时直接开始；非空才提示是否清空。
+确认清空时保留资源导出阶段生成的 `file_id_map.json`，不会修改 `workspace/output`。
+
 输出到 `workspace/records`：
 
 - `records.json`: 待翻译文本记录。
