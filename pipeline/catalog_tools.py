@@ -894,8 +894,12 @@ def auto_patch_and_repack_catalog_after_import(
         return None
 
     output_dir = cfg.result_dir / "catalog"
-    print(f"[catalog] 检测到 catalog，开始解析: {cfg.catalog_source_path}")
-    _formatted_path, expanded_path = parse_catalog_to_output(cfg, cfg.catalog_source_path, output_dir)
+    expanded_path = output_dir / "Output.json"
+    if expanded_path.is_file():
+        _log_green(f"[catalog] 复用导出前已展开的 Output.json: {expanded_path}")
+    else:
+        print(f"[catalog][提示] 未找到导出前的 Output.json，兜底解析: {cfg.catalog_source_path}")
+        _formatted_path, expanded_path = parse_catalog_to_output(cfg, cfg.catalog_source_path, output_dir)
 
     source_bundle_root = source_bundle_root or _source_catalog_android_root(cfg)
     if not validate_catalog_crc_algorithm(cfg, expanded_path, source_bundle_root, bundle_root, output_dir):

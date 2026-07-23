@@ -204,7 +204,9 @@ Bundle 文件会放到：
 workspace/FinalResult/Bundle/Android
 ```
 
-如果检测到 Addressables catalog，导入收尾阶段会尝试解析并生成最终 catalog 到：
+如果检测到 Addressables catalog，导入收尾阶段会复用导出前生成的
+`workspace/output/catalog/Output.json`，按最终 Bundle 修正后回打生成最终 catalog 到：
+若该文件缺失，才会兜底重新解析原始 catalog。
 
 ```text
 workspace/FinalResult/Bundle/catalog.json
