@@ -559,6 +559,8 @@ def _build_tmp_font_replacement(template: dict[str, Any], old: dict[str, Any]) -
         if key in old:
             new[key] = copy.deepcopy(old[key])
 
+    _sync_alias_group_to_source(new, old, ("m_Material", "material"))
+
     if isinstance(old.get("m_FaceInfo"), dict) and isinstance(new.get("m_FaceInfo"), dict):
         for key in ("m_FamilyName", "m_StyleName", "m_UnitsPerEM"):
             if key in old["m_FaceInfo"]:
@@ -573,6 +575,8 @@ def _build_tmp_font_replacement(template: dict[str, Any], old: dict[str, Any]) -
         for key in ("m_FileID", "m_PathID"):
             if key in old["atlas"]:
                 new["atlas"][key] = copy.deepcopy(old["atlas"][key])
+    elif "atlas" in old:
+        new["atlas"] = copy.deepcopy(old["atlas"])
 
     old_atlases = old.get("m_AtlasTextures", {}).get("Array", [])
     new_atlases = new.get("m_AtlasTextures", {}).get("Array", [])
