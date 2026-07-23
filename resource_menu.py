@@ -21,6 +21,10 @@ from pipeline.resource_staging import (
 PIPELINE_SCRIPT = Path(__file__).resolve().parent / "AssetPipeline_CLI" / "scripts" / "unity_resource_pipeline.py"
 
 
+def prompt_input(message: str) -> str:
+    return input(f"\033[96m{message}\033[0m")
+
+
 def workspace_temp_root(cfg) -> Path:
     return cfg.root_dir / "workspace" / "temp"
 
@@ -618,7 +622,7 @@ def build_filtered_import_work_root(cfg, replacement_root: Path) -> Path | None:
 
 def prompt_import_selection() -> set[str] | None:
     print_import_options()
-    raw = input("请选择要导入的内容，可输入多个编号并用逗号分隔: ").strip().lower()
+    raw = prompt_input("请选择要导入的内容，可输入多个编号并用逗号分隔: ").strip().lower()
     if raw in {"q", "quit", "exit"}:
         return None
 
@@ -666,19 +670,23 @@ def main() -> int:
 
     while True:
         print_menu()
-        choice = input("请选择: ").strip().lower()
+        choice = prompt_input("请选择: ").strip().lower()
         if choice == "1":
             clean_workspace_temp_root(cfg)
             source_root = prepare_unified_resource_source(cfg)
             if source_root is None:
                 return 1
-            confirm = input(f"导出前是否清空目标目录 {input_root} ? 输入 y 确认，其它任意键取消: ").strip().lower()
-            if confirm == "y":
-                print(f"正在清空: {input_root}")
-                clean_input_root(input_root)
-            else:
-                print("已取消清空，继续保留现有文件。")
-                print()
+            if _has_files(input_root):
+                confirm = prompt_input(
+                    f"导出目标目录非空，是否清空 {input_root} ? "
+                    "输入 y 确认，其它任意键取消: "
+                ).strip().lower()
+                if confirm == "y":
+                    print(f"正在清空: {input_root}")
+                    clean_input_root(input_root)
+                else:
+                    print("已取消清空，继续保留现有文件。")
+                    print()
             prepare_managed_dlls(cfg)
             result = run_pipeline("export", source_root, input_root, managed_root, log_dir / "一键导出.log")
             if result == 0:
