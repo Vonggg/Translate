@@ -122,7 +122,7 @@ python .\resource_menu.py
 - 检测 `.splitN` 分卷，确认后可自动合并。
 - 导出资源到 `workspace/input`。
 - 生成 `workspace/records/file_id_map.json`。
-- 清理 `workspace/temp`。
+- `workspace` 非空时询问是否清空；确认后重建整个工作区。
 
 ### 2. 扫描、判断字段、翻译、生成待替换文件
 
@@ -379,7 +379,7 @@ game/assets/bin/Data   -> workspace/input_sources/bin/Data
 
 导出前会：
 
-- 清理 `workspace/temp`。
+- `workspace` 非空时询问是否清空；确认后重建整个工作区。工作区为空时直接继续。
 - 把当前 `game/assets/aa` 完整备份到 `game-name/bak/aa_before_resource_export`；下次导出会用新的操作前快照覆盖该备份。
 - 如果 catalog 存在，先解析并检查远程 InternalId。
 - 可确定完整 URL 时，自动把本地缺失资源下载到游戏的 `assets/aa/Android`。

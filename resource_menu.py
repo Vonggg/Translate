@@ -25,16 +25,24 @@ def prompt_input(message: str) -> str:
     return input(f"\033[96m{message}\033[0m")
 
 
+def workspace_root(cfg) -> Path:
+    return cfg.root_dir / "workspace"
+
+
 def workspace_temp_root(cfg) -> Path:
-    return cfg.root_dir / "workspace" / "temp"
+    return workspace_root(cfg) / "temp"
 
 
-def clean_workspace_temp_root(cfg) -> None:
-    temp_root = workspace_temp_root(cfg)
-    if temp_root.exists():
-        print(f"[临时目录] 导出前清空: {temp_root}", flush=True)
-        shutil.rmtree(temp_root)
-    temp_root.mkdir(parents=True, exist_ok=True)
+def _has_entries(root: Path) -> bool:
+    return root.is_dir() and any(root.iterdir())
+
+
+def clean_workspace_root(cfg) -> None:
+    root = workspace_root(cfg)
+    if root.exists():
+        print(f"正在清空 workspace: {root}", flush=True)
+        shutil.rmtree(root)
+    root.mkdir(parents=True, exist_ok=True)
 
 
 def clean_import_temp_roots(cfg) -> None:
@@ -142,12 +150,6 @@ def run_pipeline(
         for line in proc.stdout:
             tee.write(line)
     return proc.wait()
-
-
-def clean_input_root(input_root: Path) -> None:
-    if input_root.exists():
-        shutil.rmtree(input_root)
-    input_root.mkdir(parents=True, exist_ok=True)
 
 
 def clean_result_root(result_root: Path) -> None:
@@ -672,21 +674,22 @@ def main() -> int:
         print_menu()
         choice = prompt_input("请选择: ").strip().lower()
         if choice == "1":
-            clean_workspace_temp_root(cfg)
-            source_root = prepare_unified_resource_source(cfg)
-            if source_root is None:
-                return 1
-            if _has_files(input_root):
+            root = workspace_root(cfg)
+            if _has_entries(root):
                 confirm = prompt_input(
-                    f"导出目标目录非空，是否清空 {input_root} ? "
+                    f"workspace 非空，是否清空 {root} ? "
                     "输入 y 确认，其它任意键取消: "
                 ).strip().lower()
                 if confirm == "y":
-                    print(f"正在清空: {input_root}")
-                    clean_input_root(input_root)
+                    clean_workspace_root(cfg)
                 else:
-                    print("已取消清空，继续保留现有文件。")
+                    print("已取消清空，继续保留现有 workspace 内容。")
                     print()
+            else:
+                root.mkdir(parents=True, exist_ok=True)
+            source_root = prepare_unified_resource_source(cfg)
+            if source_root is None:
+                return 1
             prepare_managed_dlls(cfg)
             result = run_pipeline("export", source_root, input_root, managed_root, log_dir / "一键导出.log")
             if result == 0:
