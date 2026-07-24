@@ -1185,7 +1185,7 @@ def run_clean_all_text_effect_materials() -> None:
     cfg = load_config()
     print()
     print("清理全部 TMP 阴影/描边/发光材质")
-    print("说明: 扫描 workspace/input 中全部带 TMP 效果参数的 Material JSON，")
+    print("说明: 扫描 workspace/input 中具有 TMP SDF 专属参数且带效果参数的 Material JSON，")
     print("      将对应替换 JSON 写入 workspace/output/Text；本工具只处理材质，不处理组件。")
     print("      这会影响所有使用这些材质的文本，请先保留资源副本。")
     print()

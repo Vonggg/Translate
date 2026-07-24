@@ -1767,6 +1767,46 @@ MATERIAL_EFFECT_COLOR_ALPHA_ZERO_KEYS = {
     "_GlowColor",
 }
 
+# Generic scene shaders also commonly expose _OutlineWidth/_OutlineColor.  A
+# material must have several TMP SDF-specific properties before we ever alter it.
+TMP_SDF_MATERIAL_MARKERS = {
+    "_FaceColor",
+    "_FaceDilate",
+    "_GradientScale",
+    "_ScaleRatioA",
+    "_ScaleRatioB",
+    "_ScaleRatioC",
+    "_TextureWidth",
+    "_TextureHeight",
+    "_WeightNormal",
+    "_WeightBold",
+}
+
+
+def _material_property_names(node: Any, names: set[str]) -> None:
+    if isinstance(node, dict):
+        pair_name = node.get("first")
+        if not isinstance(pair_name, str):
+            pair_name = node.get("name") if isinstance(node.get("name"), str) else None
+        if isinstance(pair_name, str):
+            names.add(pair_name)
+        for key, value in node.items():
+            if isinstance(key, str):
+                names.add(key)
+            _material_property_names(value, names)
+    elif isinstance(node, list):
+        for item in node:
+            _material_property_names(item, names)
+
+
+def _is_tmp_sdf_material_json(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    names: set[str] = set()
+    _material_property_names(data, names)
+    markers = TMP_SDF_MATERIAL_MARKERS.intersection(names)
+    return "_FaceColor" in markers and len(markers) >= 3
+
 
 def _zero_number(value: Any) -> tuple[Any, bool]:
     if isinstance(value, bool):
@@ -1893,7 +1933,7 @@ def _material_paths_for_translated_records(
 
 
 def _all_text_effect_material_paths(cfg: PipelineConfig) -> dict[str, list[dict[str, Any]]]:
-    """Find every exported Material that has TMP outline, underlay, or glow properties."""
+    """Find every TMP SDF Material that has outline, underlay, or glow properties."""
     effect_names = MATERIAL_EFFECT_FLOAT_ZERO_KEYS | MATERIAL_EFFECT_COLOR_ALPHA_ZERO_KEYS
     material_sources: dict[str, list[dict[str, Any]]] = {}
     for json_path in collect_json_files(cfg.resource_input_root):
@@ -1901,13 +1941,55 @@ def _all_text_effect_material_paths(cfg: PipelineConfig) -> dict[str, list[dict[
             continue
         try:
             raw_text = json_path.read_text(encoding="utf-8-sig", errors="ignore")
+            data = json.loads(raw_text)
         except Exception:
             continue
-        if not any(name in raw_text for name in effect_names):
+        if not any(name in raw_text for name in effect_names) or not _is_tmp_sdf_material_json(data):
             continue
         relative = str(json_path.relative_to(cfg.resource_input_root))
         material_sources[relative] = [{"text_file": "<runtime-binding fallback>", "field": "", "file_id": None, "path_id": None}]
     return material_sources
+
+
+def _remove_stale_non_tmp_global_material_overlays(cfg: PipelineConfig) -> int:
+    """Remove only old all-material fallback outputs proven to be non-TMP."""
+    record_path = cfg.stage_record_dir / cfg.output_disabled_effect_components_json
+    if not record_path.is_file():
+        return 0
+    try:
+        record_data = read_json(record_path)
+    except Exception:
+        return 0
+    materials = record_data.get("materials") if isinstance(record_data, dict) else None
+    if not isinstance(materials, list):
+        return 0
+    removed = 0
+    for item in materials:
+        if not isinstance(item, dict):
+            continue
+        used_by = item.get("used_by")
+        if not isinstance(used_by, list) or not any(
+            isinstance(source, dict) and source.get("text_file") == "<runtime-binding fallback>"
+            for source in used_by
+        ):
+            continue
+        relative = item.get("file")
+        output_file = item.get("output_file")
+        if not isinstance(relative, str) or not isinstance(output_file, str):
+            continue
+        try:
+            source_data = read_json(_resolve_input_json_path(cfg, relative))
+        except Exception:
+            continue
+        if _is_tmp_sdf_material_json(source_data):
+            continue
+        output_path = cfg.stage_dir / output_file
+        if output_path.is_file():
+            output_path.unlink()
+            removed += 1
+    if removed:
+        _log_blue(f"[材质阴影描边] 已清理旧版全量工具误写入的非 TMP 材质: {removed} 个")
+    return removed
 
 
 def _load_runtime_binding_sources_for_translations(
@@ -2415,6 +2497,7 @@ def disable_translated_text_effect_components(
     if translations is None or scan_artifacts is None:
         raise FileNotFoundError("需要先生成 records.json / trans.json / ref_map.json，再执行阴影描边组件屏蔽。")
 
+    _remove_stale_non_tmp_global_material_overlays(cfg)
     records, _ids_map, _font_map, ref_map = scan_artifacts
     if not _is_reverse_ref_map_format(ref_map):
         raise ValueError("ref_map.json 不是被引用表格式，请先重新执行脚本 0。")
@@ -2501,6 +2584,7 @@ def disable_translated_text_effect_components(
     material_changed_count = 0
     material_disabled_fields_total = 0
     material_skipped_without_effect = 0
+    material_skipped_non_tmp = 0
     disabled_material_records: list[dict[str, Any]] = []
     total_components = len(component_paths)
     for index, json_path in enumerate(sorted(component_paths), start=1):
@@ -2581,6 +2665,9 @@ def disable_translated_text_effect_components(
         except Exception:
             _log(f"[材质阴影描边] 读取失败，已跳过: {source_path}")
             continue
+        if not _is_tmp_sdf_material_json(data):
+            material_skipped_non_tmp += 1
+            continue
         changes = _disable_material_effect_properties(data)
         material_matched_count += 1
         source_entries = material_sources.get(str(relative), [])
@@ -2658,7 +2745,8 @@ def disable_translated_text_effect_components(
     _log(
         f"[材质阴影描边] 命中材质: {material_matched_count} 个；"
         f"写出屏蔽 JSON: {material_changed_count} 个；修改字段: {material_disabled_fields_total} 处；"
-        f"跳过无效果参数材质: {material_skipped_without_effect} 个"
+        f"跳过无效果参数材质: {material_skipped_without_effect} 个；"
+        f"跳过非 TMP 材质: {material_skipped_non_tmp} 个"
     )
     _log(f"[阴影描边] 屏蔽组件记录: {record_path}")
     _log(f"[阴影描边] 屏蔽组件 TSV: {tsv_path}")
