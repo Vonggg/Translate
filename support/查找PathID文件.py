@@ -18,6 +18,10 @@ from support.image_import_utils import copy_image_for_import
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".webp"}
 
 
+def prompt_input(message: str) -> str:
+    return input(f"\033[38;5;208m{message}\033[0m")
+
+
 def normalize_path_id(raw: str) -> str:
     text = raw.strip()
     if text.lower().startswith("0x"):
@@ -138,7 +142,7 @@ def prompt_copy_images(image_paths: list[Path], input_root: Path, output_root: P
 
     print()
     print("输入编号复制图片，可用逗号或范围，例如 1,3,5 或 2-6；输入 all 复制全部；直接回车跳过。")
-    raw = input("请选择要复制的图片编号: ")
+    raw = prompt_input("请选择要复制的图片编号: ")
     try:
         selected_indexes = parse_selection(raw, len(image_paths))
     except ValueError:
@@ -182,7 +186,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    raw_path_id = args.path_id or input("请输入 PathID: ").strip()
+    raw_path_id = args.path_id or prompt_input("请输入 PathID: ").strip()
     if not raw_path_id:
         print("PathID 不能为空。")
         return 1

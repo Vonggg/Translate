@@ -22,7 +22,7 @@ PIPELINE_SCRIPT = Path(__file__).resolve().parent / "AssetPipeline_CLI" / "scrip
 
 
 def prompt_input(message: str) -> str:
-    return input(f"\033[96m{message}\033[0m")
+    return input(f"\033[38;5;208m{message}\033[0m")
 
 
 def log_source_modified(message: str) -> None:

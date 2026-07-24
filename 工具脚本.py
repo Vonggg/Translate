@@ -45,6 +45,10 @@ M_NAME_JSON_RE = re.compile(r'("m_Name"\s*:\s*)"(?:\\.|[^"\\])*"')
 M_NAME_YAML_RE = re.compile(r"(^\s*m_Name:\s*)(.*)$", re.MULTILINE)
 
 
+def prompt_input(message: str) -> str:
+    return input(f"\033[38;5;208m{message}\033[0m")
+
+
 def iter_json_files(root: Path):
     for path in root.rglob("*.json"):
         if path.is_file():
@@ -417,13 +421,13 @@ def copy_matched_json_files(source_root: Path, dest_root: Path, needle: str) -> 
 
 
 def prompt_path(label: str, default_path: Path) -> Path:
-    raw = input(f"{label}（直接回车使用默认 {default_path}）: ").strip()
+    raw = prompt_input(f"{label}（直接回车使用默认 {default_path}）: ").strip()
     return Path(raw) if raw else default_path
 
 
 def prompt_text(label: str) -> str:
     while True:
-        raw = input(f"{label}: ").strip()
+        raw = prompt_input(f"{label}: ").strip()
         if raw:
             return raw
         print("输入不能为空，请重新输入。")
@@ -866,7 +870,7 @@ def _select_ai_batch_request_path() -> Path | None:
     request_files = sorted(records_dir.glob("ai_translation_request*.json"))
     if not request_files:
         print(f"未找到 AI request 批次文件: {records_dir / 'ai_translation_request*.json'}")
-        raw = input("可手动输入 request 文件路径，或直接回车返回: ").strip()
+        raw = prompt_input("可手动输入 request 文件路径，或直接回车返回: ").strip()
         return Path(raw) if raw else None
 
     print()
@@ -878,7 +882,7 @@ def _select_ai_batch_request_path() -> Path | None:
     print("q. 返回")
 
     while True:
-        raw = input("请选择批次编号，或输入 request 文件路径: ").strip()
+        raw = prompt_input("请选择批次编号，或输入 request 文件路径: ").strip()
         if raw.lower() in {"q", "quit", "exit"}:
             return None
         if raw.isdigit():
@@ -936,7 +940,7 @@ def run_ai_translation_batch_menu() -> None:
     print("2. 用已有 response 修补 trans.json")
     print("3. 重发单批后立刻修补 trans.json")
     print("q. 返回")
-    choice = input("请选择: ").strip().lower()
+    choice = prompt_input("请选择: ").strip().lower()
     if choice in {"q", "quit", "exit"}:
         return
 
@@ -1046,11 +1050,11 @@ def run_clean_unsupported_ttf_chars() -> None:
         if len(matches) > 50:
             print(f"  ... 其余 {len(matches) - 50} 条省略")
 
-        confirm = input(f"是否统一替换/删除字符 {repr(char)} ? 输入 y 确认，其它任意键跳过: ").strip().lower()
+        confirm = prompt_input(f"是否统一替换/删除字符 {repr(char)} ? 输入 y 确认，其它任意键跳过: ").strip().lower()
         if confirm != "y":
             print(f"[清理字符] 已跳过: {repr(char)}")
             continue
-        replacement = input("替换为（直接回车表示删除该字符）: ")
+        replacement = prompt_input("替换为（直接回车表示删除该字符）: ")
         changed = 0
         for source, translated in matches:
             new_value = translated.replace(char, replacement)
@@ -1132,7 +1136,7 @@ def run_clean_blacklisted_records() -> None:
         if len(field_counts) > 50:
             print(f"  ... 其余字段 {len(field_counts) - 50} 个省略")
 
-    confirm = input("确认写回 records.json 并清理 trans.json ? 输入 y 确认，其它任意键取消: ").strip().lower()
+    confirm = prompt_input("确认写回 records.json 并清理 trans.json ? 输入 y 确认，其它任意键取消: ").strip().lower()
     if confirm != "y":
         print("[清理黑名单] 已取消，未修改文件。")
         return
@@ -1167,7 +1171,7 @@ def run_sync_generated_tmp_material_parameters() -> None:
     print("      保留原游戏材质的 PathID、Shader、纹理、颜色和遮罩设置，只同步影响 SDF 边缘的数值参数。")
     print("      重新执行主流程的 SDF 待导入准备步骤，会清空本工具生成的材质替换。")
     print()
-    confirm = input("确认同步生成材质参数到当前 SDF/ToImport ? 输入 y 确认，其它任意键取消: ").strip().lower()
+    confirm = prompt_input("确认同步生成材质参数到当前 SDF/ToImport ? 输入 y 确认，其它任意键取消: ").strip().lower()
     if confirm != "y":
         print("[TMP材质] 已取消，未修改文件。")
         return
@@ -1185,7 +1189,7 @@ def run_clean_all_text_effect_materials() -> None:
     print("      将对应替换 JSON 写入 workspace/output/Text；本工具只处理材质，不处理组件。")
     print("      这会影响所有使用这些材质的文本，请先保留资源副本。")
     print()
-    confirm = input("确认执行全部材质清理? 输入 y 确认，其它任意键取消: ").strip().lower()
+    confirm = prompt_input("确认执行全部材质清理? 输入 y 确认，其它任意键取消: ").strip().lower()
     if confirm != "y":
         print("[材质阴影描边] 已取消，未修改文件。")
         return
@@ -1337,7 +1341,7 @@ def run_patch_catalog_real_crc_interactive() -> None:
                     f"hash={row.get('m_Hash')} real_crc={row.get('m_Crc')} size={row.get('m_BundleSize')}"
                 )
                 while True:
-                    choice = input("输入 0 置 m_Crc=0 跳过校验；输入 s 跳过该条真实 CRC 替换: ").strip().lower()
+                    choice = prompt_input("输入 0 置 m_Crc=0 跳过校验；输入 s 跳过该条真实 CRC 替换: ").strip().lower()
                     if choice in {"0", ""}:
                         row["m_Crc"] = 0
                         changed += 1
@@ -1465,7 +1469,7 @@ def main() -> int:
         print("17. 清理全部 TMP 阴影/描边/发光材质")
         print("q. 退出")
         try:
-            choice = input("请选择: ").strip().lower()
+            choice = prompt_input("请选择: ").strip().lower()
         except EOFError:
             return 0
 

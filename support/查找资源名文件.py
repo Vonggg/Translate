@@ -17,6 +17,10 @@ from support.image_import_utils import copy_image_for_import
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".webp"}
 
 
+def prompt_input(message: str) -> str:
+    return input(f"\033[38;5;208m{message}\033[0m")
+
+
 def normalize_name(raw: str) -> str:
     return raw.strip()
 
@@ -143,7 +147,7 @@ def prompt_copy_images(image_paths: list[Path], input_root: Path, output_root: P
 
     print()
     print("输入编号复制图片，可用逗号或范围，例如 1,3,5 或 2-6；输入 all 复制全部；直接回车跳过。")
-    raw = input("请选择要复制的图片编号: ")
+    raw = prompt_input("请选择要复制的图片编号: ")
     try:
         selected_indexes = parse_selection(raw, len(image_paths))
     except ValueError:
@@ -192,7 +196,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    raw_asset_name = args.asset_name or input("请输入资源名: ").strip()
+    raw_asset_name = args.asset_name or prompt_input("请输入资源名: ").strip()
     asset_name = normalize_name(raw_asset_name)
     if not asset_name:
         print("资源名不能为空。")

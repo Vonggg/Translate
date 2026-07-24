@@ -2103,7 +2103,7 @@ def _manual_ai_field_selection(cfg: PipelineConfig, candidates_path: Path, reaso
     if reason:
         print(f"[AI字段] {reason}")
     print(f"[AI字段] 请把字段候选文件交给 AI 判断: {candidates_path}")
-    raw = input("[AI字段] 粘贴 AI 返回的字段名，使用英文逗号分隔: ").strip()
+    raw = input("\033[38;5;208m[AI字段] 粘贴 AI 返回的字段名，使用英文逗号分隔: \033[0m").strip()
     return _parse_ai_field_response(raw)
 
 

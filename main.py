@@ -31,7 +31,7 @@ UNITY_GENERATOR_ENTRY_MARKER = "[TMP] Generator entry reached"
 
 
 def prompt_input(message: str) -> str:
-    return input(f"\033[96m{message}\033[0m")
+    return input(f"\033[38;5;208m{message}\033[0m")
 
 
 def scan_generated_artifact_paths(cfg) -> list[Path]:
