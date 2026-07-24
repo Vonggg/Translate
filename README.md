@@ -222,8 +222,9 @@ workspace/FinalResult/Bundle/catalog.json
 
 读取 `workspace/input` 下的导出 JSON。
 
-扫描前只检查 `workspace/records`：目录不存在或为空时直接开始；非空才提示是否清空。
-确认清空时保留资源导出阶段生成的 `file_id_map.json`，不会修改 `workspace/output`。
+扫描前只检查脚本 0 会重新生成的扫描产物；这些文件不存在时直接开始，存在时才提示是否清理。
+确认清理时只删除扫描索引、扫描状态/缓存、TMP manifest 索引，以及 AI 字段判断启用时的字段统计；
+不会触碰资源导出阶段生成的 `file_id_map.json`、翻译记录或 `workspace/output`。
 
 输出到 `workspace/records`：
 

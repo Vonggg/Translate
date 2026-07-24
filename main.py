@@ -7,6 +7,7 @@ import sys
 
 from support.config import load_config
 from pipeline.font_ttf import build_ttf_replacements
+from pipeline.manifest_index import tmp_manifest_index_path
 from pipeline.tmp_pipeline import (
     build_merged_tmp_chars,
     launch_unity_tmp_generator,
@@ -33,38 +34,55 @@ def prompt_input(message: str) -> str:
     return input(f"\033[96m{message}\033[0m")
 
 
-def _has_entries(path: Path) -> bool:
-    return path.is_dir() and any(path.iterdir())
+def scan_generated_artifact_paths(cfg) -> list[Path]:
+    paths = [
+        cfg.stage_record_dir / cfg.output_scan_records_json,
+        cfg.stage_record_dir / cfg.output_ids_json,
+        cfg.stage_record_dir / cfg.output_font_map_json,
+        cfg.stage_record_dir / cfg.output_material_map_json,
+        cfg.stage_record_dir / cfg.output_ref_map_json,
+        cfg.stage_record_dir / cfg.output_path_id_map_json,
+        cfg.scan_state_path,
+        cfg.scan_cache_path,
+        tmp_manifest_index_path(cfg),
+    ]
+    if cfg.enable_ai_field_review:
+        paths.extend(
+            [
+                cfg.stage_record_dir / cfg.output_string_field_stats_json,
+                cfg.stage_record_dir / cfg.output_string_field_stats_tsv,
+                cfg.stage_record_dir / cfg.output_string_field_review_txt,
+            ]
+        )
+    return paths
 
 
-def clean_scan_records(cfg) -> None:
-    preserved_file_id_map = None
-    file_id_map_path = cfg.stage_record_dir / cfg.output_file_id_map_json
-    if file_id_map_path.is_file():
-        preserved_file_id_map = file_id_map_path.read_bytes()
-
-    if cfg.record_dir.exists():
-        shutil.rmtree(cfg.record_dir)
+def clean_scan_artifacts(cfg) -> int:
+    removed = 0
+    for path in scan_generated_artifact_paths(cfg):
+        if path.is_dir():
+            shutil.rmtree(path)
+            removed += 1
+        elif path.is_file():
+            path.unlink()
+            removed += 1
     cfg.record_dir.mkdir(parents=True, exist_ok=True)
-
-    if preserved_file_id_map is not None:
-        file_id_map_path.parent.mkdir(parents=True, exist_ok=True)
-        file_id_map_path.write_bytes(preserved_file_id_map)
-        print(f"[清理] 已保留 FileID 映射: {file_id_map_path}")
+    return removed
 
 
 def maybe_clean_scan_records(cfg) -> None:
-    if not _has_entries(cfg.record_dir):
+    existing_paths = [path for path in scan_generated_artifact_paths(cfg) if path.exists()]
+    if not existing_paths:
         cfg.record_dir.mkdir(parents=True, exist_ok=True)
         return
 
     confirm = prompt_input(
-        f"扫描前 records 目录非空，是否清空 {cfg.record_dir} ? "
-        "输入 y 确认，其它任意键取消: "
+        f"扫描产物已存在（{len(existing_paths)} 项），是否清理后重新扫描？"
+        " 输入 y 确认，其它任意键取消: "
     ).strip().lower()
     if confirm == "y":
-        print("正在清空已有扫描记录...")
-        clean_scan_records(cfg)
+        removed = clean_scan_artifacts(cfg)
+        print(f"[清理] 已清理扫描产物: {removed} 项；未触碰其它 records 文件。")
     else:
         print("已取消清空，继续保留现有扫描记录。")
         print()
