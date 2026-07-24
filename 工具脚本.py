@@ -22,7 +22,7 @@ from pipeline.catalog_tools import (
     _rebuild_request_option_raw,
     _source_catalog_android_root,
 )
-from pipeline.translation import _is_blacklisted_string_field
+from pipeline.translation import _is_blacklisted_string_field, disable_translated_text_effect_components
 from pipeline.tmp_pipeline import sync_generated_tmp_material_parameters
 
 
@@ -1177,6 +1177,28 @@ def run_sync_generated_tmp_material_parameters() -> None:
         print(f"[TMP材质] 处理失败: {exc}")
 
 
+def run_clean_all_text_effect_materials() -> None:
+    cfg = load_config()
+    print()
+    print("清理全部 TMP 阴影/描边/发光材质")
+    print("说明: 扫描 workspace/input 中全部带 TMP 效果参数的 Material JSON，")
+    print("      将对应替换 JSON 写入 workspace/output/Text；本工具只处理材质，不处理组件。")
+    print("      这会影响所有使用这些材质的文本，请先保留资源副本。")
+    print()
+    confirm = input("确认执行全部材质清理? 输入 y 确认，其它任意键取消: ").strip().lower()
+    if confirm != "y":
+        print("[材质阴影描边] 已取消，未修改文件。")
+        return
+    try:
+        disable_translated_text_effect_components(
+            cfg,
+            force_all_text_effect_materials=True,
+            material_only=True,
+        )
+    except Exception as exc:
+        print(f"[材质阴影描边] 处理失败: {exc}")
+
+
 def run_parse_catalog() -> None:
     cfg = load_config()
     print()
@@ -1384,6 +1406,9 @@ def main() -> int:
         if command in {"sync-generated-sdf-material", "sync-sdf-material"}:
             run_sync_generated_tmp_material_parameters()
             return 0
+        if command in {"clean-all-text-effects", "clean-all-tmp-effects"}:
+            run_clean_all_text_effect_materials()
+            return 0
         if command in {"parse-catalog", "catalog"}:
             run_parse_catalog()
             return 0
@@ -1411,6 +1436,7 @@ def main() -> int:
         print(f"或: python {Path(__file__).name} clean-unsupported-ttf-chars")
         print(f"或: python {Path(__file__).name} clean-blacklisted-records")
         print(f"或: python {Path(__file__).name} sync-generated-sdf-material")
+        print(f"或: python {Path(__file__).name} clean-all-text-effects")
         print(f"或: python {Path(__file__).name} parse-catalog")
         print(f"或: python {Path(__file__).name} repack-catalog [Output.json] [catalog.repacked.json]")
         print(f"或: python {Path(__file__).name} auto-patch-catalog")
@@ -1436,6 +1462,7 @@ def main() -> int:
         print("14. 按最终 Bundle 真实 CRC 修正 catalog（长度溢出时询问）")
         print("15. 清理 records.json 中当前黑名单字段，并同步清理 trans.json")
         print("16. 同步生成字体的 SDF 材质参数到待导入目录（可选实验）")
+        print("17. 清理全部 TMP 阴影/描边/发光材质")
         print("q. 退出")
         try:
             choice = input("请选择: ").strip().lower()
@@ -1478,6 +1505,9 @@ def main() -> int:
         if choice == "16":
             run_sync_generated_tmp_material_parameters()
             continue
+        if choice == "17":
+            run_clean_all_text_effect_materials()
+            continue
         if choice == "11":
             run_parse_catalog()
             continue
@@ -1493,7 +1523,7 @@ def main() -> int:
         if choice in {"q", "quit", "exit"}:
             return 0
 
-        print("无效选择，请输入 1、2、3、4、5、6、7、8、9、10、11、12、13、14、15、16 或 q。")
+        print("无效选择，请输入 1、2、3、4、5、6、7、8、9、10、11、12、13、14、15、16、17 或 q。")
     return 0
 
 

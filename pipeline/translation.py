@@ -565,6 +565,80 @@ def _is_localization_string_table_json(data: Any) -> bool:
     return any(isinstance(row, dict) and "m_Localized" in row for row in rows)
 
 
+def _is_i2_language_table_json(data: Any) -> bool:
+    """Return true only for I2's term/language table, not ordinary I2 components."""
+    if not isinstance(data, dict):
+        return False
+    source = data.get("mSource")
+    if not isinstance(source, dict) or not isinstance(source.get("mTerms"), dict):
+        return False
+    terms = source["mTerms"].get("Array")
+    return isinstance(terms, list) and any(isinstance(term, dict) and "Languages" in term for term in terms)
+
+
+def _runtime_text_binding_report_path(cfg: PipelineConfig) -> Path:
+    return cfg.stage_record_dir / cfg.output_runtime_text_binding_report_json
+
+
+def _runtime_text_binding_kind(data: Any, record: ScanRecord) -> str | None:
+    if _is_i2_language_table_json(data):
+        return "i2_language_table"
+    if _is_localization_string_table_json(data):
+        return "unity_localization_string_table"
+    if not isinstance(record.path_id, int) or record.path_id <= 0:
+        return "runtime_or_scriptable_text"
+    return None
+
+
+def write_runtime_text_binding_report(cfg: PipelineConfig, records: list[ScanRecord]) -> Path:
+    """Record text sources that cannot be reliably linked to a static Text/TMP object."""
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    data_cache: dict[str, Any] = {}
+    for record in records:
+        source_path = str(record.file_path)
+        if source_path not in data_cache:
+            try:
+                data_cache[source_path] = read_json(_resolve_input_json_path(cfg, source_path))
+            except Exception:
+                data_cache[source_path] = None
+        kind = _runtime_text_binding_kind(data_cache[source_path], record)
+        if kind is None:
+            continue
+        entry = grouped.setdefault(
+            (kind, source_path),
+            {
+                "kind": kind,
+                "file_path": source_path,
+                "record_count": 0,
+                "source_texts": [],
+            },
+        )
+        entry["record_count"] += 1
+        if record.source_text not in entry["source_texts"]:
+            entry["source_texts"].append(record.source_text)
+
+    sources = list(grouped.values())
+    for source in sources:
+        source["text_count"] = len(source["source_texts"])
+        source["source_text_samples"] = source["source_texts"][:6]
+    sources.sort(key=lambda item: (str(item["kind"]), str(item["file_path"])))
+    summary = {
+        "i2_language_tables": sum(item["kind"] == "i2_language_table" for item in sources),
+        "unity_localization_string_tables": sum(item["kind"] == "unity_localization_string_table" for item in sources),
+        "runtime_or_scriptable_sources": sum(item["kind"] == "runtime_or_scriptable_text" for item in sources),
+        "runtime_bound_record_count": sum(int(item["record_count"]) for item in sources),
+    }
+    report_path = _runtime_text_binding_report_path(cfg)
+    write_json(report_path, {"summary": summary, "sources": sources})
+    _log(
+        "[导出] 运行时文本绑定报告已写入: "
+        f"{report_path} (I2={summary['i2_language_tables']}, "
+        f"Localization={summary['unity_localization_string_tables']}, "
+        f"其他运行时来源={summary['runtime_or_scriptable_sources']})"
+    )
+    return report_path
+
+
 def _is_unity_or_sdk_owned_json(data: Any, json_path: Path) -> bool:
     path_text = json_path.as_posix().lower()
     unity_path_markers = (
@@ -1818,6 +1892,47 @@ def _material_paths_for_translated_records(
     return material_sources
 
 
+def _all_text_effect_material_paths(cfg: PipelineConfig) -> dict[str, list[dict[str, Any]]]:
+    """Find every exported Material that has TMP outline, underlay, or glow properties."""
+    effect_names = MATERIAL_EFFECT_FLOAT_ZERO_KEYS | MATERIAL_EFFECT_COLOR_ALPHA_ZERO_KEYS
+    material_sources: dict[str, list[dict[str, Any]]] = {}
+    for json_path in collect_json_files(cfg.resource_input_root):
+        if json_path.parent.name.lower() != "material":
+            continue
+        try:
+            raw_text = json_path.read_text(encoding="utf-8-sig", errors="ignore")
+        except Exception:
+            continue
+        if not any(name in raw_text for name in effect_names):
+            continue
+        relative = str(json_path.relative_to(cfg.resource_input_root))
+        material_sources[relative] = [{"text_file": "<runtime-binding fallback>", "field": "", "file_id": None, "path_id": None}]
+    return material_sources
+
+
+def _load_runtime_binding_sources_for_translations(
+    cfg: PipelineConfig,
+    translations: dict[str, str],
+) -> list[dict[str, Any]]:
+    report_path = _runtime_text_binding_report_path(cfg)
+    if not report_path.is_file():
+        return []
+    try:
+        report = read_json(report_path)
+    except Exception:
+        return []
+    sources = report.get("sources") if isinstance(report, dict) else None
+    if not isinstance(sources, list):
+        return []
+    return [
+        item
+        for item in sources
+        if isinstance(item, dict)
+        and isinstance(item.get("source_texts"), list)
+        and any(isinstance(text, str) and text in translations for text in item["source_texts"])
+    ]
+
+
 def _load_path_id_map(cfg: PipelineConfig) -> dict[str, dict[str, str]]:
     path = cfg.stage_record_dir / cfg.output_path_id_map_json
     if not path.is_file():
@@ -2290,7 +2405,11 @@ def _export_translated_files(cfg: PipelineConfig, final_translations: dict[str, 
     _log(f"[导出] 实际写出待替换 JSON: {written_count}/{len(json_files)}")
 
 
-def disable_translated_text_effect_components(cfg: PipelineConfig) -> None:
+def disable_translated_text_effect_components(
+    cfg: PipelineConfig,
+    force_all_text_effect_materials: bool = False,
+    material_only: bool = False,
+) -> None:
     translations = _load_translation_dict(cfg)
     scan_artifacts = _load_scan_artifacts(cfg)
     if translations is None or scan_artifacts is None:
@@ -2305,10 +2424,28 @@ def disable_translated_text_effect_components(cfg: PipelineConfig) -> None:
     material_map = _load_material_usage_map(cfg)
     file_id_map = _load_file_id_map(cfg)
 
+    runtime_sources = _load_runtime_binding_sources_for_translations(cfg, dict(translations))
+    clean_all_text_effect_materials = force_all_text_effect_materials
+    if force_all_text_effect_materials:
+        _log("\033[95m[材质阴影描边] 已由工具脚本强制启用全部 TMP 效果材质清理。\033[0m")
+    elif runtime_sources:
+        kinds = sorted({str(item.get("kind", "unknown")) for item in runtime_sources})
+        _log(
+            "\033[95m[阴影描边][运行时绑定] 检测到 "
+            f"{len(runtime_sources)} 个运行时文本来源（{', '.join(kinds)}）。"
+            "这些文本无法静态关联到实际 Text/TMP 材质。\033[0m"
+        )
+        answer = input(
+            "\033[96m[阴影描边][运行时绑定] 是否清理全部含 TMP 描边/阴影/发光参数的材质？"
+            "输入 y 确认，其它任意键仅按静态引用处理: \033[0m"
+        ).strip().lower()
+        clean_all_text_effect_materials = answer == "y"
+
     component_paths: set[Path] = set()
     translated_game_objects: set[tuple[str, int]] = set()
-    for record in records:
-        if record.source_text not in translations or not isinstance(record.path_id, int):
+    component_records = [] if material_only else records
+    for record in component_records:
+        if record.source_text not in translations or not isinstance(record.path_id, int) or record.path_id <= 0:
             continue
         json_path = _resolve_input_json_path(cfg, record.file_path)
         asset_key = _bundle_key_for_json_path(cfg, json_path)
@@ -2337,7 +2474,21 @@ def disable_translated_text_effect_components(cfg: PipelineConfig) -> None:
         f"候选同物体组件: {len(component_paths)} 个"
     )
 
-    material_sources = _material_paths_for_translated_records(cfg, records, dict(translations), material_map, path_id_map, file_id_map)
+    if clean_all_text_effect_materials:
+        material_sources = _all_text_effect_material_paths(cfg)
+        _log(
+            "\033[95m[材质阴影描边][运行时绑定] 已启用全部 TMP 效果材质清理："
+            f"候选材质={len(material_sources)}。\033[0m"
+        )
+    else:
+        material_sources = _material_paths_for_translated_records(
+            cfg,
+            records,
+            dict(translations),
+            material_map,
+            path_id_map,
+            file_id_map,
+        )
     material_paths = {_resolve_input_json_path(cfg, relative) for relative in material_sources}
     _log(f"[阴影描边] 候选文本材质: {len(material_paths)} 个")
 
@@ -2600,6 +2751,10 @@ def export_translated_files(cfg: PipelineConfig) -> None:
     if not target_paths:
         raise FileNotFoundError("trans.json 没有匹配到 records.json 中的任何文本，未找到需要导出的文件。")
     _log(f"[导出] 读取 records.json + trans.json 作为导出目标，候选文件: {len(target_paths)}")
+    write_runtime_text_binding_report(
+        cfg,
+        [record for record in records if record.source_text in translations],
+    )
     _export_translated_files(cfg, dict(translations), target_paths)
     _log("[完成] 翻译后的待替换 JSON 导出已结束")
 
@@ -2616,5 +2771,9 @@ def translate_and_export(cfg: PipelineConfig) -> None:
     if not target_paths:
         raise FileNotFoundError("trans.json 没有匹配到 records.json 中的任何文本，未找到需要导出的文件。")
     _log(f"[导出] 读取 records.json + trans.json 作为导出目标，候选文件: {len(target_paths)}")
+    write_runtime_text_binding_report(
+        cfg,
+        [record for record in records if record.source_text in translations],
+    )
     _export_translated_files(cfg, dict(translations), target_paths)
     _log("[完成] 扫描、翻译和实际文件导出已结束")

@@ -143,6 +143,7 @@ class PipelineConfig:
     output_ref_map_json: str = "ref_map.json"
     output_path_id_map_json: str = "path_id_map.json"
     output_disabled_effect_components_json: str = "disabled_text_effect_components.json"
+    output_runtime_text_binding_report_json: str = "runtime_text_binding_report.json"
     output_scan_records_json: str = "records.json"
     output_string_field_stats_json: str = "string_field_stats.json"
     output_string_field_stats_tsv: str = "string_field_stats.tsv"
@@ -281,6 +282,10 @@ def load_config(config_path: str | Path | None = None) -> PipelineConfig:
         output_disabled_effect_components_json=get_value(
             "output_disabled_effect_components_json",
             "disabled_text_effect_components.json",
+        ),
+        output_runtime_text_binding_report_json=get_value(
+            "output_runtime_text_binding_report_json",
+            "runtime_text_binding_report.json",
         ),
         output_scan_records_json=get_value("output_scan_records_json", "records.json"),
         output_string_field_stats_json=get_value("output_string_field_stats_json", "string_field_stats.json"),
