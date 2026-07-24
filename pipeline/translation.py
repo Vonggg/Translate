@@ -2016,6 +2016,42 @@ def _load_runtime_binding_sources_for_translations(
     ]
 
 
+def _i2_bound_game_objects_for_translations(
+    cfg: PipelineConfig,
+    translations: dict[str, str],
+) -> set[tuple[str, int]]:
+    """Find GameObjects whose I2 Localize term is present in trans.json."""
+    result: set[tuple[str, int]] = set()
+    for json_path in collect_json_files(cfg.resource_input_root):
+        try:
+            raw_text = json_path.read_text(encoding="utf-8-sig", errors="ignore")
+        except OSError:
+            continue
+        if '"mTerm"' not in raw_text or '"mLocalizeTargetName"' not in raw_text:
+            continue
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        term = data.get("mTerm")
+        target_name = data.get("mLocalizeTargetName")
+        game_object = data.get("m_GameObject")
+        if (
+            not isinstance(term, str)
+            or term not in translations
+            or not isinstance(target_name, str)
+            or "Text" not in target_name
+            or not isinstance(game_object, dict)
+            or not isinstance(game_object.get("m_PathID"), int)
+            or game_object["m_PathID"] <= 0
+        ):
+            continue
+        result.add((_bundle_key_for_json_path(cfg, json_path), game_object["m_PathID"]))
+    return result
+
+
 def _load_path_id_map(cfg: PipelineConfig) -> dict[str, dict[str, str]]:
     path = cfg.stage_record_dir / cfg.output_path_id_map_json
     if not path.is_file():
@@ -2498,7 +2534,10 @@ def disable_translated_text_effect_components(
     if translations is None or scan_artifacts is None:
         raise FileNotFoundError("需要先生成 records.json / trans.json / ref_map.json，再执行阴影描边组件屏蔽。")
 
-    _remove_stale_global_material_overlays(cfg)
+    _remove_stale_global_material_overlays(
+        cfg,
+        remove_tmp=not force_all_text_effect_materials,
+    )
     records, _ids_map, _font_map, ref_map = scan_artifacts
     if not _is_reverse_ref_map_format(ref_map):
         raise ValueError("ref_map.json 不是被引用表格式，请先重新执行脚本 0。")
@@ -2514,34 +2553,28 @@ def disable_translated_text_effect_components(
         _log("\033[94m[材质阴影描边] 已由工具脚本强制启用全部 TMP 效果材质清理。\033[0m")
     elif runtime_sources:
         kinds = sorted({str(item.get("kind", "unknown")) for item in runtime_sources})
-        _log(
-            "\033[94m[阴影描边][运行时绑定] 检测到 "
+        _log_blue(
+            "[阴影描边][运行时绑定] 检测到 "
             f"{len(runtime_sources)} 个运行时文本来源（{', '.join(kinds)}）。"
-            "这些文本无法静态关联到实际 Text/TMP 材质。\033[0m"
+            "脚本 5 只处理可精确定位的 I2 绑定，不再自动全量修改 TMP 材质。"
         )
-        answer = input(
-            "\033[38;5;208m[阴影描边][运行时绑定] 是否清理全部含 TMP 描边/阴影/发光参数的材质？"
-            "输入 y 确认，其它任意键仅按静态引用处理: \033[0m"
-        ).strip().lower()
-        clean_all_text_effect_materials = answer == "y"
-        if not clean_all_text_effect_materials:
-            _remove_stale_global_material_overlays(cfg, remove_tmp=True)
 
     component_paths: set[Path] = set()
     translated_game_objects: set[tuple[str, int]] = set()
-    component_records = [] if material_only else records
-    for record in component_records:
-        if record.source_text not in translations or not isinstance(record.path_id, int) or record.path_id <= 0:
-            continue
-        json_path = _resolve_input_json_path(cfg, record.file_path)
-        asset_key = _bundle_key_for_json_path(cfg, json_path)
-        key = (asset_key, record.path_id)
+    i2_bound_game_objects = (
+        set()
+        if material_only
+        else _i2_bound_game_objects_for_translations(cfg, dict(translations))
+    )
+
+    def add_game_object_components(key: tuple[str, int]) -> None:
         if key in translated_game_objects:
-            continue
+            return
         translated_game_objects.add(key)
-        entries = ref_map.get(asset_key, {}).get(str(record.path_id), [])
+        asset_key, game_object_path_id = key
+        entries = ref_map.get(asset_key, {}).get(str(game_object_path_id), [])
         if not isinstance(entries, list):
-            continue
+            return
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -2555,8 +2588,18 @@ def disable_translated_text_effect_components(
                 continue
             component_paths.add(_resolve_input_json_path(cfg, relative))
 
+    component_records = [] if material_only else records
+    for record in component_records:
+        if record.source_text not in translations or not isinstance(record.path_id, int) or record.path_id <= 0:
+            continue
+        json_path = _resolve_input_json_path(cfg, record.file_path)
+        add_game_object_components((_bundle_key_for_json_path(cfg, json_path), record.path_id))
+    for key in i2_bound_game_objects:
+        add_game_object_components(key)
+
     _log(
         f"[阴影描边] 已翻译文本 GameObject: {len(translated_game_objects)} 个；"
+        f"其中 I2 精确绑定: {len(i2_bound_game_objects)} 个；"
         f"候选同物体组件: {len(component_paths)} 个"
     )
 
@@ -2567,9 +2610,20 @@ def disable_translated_text_effect_components(
             f"候选材质={len(material_sources)}。\033[0m"
         )
     else:
+        material_records = list(records)
+        if component_paths and translations:
+            marker_text = next(iter(translations))
+            material_records.extend(
+                ScanRecord(
+                    file_path=str(path),
+                    field="<i2-bound-component>",
+                    source_text=marker_text,
+                )
+                for path in component_paths
+            )
         material_sources = _material_paths_for_translated_records(
             cfg,
-            records,
+            material_records,
             dict(translations),
             material_map,
             path_id_map,

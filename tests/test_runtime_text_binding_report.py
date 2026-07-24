@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from pipeline.translation import write_runtime_text_binding_report
+from pipeline.translation import _i2_bound_game_objects_for_translations, write_runtime_text_binding_report
 from pipeline.shared import ScanRecord
 
 
@@ -45,6 +45,31 @@ class RuntimeTextBindingReportTests(unittest.TestCase):
             self.assertEqual(report["summary"]["runtime_or_scriptable_sources"], 1)
             self.assertEqual(report["summary"]["runtime_bound_record_count"], 2)
             self.assertNotIn("静态文本", [text for source in report["sources"] for text in source["source_texts"]])
+
+    def test_i2_binding_is_matched_by_translated_term(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_root = Path(temp_dir) / "input"
+            localize_path = input_root / "level0" / "MonoBehaviour" / "Localize_1.json"
+            localize_path.parent.mkdir(parents=True)
+            localize_path.write_text(
+                json.dumps(
+                    {
+                        "m_GameObject": {"m_PathID": 153},
+                        "mTerm": "BANK",
+                        "mLocalizeTargetName": "I2.Loc.LocalizeTarget_TextMeshPro_UGUI",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = SimpleNamespace(resource_input_root=input_root)
+            self.assertEqual(
+                _i2_bound_game_objects_for_translations(cfg, {"BANK": "银行"}),
+                {("level0", 153)},
+            )
+            self.assertEqual(
+                _i2_bound_game_objects_for_translations(cfg, {"PRODUCTS": "产品"}),
+                set(),
+            )
 
 
 if __name__ == "__main__":

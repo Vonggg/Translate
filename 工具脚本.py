@@ -1187,7 +1187,8 @@ def run_clean_all_text_effect_materials() -> None:
     print("清理全部 TMP 阴影/描边/发光材质")
     print("说明: 扫描 workspace/input 中具有 TMP SDF 专属参数且带效果参数的 Material JSON，")
     print("      将对应替换 JSON 写入 workspace/output/Text；本工具只处理材质，不处理组件。")
-    print("      这会影响所有使用这些材质的文本，请先保留资源副本。")
+    print("      高风险: 这会修改所有共享 TMP 字体材质，可能影响教程和运行时 UI。")
+    print("      主流程不会自动执行本功能，仅用于手工测试。")
     print()
     confirm = prompt_input("确认执行全部材质清理? 输入 y 确认，其它任意键取消: ").strip().lower()
     if confirm != "y":
