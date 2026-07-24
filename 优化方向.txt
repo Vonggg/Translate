@@ -1,0 +1,43 @@
+统一失败样本收集器
+
+目标
+对“资源没有按预期写回、被跳过写回、校验失败、可能生成坏资源”的情况自动保存可复现样本，
+为后续补充 Unity 资源兼容逻辑提供原始数据。普通可恢复提示不保存，避免样本目录无限增长。
+
+统一目录规范
+样本/
+  SerializeReference/
+  catalog_crc/
+  texture_invalid/
+  texture_encode/
+  json_import/
+  bundle_rebuild/
+  split_merge/
+  localization/
+
+每个样本应包含
+- info.json：错误类型、错误信息、资源相对路径、资源名、PathID、FileID、操作阶段、工具版本。
+- original/：原始导出 JSON、原 Bundle、原图片等。
+- replacement/：待导入 JSON、待替换 PNG 等。
+- manifest.json：对应资源的 manifest。
+- logs/：本次相关日志片段。
+
+去重与覆盖规则
+- 去重键：错误类型 + 资源相对路径 + PathID。
+- 相同问题再次触发时覆盖同一个样本目录，不使用时间戳。
+- 样本保持为最新一次可复现状态，避免目录持续膨胀。
+
+触发范围
+- JSON 导入失败，或写回后的结构校验失败。
+- SerializeReference 内部数据无法按 JSON 写回而保留原值。
+- Localization StringTable 无法匹配 m_Id，或无法写回 m_Localized。
+- Texture 尺寸为 0x0、图像编码失败、纹理格式不支持、图集引用缺失。
+- TMP/SDF FontAsset 与 Texture 图集不匹配，或字体图集无效。
+- Bundle 重建、压缩、UnityFS 布局处理、分卷合并失败。
+- catalog CRC 自校验失败、catalog 回打失败。
+- manifest 路径、FileID、PathID、外部引用无法解析。
+
+实现建议
+- Python 流程与 UnityResourceCLI C# 流程分别实现收集入口，但使用相同的目录和 info.json 字段规范。
+- 终端用紫色日志输出样本位置： [样本] 已保存: ...
+- 当前已有的 SerializeReference 样本和 catalog_crc 样本后续迁移到此统一规范。
