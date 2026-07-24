@@ -2427,16 +2427,16 @@ def disable_translated_text_effect_components(
     runtime_sources = _load_runtime_binding_sources_for_translations(cfg, dict(translations))
     clean_all_text_effect_materials = force_all_text_effect_materials
     if force_all_text_effect_materials:
-        _log("\033[95m[材质阴影描边] 已由工具脚本强制启用全部 TMP 效果材质清理。\033[0m")
+        _log("\033[94m[材质阴影描边] 已由工具脚本强制启用全部 TMP 效果材质清理。\033[0m")
     elif runtime_sources:
         kinds = sorted({str(item.get("kind", "unknown")) for item in runtime_sources})
         _log(
-            "\033[95m[阴影描边][运行时绑定] 检测到 "
+            "\033[94m[阴影描边][运行时绑定] 检测到 "
             f"{len(runtime_sources)} 个运行时文本来源（{', '.join(kinds)}）。"
             "这些文本无法静态关联到实际 Text/TMP 材质。\033[0m"
         )
         answer = input(
-            "\033[96m[阴影描边][运行时绑定] 是否清理全部含 TMP 描边/阴影/发光参数的材质？"
+            "\033[38;5;208m[阴影描边][运行时绑定] 是否清理全部含 TMP 描边/阴影/发光参数的材质？"
             "输入 y 确认，其它任意键仅按静态引用处理: \033[0m"
         ).strip().lower()
         clean_all_text_effect_materials = answer == "y"
@@ -2477,7 +2477,7 @@ def disable_translated_text_effect_components(
     if clean_all_text_effect_materials:
         material_sources = _all_text_effect_material_paths(cfg)
         _log(
-            "\033[95m[材质阴影描边][运行时绑定] 已启用全部 TMP 效果材质清理："
+            "\033[94m[材质阴影描边][运行时绑定] 已启用全部 TMP 效果材质清理："
             f"候选材质={len(material_sources)}。\033[0m"
         )
     else:
