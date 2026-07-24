@@ -1951,8 +1951,8 @@ def _all_text_effect_material_paths(cfg: PipelineConfig) -> dict[str, list[dict[
     return material_sources
 
 
-def _remove_stale_non_tmp_global_material_overlays(cfg: PipelineConfig) -> int:
-    """Remove only old all-material fallback outputs proven to be non-TMP."""
+def _remove_stale_global_material_overlays(cfg: PipelineConfig, remove_tmp: bool = False) -> int:
+    """Remove old all-material fallback outputs; optionally retain valid TMP overlays."""
     record_path = cfg.stage_record_dir / cfg.output_disabled_effect_components_json
     if not record_path.is_file():
         return 0
@@ -1981,14 +1981,15 @@ def _remove_stale_non_tmp_global_material_overlays(cfg: PipelineConfig) -> int:
             source_data = read_json(_resolve_input_json_path(cfg, relative))
         except Exception:
             continue
-        if _is_tmp_sdf_material_json(source_data):
+        if not remove_tmp and _is_tmp_sdf_material_json(source_data):
             continue
         output_path = cfg.stage_dir / output_file
         if output_path.is_file():
             output_path.unlink()
             removed += 1
     if removed:
-        _log_blue(f"[材质阴影描边] 已清理旧版全量工具误写入的非 TMP 材质: {removed} 个")
+        detail = "全部旧全量材质覆盖层" if remove_tmp else "旧版全量工具误写入的非 TMP 材质"
+        _log_blue(f"[材质阴影描边] 已清理{detail}: {removed} 个")
     return removed
 
 
@@ -2497,7 +2498,7 @@ def disable_translated_text_effect_components(
     if translations is None or scan_artifacts is None:
         raise FileNotFoundError("需要先生成 records.json / trans.json / ref_map.json，再执行阴影描边组件屏蔽。")
 
-    _remove_stale_non_tmp_global_material_overlays(cfg)
+    _remove_stale_global_material_overlays(cfg)
     records, _ids_map, _font_map, ref_map = scan_artifacts
     if not _is_reverse_ref_map_format(ref_map):
         raise ValueError("ref_map.json 不是被引用表格式，请先重新执行脚本 0。")
@@ -2523,6 +2524,8 @@ def disable_translated_text_effect_components(
             "输入 y 确认，其它任意键仅按静态引用处理: \033[0m"
         ).strip().lower()
         clean_all_text_effect_materials = answer == "y"
+        if not clean_all_text_effect_materials:
+            _remove_stale_global_material_overlays(cfg, remove_tmp=True)
 
     component_paths: set[Path] = set()
     translated_game_objects: set[tuple[str, int]] = set()
@@ -2600,7 +2603,7 @@ def disable_translated_text_effect_components(
         component_path_id = _extract_asset_path_id_from_json_path(json_path)
         game_object_path_id: int | None = None
         output_path = cfg.translated_dump_dir / relative
-        source_path = output_path if output_path.is_file() else json_path
+        source_path = json_path
         try:
             raw_text = source_path.read_text(encoding="utf-8-sig", errors="ignore")
         except Exception:
@@ -2651,7 +2654,9 @@ def disable_translated_text_effect_components(
             continue
         relative = json_path.relative_to(cfg.resource_input_root)
         output_path = cfg.translated_dump_dir / relative
-        source_path = output_path if output_path.is_file() else json_path
+        # Material overlays are generated only by this pass, so always rebuild
+        # from input instead of perpetuating an older all-material cleanup.
+        source_path = json_path
         try:
             raw_text = source_path.read_text(encoding="utf-8-sig", errors="ignore")
         except Exception:

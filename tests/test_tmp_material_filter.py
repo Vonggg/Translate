@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from pipeline.translation import _is_tmp_sdf_material_json, _remove_stale_non_tmp_global_material_overlays
+from pipeline.translation import _is_tmp_sdf_material_json, _remove_stale_global_material_overlays
 
 
 def material_with_properties(*names: str) -> dict:
@@ -52,9 +52,11 @@ class TmpMaterialFilterTests(unittest.TestCase):
                 stage_record_dir=record_dir,
                 output_disabled_effect_components_json="disabled.json",
             )
-            self.assertEqual(_remove_stale_non_tmp_global_material_overlays(cfg), 1)
+            self.assertEqual(_remove_stale_global_material_overlays(cfg), 1)
             self.assertFalse((stage_dir / "Text" / generic_relative).exists())
             self.assertTrue((stage_dir / "Text" / tmp_relative).exists())
+            self.assertEqual(_remove_stale_global_material_overlays(cfg, remove_tmp=True), 1)
+            self.assertFalse((stage_dir / "Text" / tmp_relative).exists())
 
 
 if __name__ == "__main__":
