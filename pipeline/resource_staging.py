@@ -675,6 +675,17 @@ def prepare_split_sync_outputs(
 
 
 def print_final_addressables_sync_reminder(cfg: PipelineConfig, final_root: Path) -> None:
+    report_path = remote_resource_report_path(cfg)
+    if not report_path.is_file():
+        return
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return
+    success_count = report.get("success_count") if isinstance(report, dict) else 0
+    if not isinstance(success_count, int) or isinstance(success_count, bool) or success_count <= 0:
+        return
+
     source_aa = _addressables_root(cfg)
     expected_project_aa = (
         cfg.project_dir / "game-name" / "GAME_hongtu_P" / "assets" / "aa"
@@ -684,7 +695,7 @@ def print_final_addressables_sync_reminder(cfg: PipelineConfig, final_root: Path
         if expected_project_aa.parent.is_dir()
         else "<实际项目目录>/assets/aa"
     )
-    _log_green(f"[导入完成] 已下载并本地化的 Addressables 位于: {source_aa}")
+    _log_green(f"[导入完成] 本次已下载并本地化 {success_count} 个 Addressables 资源，位于: {source_aa}")
     _log_green("[导入完成] 推荐替换顺序:")
     _log_green(f"[导入完成] 1. 先把 {source_aa} 同步到 {target_text}")
     _log_green(f"[导入完成] 2. 再用 {final_root} 中的修改资源覆盖实际项目对应文件")

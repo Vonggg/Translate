@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,6 +12,7 @@ from pipeline.resource_staging import (
     _build_remote_downloads,
     prepare_split_sync_outputs,
     prepare_unified_resource_source,
+    print_final_addressables_sync_reminder,
     remote_resource_report_path,
     resource_source_map_path,
     restore_imported_resource_paths,
@@ -120,6 +123,21 @@ class ResourceStagingTests(unittest.TestCase):
             self.assertEqual(len(downloads), 1)
             self.assertEqual(unresolved, [])
             self.assertEqual(downloads[0].url, "https://cdn.example/game/Android/missing.bundle")
+
+            reminder_output = io.StringIO()
+            with redirect_stdout(reminder_output):
+                print_final_addressables_sync_reminder(cfg, final_root)
+            self.assertEqual(reminder_output.getvalue(), "")
+
+            remote_report["success_count"] = 2
+            remote_resource_report_path(cfg).write_text(
+                json.dumps(remote_report),
+                encoding="utf-8",
+            )
+            reminder_output = io.StringIO()
+            with redirect_stdout(reminder_output):
+                print_final_addressables_sync_reminder(cfg, final_root)
+            self.assertIn("本次已下载并本地化 2 个", reminder_output.getvalue())
 
 
 if __name__ == "__main__":
