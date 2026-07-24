@@ -34,6 +34,16 @@ def prompt_input(message: str) -> str:
     return input(f"\033[38;5;208m{message}\033[0m")
 
 
+def log_step_completed(step: str) -> None:
+    print(f"\033[92m[完成] 脚本 {step} 执行结束。\033[0m", flush=True)
+
+
+def finish_step(step: str, result: int) -> int:
+    if result == 0:
+        log_step_completed(step)
+    return result
+
+
 def scan_generated_artifact_paths(cfg) -> list[Path]:
     paths = [
         cfg.stage_record_dir / cfg.output_scan_records_json,
@@ -150,27 +160,27 @@ def _run_sdf_finalize_in_fresh_process(cfg) -> int:
         return 1
 
     prepare_generated_tmp_import_replacements(cfg)
-    print("[完成] 独立进程已完成步骤 8 和步骤 9。")
+    log_step_completed("8-9（Unity TMP 字体与待导入替换）")
     return 0
 
 
 def _run_noninteractive_step(cfg, step: str) -> int:
     if step == "0":
-        return scan_and_record(cfg) or 0
+        return finish_step(step, scan_and_record(cfg) or 0)
     if step == "1":
-        return apply_ai_field_selection_to_records(cfg) or 0
+        return finish_step(step, apply_ai_field_selection_to_records(cfg) or 0)
     if step == "2":
-        return translate_from_scan_records(cfg) or 0
+        return finish_step(step, translate_from_scan_records(cfg) or 0)
     if step == "4":
-        return export_translated_files(cfg) or 0
+        return finish_step(step, export_translated_files(cfg) or 0)
     if step == "5":
-        return disable_translated_text_effect_components(cfg) or 0
+        return finish_step(step, disable_translated_text_effect_components(cfg) or 0)
     if step == "6":
         build_ttf_replacements(cfg)
-        return 0
+        return finish_step(step, 0)
     if step == "7":
         build_merged_tmp_chars(cfg)
-        return 0
+        return finish_step(step, 0)
     print(f"[全部执行][停止] 不支持的内部步骤: {step}")
     return 1
 
@@ -192,6 +202,7 @@ def _run_full_pipeline_in_isolated_processes(cfg) -> int:
         if result.returncode != 0:
             print(f"[全部执行][停止] 步骤 {step} 失败，返回码={result.returncode}。")
             return 1
+        print(f"\033[92m[全部执行] 步骤 {step} 已完成（{index}/{len(steps)}）。\033[0m", flush=True)
 
     print("[全部执行] 步骤 0-7 已完成，启动独立进程执行步骤 8 和步骤 9。")
     sys.stdout.flush()
@@ -202,7 +213,8 @@ def _run_full_pipeline_in_isolated_processes(cfg) -> int:
     if result.returncode != 0:
         print(f"[全部执行][停止] 步骤 8-9 失败，返回码={result.returncode}。")
         return 1
-    print("[完成] 脚本 10 全部步骤执行结束。")
+    print("\033[92m[全部执行] 步骤 8-9 已完成。\033[0m", flush=True)
+    log_step_completed("10（全部执行）")
     return 0
 
 
@@ -273,32 +285,30 @@ def main() -> int:
 
         if choice == "0":
             maybe_clean_scan_records(cfg)
-            return scan_and_record(cfg) or 0
+            return _run_noninteractive_step(cfg, "0")
         if choice == "1":
-            return apply_ai_field_selection_to_records(cfg) or 0
+            return _run_noninteractive_step(cfg, "1")
         if choice == "2":
-            return translate_from_scan_records(cfg) or 0
+            return _run_noninteractive_step(cfg, "2")
         if choice == "3":
-            return rebuild_game_text_outputs(cfg) or 0
+            return finish_step("3", rebuild_game_text_outputs(cfg) or 0)
         if choice == "4":
-            return export_translated_files(cfg) or 0
+            return _run_noninteractive_step(cfg, "4")
         if choice == "5":
-            return disable_translated_text_effect_components(cfg) or 0
+            return _run_noninteractive_step(cfg, "5")
         if choice == "6":
-            build_ttf_replacements(cfg)
-            return 0
+            return _run_noninteractive_step(cfg, "6")
         if choice == "7":
-            build_merged_tmp_chars(cfg)
-            return 0
+            return _run_noninteractive_step(cfg, "7")
         if choice == "8":
             tmp_chars_path = existing_tmp_chars_path(cfg)
             if tmp_chars_path is None:
                 return 1
             print(f"[TMP] 使用已生成字符文件: {tmp_chars_path}")
-            return launch_unity_tmp_generator(cfg, tmp_chars_path)
+            return finish_step("8", launch_unity_tmp_generator(cfg, tmp_chars_path))
         if choice == "9":
             prepare_generated_tmp_import_replacements(cfg)
-            return 0
+            return finish_step("9", 0)
         if choice == "10":
             maybe_clean_scan_records(cfg)
             return _run_full_pipeline_in_isolated_processes(cfg)
