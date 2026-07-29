@@ -1,54 +1,26 @@
 {
   "dependencies": {
     "com.unity.textmeshpro": {
-      "version": "5.0.0",
+      "version": "3.0.6",
       "depth": 0,
-      "source": "builtin",
+      "source": "registry",
       "dependencies": {
-        "com.unity.ugui": "2.0.0"
-      }
+        "com.unity.ugui": "1.0.0"
+      },
+      "url": "https://packages.unity.com"
     },
     "com.unity.ugui": {
-      "version": "2.5.0",
+      "version": "1.0.0",
       "depth": 1,
       "source": "builtin",
       "dependencies": {
         "com.unity.modules.ui": "1.0.0",
-        "com.unity.modules.imgui": "1.0.0",
-        "com.unity.modules.audio": "1.0.0",
-        "com.unity.modules.physics2d": "1.0.0",
-        "com.unity.modules.physics": "1.0.0"
+        "com.unity.modules.imgui": "1.0.0"
       }
-    },
-    "com.unity.modules.audio": {
-      "version": "1.0.0",
-      "depth": 2,
-      "source": "builtin",
-      "dependencies": {}
     },
     "com.unity.modules.imgui": {
       "version": "1.0.0",
       "depth": 2,
-      "source": "builtin",
-      "dependencies": {}
-    },
-    "com.unity.modules.physics": {
-      "version": "1.0.0",
-      "depth": 2,
-      "source": "builtin",
-      "dependencies": {}
-    },
-    "com.unity.modules.physics2d": {
-      "version": "1.0.0",
-      "depth": 2,
-      "source": "builtin",
-      "dependencies": {
-        "com.unity.modules.physicscore2d": "1.0.0"
-      }
-    },
-    "com.unity.modules.physicscore2d": {
-      "version": "1.0.0",
-      "depth": 3,
       "source": "builtin",
       "dependencies": {}
     },

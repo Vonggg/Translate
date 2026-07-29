@@ -62,10 +62,35 @@ def flatten_texts(items: Iterable[str], include_ascii: bool = True) -> str:
     return "".join(unique_preserve_order(text))
 
 
-def collect_json_files(root: Path) -> list[Path]:
+OBJECT_INDEX_JSON_DIRS = {
+    "GameObject",
+    "Transform",
+    "RectTransform",
+    "Sprite",
+    "SpriteRenderer",
+    "Mesh",
+    "MeshFilter",
+    "SkinnedMeshRenderer",
+}
+OBJECT_INDEX_JSON_DIRS_LOWER = {name.lower() for name in OBJECT_INDEX_JSON_DIRS}
+
+
+def collect_json_files(root: Path, *, include_object_index: bool = False) -> list[Path]:
     if not root.exists():
         return []
-    return [path for path in sorted(root.rglob("*.json")) if path.is_file() and path.name.lower() != "manifest.json"]
+    paths: list[Path] = []
+    for current_root, dir_names, file_names in os.walk(root, topdown=True):
+        dir_names.sort()
+        if not include_object_index:
+            dir_names[:] = [
+                name for name in dir_names
+                if name.lower() not in OBJECT_INDEX_JSON_DIRS_LOWER
+            ]
+        for file_name in sorted(file_names):
+            if file_name.lower() == "manifest.json" or not file_name.lower().endswith(".json"):
+                continue
+            paths.append(Path(current_root) / file_name)
+    return paths
 
 
 @dataclass

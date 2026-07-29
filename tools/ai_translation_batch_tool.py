@@ -142,7 +142,7 @@ def make_combined_response(model: str, translations: dict[int, str], usage_items
 
 
 def resend_batch(request_path: Path, response_path: Path) -> None:
-    cfg = load_config()
+    cfg = load_config(quiet=True)
     strategy = get_strategy(cfg)
     base_url = cfg.ai_translation_base_url.strip().rstrip("/")
     api_key = cfg.ai_translation_api_key.strip()
@@ -217,7 +217,7 @@ def resend_batch(request_path: Path, response_path: Path) -> None:
 
 
 def patch_trans_from_response(request_path: Path, response_path: Path, trans_path: Path) -> None:
-    cfg = load_config()
+    cfg = load_config(quiet=True)
     strategy = get_strategy(cfg)
     id_to_source = load_request_items(request_path)
     content = response_content(response_path)
@@ -269,7 +269,7 @@ def main() -> int:
     args = parse_args()
     request_path = args.request.resolve()
     response_path = (args.response or default_response_path(request_path)).resolve()
-    cfg = load_config()
+    cfg = load_config(quiet=True)
     trans_path = (args.trans or (cfg.stage_record_dir / cfg.output_trans_json)).resolve()
 
     if args.mode in {"resend", "resend-and-patch"}:

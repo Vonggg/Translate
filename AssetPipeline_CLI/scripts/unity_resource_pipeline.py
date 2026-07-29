@@ -43,10 +43,17 @@ def build_command(args: argparse.Namespace, repo_root: Path) -> list[str]:
         "--quality",
         str(args.quality),
     ]
+    if args.mode == "export":
+        command.extend(["--export-profile", args.export_profile])
+        command.extend(["--export-workers", str(args.export_workers)])
+        command.extend(["--verbose-export-assets", str(args.verbose_export_assets).lower()])
     if args.replacement_root:
         command.extend(["--replacement-root", str(args.replacement_root)])
     if args.result_root:
         command.extend(["--result-root", str(args.result_root)])
+    if args.mode == "import":
+        command.extend(["--import-workers", str(args.import_workers)])
+        command.extend(["--save-samples", str(args.save_samples).lower()])
     return command
 
 
@@ -101,6 +108,38 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=90,
         help="JPEG quality when image-format is jpg.",
+    )
+    parser.add_argument(
+        "--verbose-export-assets",
+        action="store_true",
+        help="Print one log line for every exported asset. Disabled by default for speed.",
+    )
+    parser.add_argument(
+        "--export-workers",
+        type=int,
+        default=0,
+        help="Parallel source-file export workers. 0 selects a conservative automatic value.",
+    )
+    parser.add_argument(
+        "--import-workers",
+        type=int,
+        default=0,
+        help="Parallel manifest import workers. 0 selects a conservative automatic value.",
+    )
+    parser.add_argument(
+        "--save-samples",
+        action="store_true",
+        help="Save diagnostic samples. Disabled by default because samples can be very large.",
+    )
+    parser.add_argument(
+        "--export-profile",
+        choices=(
+            "basic", "objects", "mesh",
+            "basic+objects", "basic+mesh", "objects+mesh",
+            "basic+objects+mesh", "all",
+        ),
+        default="all",
+        help="Export basic translation assets, object hierarchy indexes, meshes, or a combination.",
     )
     return parser.parse_args()
 

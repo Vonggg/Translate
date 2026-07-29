@@ -44,11 +44,25 @@ project_root_dir/project_name/game-name/bak/64/DummyDll
 
 - `unity_exe`
   - 本机 Unity Editor 的 `Unity.exe` 路径。
+  - 也可以写成 `auto`，脚本会优先按 `unity_font_project/ProjectSettings/ProjectVersion.txt` 记录的版本从 Unity Hub 安装目录查找 Unity。
+  - 找不到同版本时会退到已安装的其他 Unity，并打印提示。
   - 生成 TMP/SDF 字体时需要完整 Unity Editor，单独复制 `Unity.exe` 不够。
 - `unity_font_project`
   - 内置 Unity 辅助工程目录，默认 `TMP_Font_Generator`。
 - `unity_font_launcher`
   - Unity 辅助工程内的生成脚本，默认 `Tools/generate_tmp_font.py`。
+- `tmp_max_atlas_size`
+  - TMP/SDF 字体图集允许上限，默认 `8192`；实际尺寸仍按字符数量选择 `2048/4096/8192` 档位。
+  - Unity 会检查当前图形环境；若不支持 `8192x8192`、生成失败或得到 `0x0` 图集，将自动回退到 `4096x4096`。
+- `include_old_sdf_template_chars`
+  - 脚本 7 是否把 `templates/老工具的SDF模板.json` 里的常用汉字一并合入 `tmp_chars.txt`，默认 `false`。
+  - 关闭后只合并模板 TTF 非中文字符、原游戏 TMP 字符和译文字符，可明显减少新 TMP 字符数。
+- `protect_i2_tmp_fonts_from_replacement`
+  - 脚本 9 是否跳过 I2 运行时文本正在使用的 TMP FontAsset/Atlas，默认 `true`。
+  - 用于排查或规避 I2 文本因字体替换引起的运行时刷新、卡顿或材质状态问题。
+- `enable_text_effect_material_cleanup`
+  - 是否允许脚本 5 写出普通 TMP Material 覆盖层，默认 `true`。
+  - 脚本 8/9 生成的 TMP FontAsset 会保留原字体的 Material 引用，不会覆盖这些材质字段，因此脚本 5 可以先清理普通 SDF 材质的阴影/描边参数。
 - `ttf_template_path`
   - 替换字体模板 TTF。模板不支持的译文字符会在脚本 7 中提示并停止。
 
@@ -145,10 +159,10 @@ python .\main.py
 如果想一口气执行：
 
 ```text
-10. 全部执行
+a. 全部执行
 ```
 
-注意：脚本 10 在 AI 字段判断开启时会自动执行脚本 1。
+注意：`a` 在 AI 字段判断开启时会自动执行脚本 1；也支持输入 `1-2`、`4-7` 或 `0,2,4-9` 连续执行指定步骤。
 
 ### 3. 手动处理图片或工具修补
 
@@ -164,6 +178,8 @@ python .\工具脚本.py
 - 清理模板 TTF 不支持字符：菜单 10
 - 清理 records/trans 中当前黑名单字段：菜单 15  （新增黑名单但不想重扫描翻译等就用这个）
 - 可选同步生成字体的 SDF 材质参数：菜单 16
+- 处理 I2 运行时文本使用的 TMP 字体和材质：菜单 18
+- 按脚本产物清单清理测试文件：菜单 19
 - catalog 解析/回打/CRC 修正：菜单 11、12、13、14
 
 ### 4. 一键导入
@@ -213,8 +229,11 @@ workspace/FinalResult/Bundle/catalog.json
 ```
 
 当前默认策略是匹配最终 Bundle 后把对应 catalog 条目的 CRC 置为 `0`。
-回打成功后会自动覆盖源 `game/assets/aa/catalog.json`；所有直接写入游戏源目录的操作均以橙色
-`[源文件已修改]` 日志提示。
+回打成功后会输出到 `workspace/FinalResult/Bundle`。只要 catalog 中的远程
+InternalId 被改为本地 RuntimePath，就会同步覆盖源 `game/assets/aa` 中的 catalog；
+无论资源是本次下载，还是此前已经存在于本地，规则都相同。没有远程路径被本地化时
+保留源文件，并用蓝色日志提示手动替换最终产物。所有直接写入游戏源目录的操作均以
+橙色 `[源文件已修改]` 日志提示。
 
 ## main.py 菜单说明
 
@@ -263,11 +282,15 @@ list_Title.Array[]
 
 ### 2. 根据扫描记录翻译
 
-读取过滤后的 `records.json`，去重后生成空 `trans.json`，然后执行翻译。
+读取过滤后的 `records.json`，去重后生成 `trans.json`，先在本地分流疑似资源键，
+再把其余文本交给翻译接口。
 
 输出：
 
 - `trans.json`: 原文到译文的映射。
+- `trans_maybe_title.json`: 本地识别出的资源键式文本，例如
+  `PPS_PP_desc_10.1`。这类键会从 `trans.json` 中移除，不发送给 AI
+  或百度翻译。
 - `game.txt`: 去重后的译文文本。
 - `game_chars.txt`: 译文字符集合。
 - `mapping.tsv`: 翻译对照。
@@ -303,11 +326,16 @@ Unity Localization 要特别注意：
 - StringTable 的 `m_TableData.Array[].m_Localized` 应该翻译。
 - Shared Data 的 `m_Entries.Array[].m_Key` 不应该翻译。
 
-### 5. 屏蔽译文文本同物体上的阴影/描边组件
+### 5. 清理译文字体材质的阴影/描边
 
-根据 `records.json`、`ref_map.json` 和 PathID 映射，找到译文文本同 GameObject 上的 Shadow/Outline 组件，输出屏蔽后的 JSON 到 `workspace/output/Text`。
+脚本 5 有两条处理流程：
 
-这是为了解决部分游戏中文字体叠加描边/阴影后显示异常的问题。
+- 清理普通 TMP/SDF 字体材质里的阴影、描边、发光参数。
+- 清理译文所在 GameObject 上额外挂载的 Shadow/Outline MonoBehaviour。
+
+脚本 8/9 生成的 TMP FontAsset 会保留原字体的 Material 引用，因此脚本 5 写出的普通 Material 覆盖层不会被 SDF 字体替换覆盖。
+
+I2 运行时绑定文本不在主流程中直接改共享材质。脚本 5 会自动排除 I2 绑定到的 TMP 材质；I2 专项功能保留在 `工具脚本.py` 菜单 18，它会尝试把 I2 TMP 组件改指到同 Shader、同字体图集的无效果材质，而不是修改共享 Material 本体。该功能需要输入 `I2` 才会执行。
 
 ### 6. 生成 TTF 替换字体
 
@@ -325,6 +353,7 @@ workspace/output/Font/TTF/ToImport
 - 原游戏 SDF 字体字符
 - 模板 TTF 支持字符
 - 模板 TTF 非中文字符
+- 可选的老工具 SDF 模板字符
 
 生成：
 
@@ -338,6 +367,8 @@ workspace/records/tmp_chars.txt
 - `translation_chars_missing_from_ttf.tsv`
 
 并停止，避免生成缺字字体。
+
+`include_old_sdf_template_chars=false` 时，不会再把老工具 SDF 模板里的约 3000 个常用汉字强制合进新字体。
 
 ### 8. 生成 Unity TMP 字体
 
@@ -362,7 +393,9 @@ workspace/output/Font/SDF/ToImport
 
 如果某个 TMP FontAsset 没有有效图集，脚本会跳过该字体，避免出现“新字体表 + 旧/缺失图集”的错配。
 
-### 10. 全部执行
+`protect_i2_tmp_fonts_from_replacement=true` 时，脚本 9 会额外跳过 I2 运行时文本正在使用的 TMP FontAsset/Atlas。
+
+### a. 全部执行
 
 按顺序执行：
 
@@ -370,7 +403,7 @@ workspace/output/Font/SDF/ToImport
 0 -> 1(仅 AI 字段判断开启时) -> 2 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 ```
 
-脚本 10 使用一个轻量主进程，按顺序等待各个独立子进程完成；步骤之间不会保留扫描、翻译产生的大量内存和线程状态。步骤 8-9 同样在全新进程中执行，结束后自动返回终端，不需要按回车。若检测到 Unity 在进入字体生成代码前发生原生启动崩溃，会安全清理失效的 `UnityLockfile` 并自动重试一次；重试仍失败时停止，不执行步骤 9。
+`a` 直接按顺序调用脚本 0 至 9 的同一执行入口，每一步使用独立子进程；步骤之间不会保留扫描、翻译产生的大量内存和线程状态。若检测到 Unity 在进入字体生成代码前发生原生启动崩溃，会安全清理失效的 `UnityLockfile` 并自动重试一次；失败时停止，不执行后续步骤。
 
 ## resource_menu.py 菜单说明
 
@@ -459,10 +492,27 @@ workspace/FinalResult/SplitBundles/Parts
   - 针对某个 `ai_translation_request_batch_XXX.json` 单独补跑，并可用 response 修补 `trans.json`。
 - `10. 清理 trans.json 中模板 TTF 不支持的字符`
   - 根据 `translation_chars_missing_from_ttf.txt` 查找并批量替换/删除不支持字符。
+- `按 trans_maybe_title.json 清理 trans.json`
+  - 不重跑脚本 2，直接从现有 `trans.json` 精确删除疑似资源键。
 - `11. 解析 Addressables catalog 到 workspace/output/catalog`
   - 把原始 `catalog.json` 展开成可读的 `Output.json`。
 - `12. 将 Output.json 回打成原始 catalog 格式`
   - 把展开后的 `Output.json` 重新编码回 Addressables catalog。
+
+一键导出会自动读取 `settings.json`，识别 Addressables 使用的是 `catalog.json`
+还是 `catalog.bin`。遇到二进制 catalog 时会同时输出：
+
+- `workspace/output/catalog/catalog_bin_raw.json`：完整原生结构和二进制偏移。
+- `workspace/output/catalog/Output.json`：与旧 JSON catalog 相同顶层字段的兼容视图。
+- 展开 key、唯一 location、依赖、InternalId、Provider，以及 Bundle 的
+  Hash、CRC、BundleSize 和对应二进制偏移。
+- 使用 Unity Scriptable Build Pipeline 的 SpookyHash128 算法校验配套
+  `catalog.hash`；它不是 MD5。
+- 只要远程 InternalId 被本地化，就会自动回写源 `catalog.bin` 并更新
+  `catalog.hash`；复用已经存在的本地资源时同样会修改源 catalog。
+- 一键导入收尾修改 Bundle CRC/size 后，会输出
+  `FinalResult/Bundle/catalog.bin` 与 `FinalResult/Bundle/catalog.hash`。存在远程路径
+  本地化时同步覆盖游戏源 catalog；否则由用户手动替换。JSON catalog 使用相同规则。
 - `13. 按最终 Bundle 自动修正并回打 catalog（CRC 置 0）`
   - 匹配 `FinalResult/Bundle/Android` 下的 bundle，修正 size，并把命中条目的 CRC 置 0。
 - `14. 按最终 Bundle 真实 CRC 修正 catalog（长度溢出时询问）`
@@ -473,6 +523,14 @@ workspace/FinalResult/SplitBundles/Parts
   - 主流程默认保留原游戏材质；执行本项后，才会在 `workspace/output/Font/SDF/ToImport` 中生成 Material 替换 JSON。
   - 保留原材质的 PathID、Shader、纹理、颜色和遮罩，只同步影响 SDF 边缘和笔画粗细的数值参数。
   - 重新执行主流程的 SDF 待导入准备步骤，即可清除实验材质并恢复默认行为。
+- `17. 清理全部 TMP 阴影/描边/发光材质`
+  - 高风险测试功能，只处理 TMP 材质，不处理组件。
+- `18. 处理 I2 运行时文本使用的 TMP 字体和材质`
+  - 精确解析 I2 绑定，对 I2 TMP FontAsset 使用脚本 9 的规则写出 SDF 替换。
+  - 同步 I2 TMP 实际使用材质的生成 SDF 数值参数，不改指组件材质，不关闭 Shadow/Outline 组件。
+- `19. 按脚本产物清单清理指定脚本生成的文件`
+  - 清单位于 `support/script_output_manifest.json`，支持输入多个脚本编号。
+  - 删除前会显示实际存在的文件、目录、数量和大小；输入 `a` 会清理脚本 0 至 9 的全部清单产物。
 
 ## Unity Localization 规则
 

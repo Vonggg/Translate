@@ -104,6 +104,10 @@ class DefaultAITranslationStrategy:
                 continue
             item_id = item.get("id")
             translation = item.get("translation")
+            # Some compatible chat APIs occasionally return the translated
+            # value under the input field name despite the response schema.
+            if not isinstance(translation, str) or not translation:
+                translation = item.get("text")
             if isinstance(item_id, int) and isinstance(translation, str) and translation:
                 translated[item_id] = translation
         return translated

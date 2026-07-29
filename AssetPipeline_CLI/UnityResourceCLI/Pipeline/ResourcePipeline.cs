@@ -1,26 +1,48 @@
-﻿using AssetsTools.NET;
+using AssetsTools.NET;
 using AssetsTools.NET.Extra;
 using AssetsTools.NET.Texture;
+using Newtonsoft.Json.Linq;
 using StbImageSharp;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using UABEAvalonia;
 
 namespace UnityResourceCLI
 {
     internal sealed class ResourcePipeline
     {
-        private static readonly AssetClassID[] DefaultTypes =
+        private bool legacyManifestReferenceWarningShown;
+
+        private static readonly AssetClassID[] BasicTypes =
         {
             AssetClassID.Texture2D,
             AssetClassID.TextAsset,
             AssetClassID.MonoBehaviour,
             AssetClassID.Material,
             AssetClassID.Font
+        };
+
+        private static readonly AssetClassID[] ObjectIndexTypes =
+        {
+            AssetClassID.GameObject,
+            AssetClassID.Transform,
+            AssetClassID.RectTransform,
+            AssetClassID.Sprite,
+            AssetClassID.SpriteRenderer
+        };
+
+        private static readonly AssetClassID[] MeshTypes =
+        {
+            AssetClassID.Mesh,
+            AssetClassID.MeshFilter,
+            AssetClassID.SkinnedMeshRenderer
         };
 
         private readonly CliOptions options;
@@ -65,6 +87,8 @@ namespace UnityResourceCLI
             Directory.CreateDirectory(options.WorkRoot);
 
             Log($"Mode:   {options.Command}");
+            if (options.Command == "export")
+                Log($"Export profile: {options.ExportProfile}");
 
             return options.Command switch
             {
@@ -80,13 +104,35 @@ namespace UnityResourceCLI
             List<string> sourceFiles = EnumerateCandidateFiles(options.SourceRoot).ToList();
             Log($"Found {sourceFiles.Count} candidate file(s).");
 
-            int processed = 0;
-            foreach (string sourcePath in sourceFiles)
+            int workerCount = options.ExportWorkers > 0
+                ? options.ExportWorkers
+                : Math.Min(4, Math.Max(1, Environment.ProcessorCount / 2));
+            workerCount = Math.Min(workerCount, Math.Max(1, sourceFiles.Count));
+            Log($"Export workers: {workerCount}.");
+
+            if (workerCount == 1)
             {
-                processed++;
-                Log($"[{processed}/{sourceFiles.Count}] Exporting {Path.GetFileName(sourcePath)}");
-                ExportFile(sourcePath);
+                int serialProcessed = 0;
+                foreach (string sourcePath in sourceFiles)
+                {
+                    serialProcessed++;
+                    Log($"[{serialProcessed}/{sourceFiles.Count}] Exporting {Path.GetFileName(sourcePath)}");
+                    ExportFile(sourcePath);
+                }
+                Log($"Export finished. Processed {serialProcessed} file(s).");
+                return 0;
             }
+
+            int processed = 0;
+            var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = workerCount };
+            using var workers = new ThreadLocal<ResourcePipeline>(() => new ResourcePipeline(options), true);
+            Parallel.ForEach(sourceFiles, parallelOptions, sourcePath =>
+            {
+                ResourcePipeline worker = workers.Value!;
+                worker.ExportFile(sourcePath);
+                int completed = Interlocked.Increment(ref processed);
+                Log($"[{completed}/{sourceFiles.Count}] Exported {Path.GetFileName(sourcePath)}");
+            });
 
             Log($"Export finished. Processed {processed} file(s).");
             return 0;
@@ -100,13 +146,35 @@ namespace UnityResourceCLI
                 .ToList();
             Log($"Found {manifestPaths.Count} manifest file(s).");
 
-            int processed = 0;
-            foreach (string manifestPath in manifestPaths)
+            int workerCount = options.ImportWorkers > 0
+                ? options.ImportWorkers
+                : Math.Min(4, Math.Max(1, Environment.ProcessorCount / 2));
+            workerCount = Math.Min(workerCount, Math.Max(1, manifestPaths.Count));
+            Log($"Import workers: {workerCount}.");
+
+            if (workerCount == 1)
             {
-                processed++;
-                Log($"[{processed}/{manifestPaths.Count}] Importing {Path.GetDirectoryName(manifestPath)}");
-                ImportManifest(manifestPath);
+                int serialProcessed = 0;
+                foreach (string manifestPath in manifestPaths)
+                {
+                    serialProcessed++;
+                    Log($"[{serialProcessed}/{manifestPaths.Count}] Importing {Path.GetDirectoryName(manifestPath)}");
+                    ImportManifest(manifestPath);
+                }
+                Log($"Import finished. Processed {serialProcessed} manifest(s).");
+                return 0;
             }
+
+            int processed = 0;
+            var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = workerCount };
+            using var workers = new ThreadLocal<ResourcePipeline>(() => new ResourcePipeline(options), true);
+            Parallel.ForEach(manifestPaths, parallelOptions, manifestPath =>
+            {
+                ResourcePipeline worker = workers.Value!;
+                worker.ImportManifest(manifestPath);
+                int completed = Interlocked.Increment(ref processed);
+                Log($"[{completed}/{manifestPaths.Count}] Imported {Path.GetDirectoryName(manifestPath)}");
+            });
 
             Log($"Import finished. Processed {processed} manifest(s).");
             return 0;
@@ -193,13 +261,16 @@ namespace UnityResourceCLI
         private void ExportAssetsFile(AssetsFileInstance inst, string sourceStem, string outputDir, string manifestRelativeBase, string? bundleEntryName, ExportManifest manifest)
         {
             AddAssetsFileDependencyManifest(inst, manifestRelativeBase, bundleEntryName, manifest);
+            string referenceUnityVersion = inst.file.Metadata.UnityVersion ?? "";
+            if (string.IsNullOrWhiteSpace(manifest.UnityVersion) && !string.IsNullOrWhiteSpace(referenceUnityVersion))
+                manifest.UnityVersion = referenceUnityVersion;
             ExportManifestMonoBehaviourSummary monoSummary = new ExportManifestMonoBehaviourSummary
             {
                 RelativeBase = manifestRelativeBase.Replace('\\', '/'),
                 BundleEntryName = bundleEntryName ?? ""
             };
 
-            foreach (AssetClassID type in DefaultTypes)
+            foreach (AssetClassID type in GetExportTypes())
             {
                 List<AssetFileInfo> infos = inst.file.GetAssetsOfType(type);
                 if (infos.Count == 0)
@@ -235,6 +306,7 @@ namespace UnityResourceCLI
                     string exportKind;
                     string outputRelativePath;
                     string manifestRelativePath;
+                    string exportedFilePath;
 
                     if (type == AssetClassID.Texture2D)
                     {
@@ -242,8 +314,10 @@ namespace UnityResourceCLI
                         string fileName = BuildSafeExportFileName(assetName, info.PathId, options.ImageFormat, typeDir);
                         outputRelativePath = Path.Combine(typeName, fileName);
                         manifestRelativePath = Path.Combine(manifestRelativeBase, outputRelativePath);
-                        Log($"    {typeName}: {assetName} -> {manifestRelativePath}");
-                        ExportTexture(inst, baseField, Path.Combine(outputDir, outputRelativePath));
+                        exportedFilePath = Path.Combine(outputDir, outputRelativePath);
+                        if (options.VerboseExportAssets)
+                            Log($"    {typeName}: {assetName} -> {manifestRelativePath}");
+                        ExportTexture(inst, baseField, exportedFilePath);
                     }
                     else if (type == AssetClassID.Font)
                     {
@@ -252,8 +326,10 @@ namespace UnityResourceCLI
                         string fileName = BuildSafeExportFileName(assetName, info.PathId, extension, typeDir);
                         outputRelativePath = Path.Combine(typeName, fileName);
                         manifestRelativePath = Path.Combine(manifestRelativeBase, outputRelativePath);
-                        Log($"    {typeName}: {assetName} -> {manifestRelativePath}");
-                        if (!ExportFont(baseField, Path.Combine(outputDir, outputRelativePath)))
+                        exportedFilePath = Path.Combine(outputDir, outputRelativePath);
+                        if (options.VerboseExportAssets)
+                            Log($"    {typeName}: {assetName} -> {manifestRelativePath}");
+                        if (!ExportFont(baseField, exportedFilePath))
                         {
                             Log($"      WARNING: Font has no embedded m_FontData; manifest target kept for replacement, but no source ttf/otf was exported.");
                         }
@@ -264,8 +340,10 @@ namespace UnityResourceCLI
                         string fileName = BuildSafeExportFileName(assetName, info.PathId, options.DumpFormat, typeDir);
                         outputRelativePath = Path.Combine(typeName, fileName);
                         manifestRelativePath = Path.Combine(manifestRelativeBase, outputRelativePath);
-                        Log($"    {typeName}: {assetName} -> {manifestRelativePath}");
-                        ExportDump(inst, info, baseField, Path.Combine(outputDir, outputRelativePath));
+                        exportedFilePath = Path.Combine(outputDir, outputRelativePath);
+                        if (options.VerboseExportAssets)
+                            Log($"    {typeName}: {assetName} -> {manifestRelativePath}");
+                        ExportDump(inst, info, baseField, exportedFilePath);
                     }
 
                     manifest.Items.Add(new ExportManifestItem
@@ -277,7 +355,13 @@ namespace UnityResourceCLI
                         AssetName = assetName,
                         ExportKind = exportKind,
                         RelativePath = manifestRelativePath.Replace('\\', '/'),
-                        BundleEntryName = bundleEntryName ?? ""
+                        BundleEntryName = bundleEntryName ?? "",
+                        ReferenceUnityVersion = referenceUnityVersion,
+                        TypeTreeFingerprint = ComputeTypeTreeFingerprint(baseField.TemplateField),
+                        JsonSchemaFingerprint = exportKind.Equals("json", StringComparison.OrdinalIgnoreCase)
+                            && File.Exists(exportedFilePath)
+                            ? ComputeJsonSchemaFingerprint(File.ReadAllText(exportedFilePath, Encoding.UTF8))
+                            : ""
                     });
                 }
             }
@@ -298,6 +382,27 @@ namespace UnityResourceCLI
                     );
                 }
             }
+        }
+
+        private IEnumerable<AssetClassID> GetExportTypes()
+        {
+            IEnumerable<AssetClassID> types = Array.Empty<AssetClassID>();
+            string[] profiles = options.ExportProfile.Split(
+                '+',
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries
+            );
+            foreach (string profile in profiles)
+            {
+                types = profile switch
+                {
+                    "basic" => types.Concat(BasicTypes),
+                    "objects" => types.Concat(ObjectIndexTypes),
+                    "mesh" => types.Concat(MeshTypes),
+                    "all" => types.Concat(BasicTypes).Concat(ObjectIndexTypes).Concat(MeshTypes),
+                    _ => types
+                };
+            }
+            return types.Distinct();
         }
 
         private static bool IsBaseOnlyMonoBehaviour(AssetTypeValueField baseField)
@@ -327,6 +432,7 @@ namespace UnityResourceCLI
             {
                 RelativeBase = manifestRelativeBase.Replace('\\', '/'),
                 BundleEntryName = bundleEntryName ?? "",
+                UnityVersion = inst.file.Metadata.UnityVersion ?? "",
                 Externals = inst.file.Metadata.Externals.Select((external, index) => new ExportManifestExternal
                 {
                     FileId = index + 1,
@@ -379,6 +485,17 @@ namespace UnityResourceCLI
             ExportManifest? manifest = JsonSerializer.Deserialize<ExportManifest>(File.ReadAllText(manifestPath));
             if (manifest == null)
                 return;
+            if (!legacyManifestReferenceWarningShown
+                && manifest.Items.Any(item =>
+                    item.ExportKind.Equals("json", StringComparison.OrdinalIgnoreCase)
+                    && string.IsNullOrWhiteSpace(item.TypeTreeFingerprint)))
+            {
+                LogBlue(
+                    "旧 manifest 未记录导出时 Unity 版本/类型树指纹，" +
+                    "本次无法判断导出与导入参考模板是否一致；重新执行一键导出后会启用严格比较。"
+                );
+                legacyManifestReferenceWarningShown = true;
+            }
 
             string sourcePath = Path.Combine(options.SourceRoot, manifest.SourceRelativePath);
             string resultRoot = string.IsNullOrWhiteSpace(options.ResultRoot)
@@ -627,6 +744,18 @@ namespace UnityResourceCLI
             AssetTypeTemplateField? tempField = SafeGetTemplateField(inst, info);
             if (tempField == null)
                 return null;
+            AssetTypeValueField? baseField = SafeGetBaseField(inst, info);
+            if (baseField == null)
+                return null;
+
+            ReportImportReferenceCompatibility(
+                inst,
+                tempField,
+                baseField,
+                replacementPath,
+                exportKind,
+                item
+            );
 
             AssetDumpHelper importer = new AssetDumpHelper();
 
@@ -635,28 +764,35 @@ namespace UnityResourceCLI
             if (replacementPath.EndsWith(".json", StringComparison.OrdinalIgnoreCase) || exportKind == "json")
             {
                 string json = File.ReadAllText(replacementPath, Encoding.UTF8);
+                bool managedReferenceContentChanged = false;
                 if (IsLocalizationStringTableJson(json))
                 {
-                    AssetTypeValueField? baseField = SafeGetBaseField(inst, info);
-                    if (baseField == null)
-                        return null;
                     bytes = importer.ImportLocalizationStringTableJsonAsset(baseField, json, out exceptionMessage);
                 }
                 else
                 {
-                    AssetTypeValueField? baseField = SafeGetBaseField(inst, info);
-                    if (baseField == null)
-                        return null;
+                    managedReferenceContentChanged = HasManagedReferenceContentChanges(baseField, json);
                     using MemoryStream ms = new MemoryStream(Encoding.UTF8.GetBytes(json));
                     using StreamReader sr = new StreamReader(ms, Encoding.UTF8, true);
                     bytes = importer.ImportJsonAssetPreserveManagedReferences(tempField, baseField, sr, out exceptionMessage);
-                    if (bytes != null && importer.PreservedManagedReferencesCount > 0)
+                    if (bytes != null
+                        && importer.PreservedManagedReferencesCount > 0
+                        && managedReferenceContentChanged)
                     {
                         LogPurple(
                             $"      WARNING: SerializeReference 内部数据暂不按 JSON 导入，已保留原资源内部数据: " +
-                            $"{importer.PreservedManagedReferencesCount} 处。请保留样本用于后续支持: {replacementPath}"
+                            $"{importer.PreservedManagedReferencesCount} 处: {replacementPath}"
                         );
-                        SaveSerializeReferenceSample(replacementPath, manifestDir, item, importer.PreservedManagedReferencesCount);
+                        if (options.SaveSamples)
+                            SaveSerializeReferenceSample(replacementPath, manifestDir, item, importer.PreservedManagedReferencesCount);
+                    }
+                    if (bytes != null && importer.PreservedMissingJsonFieldsCount > 0)
+                    {
+                        LogBlue(
+                            $"      JSON 与目标类型树字段不完全一致，已从原资源保留缺失字段: " +
+                            $"{importer.PreservedMissingJsonFieldsCount} 处 " +
+                            $"({string.Join(", ", importer.PreservedMissingJsonFieldNames.Distinct())})。"
+                        );
                     }
                 }
             }
@@ -684,6 +820,230 @@ namespace UnityResourceCLI
         private static void LogPurple(string message)
         {
             Console.WriteLine($"\u001b[95m[UnityResourceCLI] {message}\u001b[0m");
+        }
+
+        private static void LogBlue(string message)
+        {
+            Console.WriteLine($"\u001b[94m[UnityResourceCLI] {message}\u001b[0m");
+        }
+
+        private static void LogRed(string message)
+        {
+            Console.WriteLine($"\u001b[91m[UnityResourceCLI] {message}\u001b[0m");
+        }
+
+        private static void ReportImportReferenceCompatibility(
+            AssetsFileInstance inst,
+            AssetTypeTemplateField currentTemplate,
+            AssetTypeValueField baseField,
+            string replacementPath,
+            string exportKind,
+            ExportManifestItem item)
+        {
+            string currentUnityVersion = inst.file.Metadata.UnityVersion ?? "";
+            if (!string.IsNullOrWhiteSpace(item.ReferenceUnityVersion)
+                && !string.IsNullOrWhiteSpace(currentUnityVersion)
+                && !string.Equals(item.ReferenceUnityVersion, currentUnityVersion, StringComparison.Ordinal))
+            {
+                LogRed(
+                    $"      导出/导入 Unity 版本不一致: " +
+                    $"export={item.ReferenceUnityVersion}, import={currentUnityVersion}, asset={item.RelativePath}"
+                );
+            }
+
+            string currentTypeTreeFingerprint = ComputeTypeTreeFingerprint(currentTemplate);
+            if (!string.IsNullOrWhiteSpace(item.TypeTreeFingerprint)
+                && !string.Equals(item.TypeTreeFingerprint, currentTypeTreeFingerprint, StringComparison.OrdinalIgnoreCase))
+            {
+                LogRed(
+                    $"      导出/导入类型树不一致: " +
+                    $"export={item.TypeTreeFingerprint}, import={currentTypeTreeFingerprint}, asset={item.RelativePath}"
+                );
+            }
+
+            if (exportKind.Equals("json", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(item.JsonSchemaFingerprint))
+            {
+                string currentJsonSchemaFingerprint = ComputeJsonSchemaFingerprint(
+                    File.ReadAllText(replacementPath, Encoding.UTF8)
+                );
+                if (!string.Equals(
+                    item.JsonSchemaFingerprint,
+                    currentJsonSchemaFingerprint,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!JsonSchemasEquivalentIgnoringArrayWrappers(baseField, replacementPath))
+                    {
+                        LogBlue(
+                            $"      待导入 JSON 结构已不同于导出时结构: " +
+                            $"export={item.JsonSchemaFingerprint}, import={currentJsonSchemaFingerprint}, " +
+                            $"asset={item.RelativePath}"
+                        );
+                    }
+                }
+            }
+        }
+
+        private static string ComputeTypeTreeFingerprint(AssetTypeTemplateField template)
+        {
+            StringBuilder signature = new StringBuilder();
+            AppendTypeTreeSignature(template, signature);
+            return ComputeSha256(signature.ToString());
+        }
+
+        private static void AppendTypeTreeSignature(AssetTypeTemplateField field, StringBuilder signature)
+        {
+            signature
+                .Append('(')
+                .Append(field.Type).Append('|')
+                .Append(field.Name).Append('|')
+                .Append(field.ValueType).Append('|')
+                .Append(field.IsArray ? '1' : '0').Append('|')
+                .Append(field.IsAligned ? '1' : '0').Append('|')
+                .Append(field.HasValue ? '1' : '0');
+            foreach (AssetTypeTemplateField child in field.Children)
+                AppendTypeTreeSignature(child, signature);
+            signature.Append(')');
+        }
+
+        private static string ComputeJsonSchemaFingerprint(
+            string json,
+            bool normalizeArrayWrappers = false)
+        {
+            JToken token = JToken.Parse(json);
+            StringBuilder signature = new StringBuilder();
+            AppendJsonSchemaSignature(token, signature, normalizeArrayWrappers);
+            return ComputeSha256(signature.ToString());
+        }
+
+        private static void AppendJsonSchemaSignature(
+            JToken token,
+            StringBuilder signature,
+            bool normalizeArrayWrappers)
+        {
+            if (token is JObject obj)
+            {
+                if (normalizeArrayWrappers
+                    && obj.Count == 1
+                    && obj.TryGetValue("Array", out JToken? arrayValue)
+                    && arrayValue is JArray)
+                {
+                    signature.Append("[]");
+                    return;
+                }
+                signature.Append('{');
+                foreach (JProperty property in obj.Properties().OrderBy(property => property.Name, StringComparer.Ordinal))
+                {
+                    signature.Append(property.Name).Append(':');
+                    AppendJsonSchemaSignature(property.Value, signature, normalizeArrayWrappers);
+                    signature.Append(';');
+                }
+                signature.Append('}');
+                return;
+            }
+
+            if (token is JArray)
+            {
+                // Array contents change legitimately for translated text and generated font tables.
+                signature.Append("[]");
+                return;
+            }
+
+            signature.Append(token.Type);
+        }
+
+        private static bool HasManagedReferenceContentChanges(
+            AssetTypeValueField baseField,
+            string replacementJson)
+        {
+            try
+            {
+                JToken original = JToken.Parse(DumpJsonAssetToString(baseField));
+                JToken replacement = JToken.Parse(replacementJson);
+                JToken? originalReferences = original["references"];
+                JToken? replacementReferences = replacement["references"];
+                if (originalReferences == null && replacementReferences == null)
+                    return false;
+                if (originalReferences == null || replacementReferences == null)
+                    return true;
+                return !JToken.DeepEquals(
+                    NormalizeArrayWrappers(originalReferences),
+                    NormalizeArrayWrappers(replacementReferences)
+                );
+            }
+            catch
+            {
+                // If comparison is unavailable, retain the warning and sample.
+                return true;
+            }
+        }
+
+        private static bool JsonSchemasEquivalentIgnoringArrayWrappers(
+            AssetTypeValueField baseField,
+            string replacementPath)
+        {
+            try
+            {
+                string originalFingerprint = ComputeJsonSchemaFingerprint(
+                    DumpJsonAssetToString(baseField),
+                    normalizeArrayWrappers: true
+                );
+                string replacementFingerprint = ComputeJsonSchemaFingerprint(
+                    File.ReadAllText(replacementPath, Encoding.UTF8),
+                    normalizeArrayWrappers: true
+                );
+                return string.Equals(
+                    originalFingerprint,
+                    replacementFingerprint,
+                    StringComparison.OrdinalIgnoreCase
+                );
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string DumpJsonAssetToString(AssetTypeValueField baseField)
+        {
+            using MemoryStream stream = new MemoryStream();
+            using (StreamWriter writer = new StreamWriter(
+                stream,
+                new UTF8Encoding(false),
+                1024,
+                leaveOpen: true))
+            {
+                AssetDumpHelper dumper = new AssetDumpHelper();
+                dumper.DumpJsonAsset(writer, baseField);
+                writer.Flush();
+            }
+            return Encoding.UTF8.GetString(stream.ToArray());
+        }
+
+        private static JToken NormalizeArrayWrappers(JToken token)
+        {
+            if (token is JObject obj)
+            {
+                if (obj.Count == 1
+                    && obj.TryGetValue("Array", out JToken? arrayValue)
+                    && arrayValue is JArray)
+                {
+                    return NormalizeArrayWrappers(arrayValue);
+                }
+                JObject normalized = new JObject();
+                foreach (JProperty property in obj.Properties())
+                    normalized[property.Name] = NormalizeArrayWrappers(property.Value);
+                return normalized;
+            }
+            if (token is JArray array)
+                return new JArray(array.Select(NormalizeArrayWrappers));
+            return token.DeepClone();
+        }
+
+        private static string ComputeSha256(string value)
+        {
+            byte[] digest = SHA256.HashData(Encoding.UTF8.GetBytes(value));
+            return Convert.ToHexString(digest).ToLowerInvariant();
         }
 
         private void SaveSerializeReferenceSample(string replacementPath, string manifestDir, ExportManifestItem item, int preservedCount)

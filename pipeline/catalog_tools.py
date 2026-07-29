@@ -14,6 +14,11 @@ from typing import Any, Iterable
 import lz4.block
 
 from support.config import PipelineConfig
+from tools.catalog_bin_tool import (
+    parse_catalog_file as parse_binary_catalog_file,
+    repack_binary_catalog_from_legacy_output,
+    write_legacy_output_view as write_binary_legacy_output_view,
+)
 
 
 CATALOG_FIELDS = (
@@ -31,6 +36,10 @@ CRC_MISMATCH_RE = re.compile(
 
 def _log_green(message: str) -> None:
     print(f"\033[92m{message}\033[0m", flush=True)
+
+
+def _log_blue(message: str) -> None:
+    print(f"\033[94m{message}\033[0m", flush=True)
 
 
 def _log_orange(message: str) -> None:
@@ -181,6 +190,49 @@ def parse_catalog_to_output(cfg: PipelineConfig, source_path: Path | None = None
 
     out_dir = (output_dir or (cfg.result_dir / "catalog")).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    if source.suffix.lower() == ".bin":
+        raw_path = out_dir / "catalog_bin_raw.json"
+        expanded_path = out_dir / "Output.json"
+        report_path = out_dir / "catalog_parse_report.txt"
+
+        def report_progress(done: int, total: int, locations: int) -> None:
+            print(
+                f"[catalog.bin] 解析 key: {done}/{total}，"
+                f"唯一 location={locations}",
+                flush=True,
+            )
+
+        parsed = parse_binary_catalog_file(
+            source,
+            raw_path,
+            progress=report_progress,
+        )
+        write_binary_legacy_output_view(parsed, expanded_path)
+        summary = parsed["summary"]
+        hash_info = parsed["catalog_hash"]
+        lines = [
+            f"Source: {source}",
+            "Format: Unity Addressables binary catalog",
+            f"Raw output: {raw_path}",
+            f"Compatible output: {expanded_path}",
+            f"Keys: {summary['key_count']}",
+            f"Locations: {summary['unique_location_count']}",
+            f"AssetBundle locations: {summary['asset_bundle_location_count']}",
+            f"Catalog hash recorded: {hash_info['recorded']}",
+            f"Catalog hash calculated: {hash_info['calculated']}",
+            f"Catalog hash matches: {hash_info['matches']}",
+        ]
+        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if hash_info["matches"] is False:
+            raise RuntimeError(
+                "catalog.hash 校验失败: "
+                f"记录={hash_info['recorded']} 计算={hash_info['calculated']}"
+            )
+        _log_green(
+            f"[catalog.bin] 已生成统一 Output.json: {expanded_path}，"
+            f"Bundle={summary['asset_bundle_location_count']}"
+        )
+        return raw_path, expanded_path
 
     catalog = json.loads(source.read_text(encoding="utf-8-sig"))
     formatted_path = out_dir / "catalog.json"
@@ -514,7 +566,10 @@ def save_catalog_crc_sample(
         shutil.rmtree(sample_dir)
     sample_dir.mkdir(parents=True, exist_ok=True)
 
-    _copy_if_exists(cfg.catalog_source_path, sample_dir / "catalog.json")
+    catalog_source = cfg.catalog_source_path
+    _copy_if_exists(catalog_source, sample_dir / catalog_source.name)
+    if catalog_source.suffix.lower() == ".bin":
+        _copy_if_exists(catalog_source.with_suffix(".hash"), sample_dir / "catalog.hash")
     _copy_if_exists(output_dir / "Output.json", sample_dir / "Output.json")
     report_path = sample_dir / "crc_self_check_report.json"
     report_path.write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -553,6 +608,7 @@ def validate_catalog_crc_algorithm(
 
     checked = 0
     passed = 0
+    skipped_zero_crc = 0
     failures: list[dict] = []
     handled_final_paths: set[Path] = set()
     for row in options:
@@ -571,6 +627,9 @@ def validate_catalog_crc_algorithm(
         if matched_final is None:
             continue
         handled_final_paths.add(matched_final.resolve())
+        if expected_crc == 0:
+            skipped_zero_crc += 1
+            continue
 
         try:
             relative_path = matched_final.relative_to(final_bundle_root)
@@ -622,7 +681,7 @@ def validate_catalog_crc_algorithm(
             continue
         row_crc = row.get("m_Crc")
         row_size = row.get("m_BundleSize")
-        if isinstance(row_crc, int) and isinstance(row_size, int):
+        if isinstance(row_crc, int) and row_crc != 0 and isinstance(row_size, int):
             option_by_crc_size.setdefault((row_crc, row_size), []).append(row)
 
     source_bundles_by_name: dict[str, list[Path]] = {}
@@ -679,7 +738,7 @@ def validate_catalog_crc_algorithm(
             "final_bundle": str(matched_final),
         })
 
-    if checked == 0:
+    if checked == 0 and skipped_zero_crc == 0:
         failures.append({
             "reason": "no_source_bundle_checked",
             "source_bundle_root": str(source_bundle_root),
@@ -690,10 +749,22 @@ def validate_catalog_crc_algorithm(
         print(f"[catalog][停止] CRC 算法自校验未通过: checked={checked}, passed={passed}, failures={len(failures)}")
         for failure in failures[:10]:
             print(f"[catalog][停止] {failure}")
-        save_catalog_crc_sample(cfg, output_dir, source_bundle_root, final_bundle_root, failures)
+        if cfg.enable_sample_collection:
+            save_catalog_crc_sample(cfg, output_dir, source_bundle_root, final_bundle_root, failures)
+        else:
+            print("[catalog][样本] 自动保存已关闭，可通过 enable_sample_collection 启用。")
         return False
 
-    _log_green(f"[catalog] CRC 算法自校验通过: checked={checked}, passed={passed}")
+    if checked == 0 and skipped_zero_crc > 0:
+        _log_green(
+            f"[catalog] 匹配到的 bundle 条目均为 m_Crc=0，CRC 校验已禁用，"
+            f"无需验证计算算法: skipped={skipped_zero_crc}"
+        )
+    else:
+        _log_green(
+            f"[catalog] CRC 算法自校验通过: checked={checked}, passed={passed}, "
+            f"skipped_zero_crc={skipped_zero_crc}"
+        )
     return True
 
 
@@ -923,9 +994,79 @@ def auto_patch_and_repack_catalog_after_import(
     _log_green(f"[catalog] 已按最终 bundle 修正 Output.json: size={size_updates}, crc置0={crc_updates}")
     _log_green(f"[catalog] Output.json 自动修正前备份: {backup_path}")
 
+    catalog_source = cfg.catalog_source_path
+    remote_report_path = (
+        cfg.root_dir
+        / "workspace"
+        / "resource_state"
+        / "addressables_remote_resources.json"
+    )
+    localized_internal_id_count = 0
+    source_catalog_modified = False
+    if remote_report_path.is_file():
+        try:
+            remote_report = json.loads(remote_report_path.read_text(encoding="utf-8-sig"))
+            localized_rows = remote_report.get("localized_internal_ids")
+            if isinstance(localized_rows, list):
+                localized_internal_id_count = len(localized_rows)
+            else:
+                localized_internal_id_count = int(
+                    remote_report.get("localized_internal_id_count", 0) or 0
+                )
+            source_catalog_modified = bool(remote_report.get("source_catalog_modified"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            localized_internal_id_count = 0
+            source_catalog_modified = False
+    sync_source_catalog = source_catalog_modified or localized_internal_id_count > 0
+
+    if catalog_source.suffix.lower() == ".bin":
+        final_catalog_path = final_result_root / "Bundle" / "catalog.bin"
+        final_hash_path = final_result_root / "Bundle" / "catalog.hash"
+        repack_result = repack_binary_catalog_from_legacy_output(
+            catalog_source,
+            expanded_path,
+            final_catalog_path,
+            final_hash_path,
+        )
+        _log_green(
+            "[catalog.bin] 已按 Output.json 回写: "
+            f"InternalId={repack_result['internal_id_updates']}，"
+            f"Bundle元数据={repack_result['bundle_option_updates']}"
+        )
+        _log_green(
+            f"[catalog.bin] 已生成 catalog.hash: "
+            f"{repack_result['catalog_hash']}"
+        )
+        if sync_source_catalog:
+            shutil.copy2(final_catalog_path, catalog_source)
+            shutil.copy2(final_hash_path, catalog_source.with_suffix(".hash"))
+            _log_orange(
+                f"[源文件已修改] catalog 中有 {localized_internal_id_count} 个远程路径已本地化，"
+                f"已用最终 catalog.bin 覆盖源文件: {catalog_source}"
+            )
+            _log_orange(
+                f"[源文件已修改] 已同步覆盖 catalog.hash: "
+                f"{catalog_source.with_suffix('.hash')}"
+            )
+        else:
+            _log_blue(
+                f"[catalog.bin] 本次没有远程路径被本地化，原项目 catalog 未修改；"
+                f"请手动替换: {final_catalog_path} 和 {final_hash_path}"
+            )
+        return final_catalog_path
+
     final_catalog_path = final_result_root / "Bundle" / "catalog.json"
     repacked_path = repack_expanded_catalog(expanded_path, final_catalog_path)
     _log_green(f"[catalog] 已回打 catalog 并输出到: {repacked_path}")
-    shutil.copy2(repacked_path, cfg.catalog_source_path)
-    _log_orange(f"[源文件已修改] 已用最终 catalog 覆盖源文件: {cfg.catalog_source_path}")
+    if sync_source_catalog:
+        shutil.copy2(repacked_path, catalog_source)
+        _log_orange(
+            f"[源文件已修改] catalog 中有 {localized_internal_id_count} 个远程路径已本地化，"
+            f"已用最终 catalog 覆盖源文件: {catalog_source}"
+        )
+    else:
+        _log_blue(
+            f"[catalog] 本次没有远程路径被本地化，原项目 catalog 未修改；"
+            f"请手动替换: {repacked_path}"
+        )
     return repacked_path

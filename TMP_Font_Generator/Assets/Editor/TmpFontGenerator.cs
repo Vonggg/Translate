@@ -37,9 +37,19 @@ namespace Translate.EditorTools
         public static void Run()
         {
             Debug.Log("[TMP] Generator entry reached");
+            LogCreationSettingFields();
             var jobPath = GetArgumentValue("--job") ?? DefaultJobPath;
             var job = LoadJob(jobPath);
             Generate(job);
+        }
+
+        private static void LogCreationSettingFields()
+        {
+            var fields = typeof(FontAssetCreationSettings)
+                .GetFields()
+                .Select(field => field.Name)
+                .OrderBy(name => name);
+            Debug.Log("[TMP] FontAssetCreationSettings fields: " + string.Join(", ", fields));
         }
 
         private static TmpFontJob LoadJob(string jobPath)
@@ -86,16 +96,66 @@ namespace Translate.EditorTools
                 ? AtlasPopulationMode.Dynamic
                 : requestedPopulationMode;
             var requestedCharacters = ReadRequestedCharacters(job);
-            var fontAsset = CreatePopulatedFontAsset(
-                font,
-                job,
-                renderMode,
-                generationPopulationMode,
-                requestedCharacters);
+            ApplyRuntimeAtlasLimit(job);
+            TMP_FontAsset fontAsset;
+            try
+            {
+                fontAsset = CreatePopulatedFontAsset(
+                    font,
+                    job,
+                    renderMode,
+                    generationPopulationMode,
+                    requestedCharacters);
+                if ((job.atlasWidth > 4096 || job.atlasHeight > 4096) && !HasUsableAtlas(fontAsset))
+                {
+                    UnityEngine.Object.DestroyImmediate(fontAsset);
+                    throw new InvalidOperationException("Unity returned an empty or 0x0 atlas texture.");
+                }
+            }
+            catch (Exception firstError) when (job.atlasWidth > 4096 || job.atlasHeight > 4096)
+            {
+                Debug.LogWarning(
+                    $"[TMP][回退] Unity 无法使用 {job.atlasWidth}x{job.atlasHeight} 生成字体：{firstError.Message}");
+                job.atlasWidth = Math.Min(job.atlasWidth, 4096);
+                job.atlasHeight = Math.Min(job.atlasHeight, 4096);
+                Debug.LogWarning($"[TMP][回退] 自动改用 {job.atlasWidth}x{job.atlasHeight} 重新生成。");
+                fontAsset = CreatePopulatedFontAsset(
+                    font,
+                    job,
+                    renderMode,
+                    generationPopulationMode,
+                    requestedCharacters);
+            }
 
             ApplyCreationSettings(fontAsset, font, job, renderMode, requestedCharacters);
             PreserveGeneratedData(fontAsset, requestedPopulationMode);
             SaveFontAsset(fontAsset, NormalizeAssetPath(job.outputAssetPath));
+        }
+
+        private static void ApplyRuntimeAtlasLimit(TmpFontJob job)
+        {
+            var maxTextureSize = SystemInfo.maxTextureSize;
+            if (maxTextureSize <= 0 ||
+                (job.atlasWidth <= maxTextureSize && job.atlasHeight <= maxTextureSize))
+            {
+                return;
+            }
+
+            var fallbackSize = Math.Min(4096, maxTextureSize);
+            Debug.LogWarning(
+                $"[TMP][回退] 当前 Unity/图形环境最大纹理尺寸为 {maxTextureSize}，" +
+                $"不支持请求的 {job.atlasWidth}x{job.atlasHeight}。");
+            job.atlasWidth = Math.Min(job.atlasWidth, fallbackSize);
+            job.atlasHeight = Math.Min(job.atlasHeight, fallbackSize);
+            Debug.LogWarning($"[TMP][回退] 自动改用 {job.atlasWidth}x{job.atlasHeight}。");
+        }
+
+        private static bool HasUsableAtlas(TMP_FontAsset fontAsset)
+        {
+            return fontAsset != null &&
+                fontAsset.atlasTextures != null &&
+                fontAsset.atlasTextures.Any(texture =>
+                    texture != null && texture.width > 0 && texture.height > 0);
         }
 
         private static void EnsureTmpEssentialResources()
@@ -243,15 +303,13 @@ namespace Translate.EditorTools
             string requestedCharacters)
         {
             var sourceFontPath = AssetDatabase.GetAssetPath(sourceFont);
-            fontAsset.creationSettings = new FontAssetCreationSettings
+            var creationSettings = new FontAssetCreationSettings
             {
                 sourceFontFileName = sourceFont.name,
                 sourceFontFileGUID = AssetDatabase.AssetPathToGUID(sourceFontPath),
-                faceIndex = 0,
                 pointSizeSamplingMode = job.pointSizeSamplingMode,
                 pointSize = Mathf.RoundToInt(fontAsset.faceInfo.pointSize),
                 padding = fontAsset.atlasPadding,
-                paddingMode = job.paddingMode,
                 packingMode = job.packingMode,
                 atlasWidth = fontAsset.atlasWidth,
                 atlasHeight = fontAsset.atlasHeight,
@@ -264,6 +322,24 @@ namespace Translate.EditorTools
                 renderMode = (int)renderMode,
                 includeFontFeatures = job.includeFontFeatures,
             };
+            SetOptionalCreationSetting(ref creationSettings, "faceIndex", 0);
+            SetOptionalCreationSetting(ref creationSettings, "paddingMode", job.paddingMode);
+            fontAsset.creationSettings = creationSettings;
+        }
+
+        private static void SetOptionalCreationSetting(ref FontAssetCreationSettings settings, string fieldName, object value)
+        {
+            var field = typeof(FontAssetCreationSettings).GetField(fieldName);
+            if (field == null)
+            {
+                Debug.Log($"[TMP] FontAssetCreationSettings.{fieldName} not found; skipped.");
+                return;
+            }
+
+            object boxed = settings;
+            field.SetValue(boxed, value);
+            settings = (FontAssetCreationSettings)boxed;
+            Debug.Log($"[TMP] FontAssetCreationSettings.{fieldName} set to {value}.");
         }
 
         private static void PreserveGeneratedData(TMP_FontAsset fontAsset, AtlasPopulationMode requestedPopulationMode)

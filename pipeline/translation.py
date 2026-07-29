@@ -22,6 +22,12 @@ from support.config import PipelineConfig
 AI_FIELD_REVIEW_MAX_BATCH_BYTES = 150 * 1024
 AI_FIELD_REVIEW_MAX_SAMPLES = 6
 AI_FIELD_REVIEW_MAX_SAMPLE_CHARS = 300
+MAYBE_TITLE_TRANS_FILENAME = "trans_maybe_title.json"
+UNFILTERED_RECORDS_FILENAME = "records_unfiltered.json"
+_IDENTIFIER_LIKE_TEXT_PATTERN = re.compile(
+    r"^[^\W_]+(?:\.[^\W_]+)*(?:[_-]+[^\W_]+(?:\.[^\W_]+)*)+$",
+    re.UNICODE,
+)
 
 
 def _extract_path_id(data: Any) -> int | None:
@@ -752,6 +758,10 @@ def _write_string_field_stats(cfg: PipelineConfig, stats: dict[str, dict[str, An
         "# 判断依据: 字段名、该字段文本出现次数 count、该字段拥有的 sample_values 文本样本。",
         "# sample_values 规则: 如果样本超过 6 条，只显示前 6 条；单条样本过长会截断；sample_total 表示原本记录的样本总数，sample_shown 表示当前显示条数。",
         "# 字段路径规则: Array[数字] 已归一化为 Array[]，请按输入中的 normalized field 原样返回。",
+        "# 独立判断规则: 每个 field 块都必须独立判断；即使多个字段拥有相同 leaf_key，也不得合并、去重，不能用 _title 等短字段代替其它完整路径。",
+        "# 高召回规则: 只要 sample_values 中存在明显可能展示给玩家的自然语言文本，就必须返回该块的完整 field；不确定时优先保留，避免漏选。",
+        "# 多语言规则: 玩家可见文本可能是英文、中文、繁体中文或其它语言，不能只把英文样本视为待翻译文本。",
+        "# 自检规则: 返回前逐块检查，确保所有已判断为玩家可见文本的完整 field 都在结果中，没有因为同名 leaf_key 或相似用途而遗漏。",
         "# 返回规则: 只直接给出可能需要翻译的 normalized field 字段路径，用英文逗号 ',' 隔开；不要返回 leaf_key；不要解释，不要编号，不要换行。",
         "# 示例: m_TableData.Array[].m_Localized,rant.Array[].speech",
         "",
@@ -947,6 +957,10 @@ def _write_scan_artifacts(
     write_json(cfg.stage_record_dir / cfg.output_material_map_json, material_map)
     write_json(cfg.stage_record_dir / cfg.output_ref_map_json, ref_map)
     if string_field_stats is not None:
+        write_json(
+            cfg.stage_record_dir / UNFILTERED_RECORDS_FILENAME,
+            [_record_to_dict(record) for record in records],
+        )
         _write_string_field_stats(cfg, string_field_stats)
 
 
@@ -1288,6 +1302,67 @@ def rebuild_material_map(cfg: PipelineConfig) -> dict[str, dict[str, Any]]:
     return material_map
 
 
+def refresh_material_map_external_refs(cfg: PipelineConfig) -> dict[str, int]:
+    """Re-resolve FileID/PathID material references without rescanning JSON."""
+    material_map = _load_material_map(cfg)
+    if material_map is None:
+        return {"entries": 0, "references": 0, "resolved": 0, "changed": 0}
+    file_id_map = _load_file_id_map(cfg)
+    path_id_map = _load_path_id_map(cfg)
+    references = 0
+    resolved = 0
+    changed = 0
+
+    for entry in material_map.values():
+        if not isinstance(entry, dict):
+            continue
+        asset_key = entry.get("asset") if isinstance(entry.get("asset"), str) else ""
+        materials = entry.get("materials")
+        if not asset_key or not isinstance(materials, list):
+            continue
+        for material in materials:
+            if not isinstance(material, dict):
+                continue
+            file_id = material.get("file_id")
+            path_id = material.get("path_id")
+            if not isinstance(path_id, int):
+                continue
+            references += 1
+            target_asset = asset_key
+            if isinstance(file_id, int) and file_id != 0:
+                target_asset = file_id_map.get(asset_key, {}).get(str(file_id), "")
+            material_file = (
+                path_id_map.get(target_asset, {}).get(str(path_id), "")
+                if target_asset
+                else ""
+            )
+            if material.get("asset") != target_asset:
+                material["asset"] = target_asset
+                changed += 1
+            if material_file:
+                resolved += 1
+                if material.get("material_file") != material_file:
+                    material["material_file"] = material_file
+                    changed += 1
+            elif material.get("material_file"):
+                material["material_file"] = ""
+                changed += 1
+
+    if changed:
+        write_json(_material_map_path(cfg), material_map)
+    stats = {
+        "entries": len(material_map),
+        "references": references,
+        "resolved": resolved,
+        "changed": changed,
+    }
+    _log(
+        "[扫描] 已刷新 material_map 外部引用: "
+        f"记录={stats['entries']}，引用={references}，解析成功={resolved}，修改={changed}"
+    )
+    return stats
+
+
 def _translate_baidu(text: str, cfg: PipelineConfig) -> str:
     from hashlib import md5
     import random
@@ -1403,6 +1478,7 @@ def _translate_ai_batch(
     strategy: Any,
     batch_index: int,
     batch_count: int,
+    artifact_prefix: str = "ai_translation",
 ) -> dict[int, str]:
     import requests
 
@@ -1425,7 +1501,7 @@ def _translate_ai_batch(
     }
     payload.update(strategy.extra_payload())
     cfg.stage_record_dir.mkdir(parents=True, exist_ok=True)
-    request_name = "ai_translation_request.json" if batch_count == 1 else f"ai_translation_request_batch_{batch_index:03d}.json"
+    request_name = f"{artifact_prefix}_request.json" if batch_count == 1 else f"{artifact_prefix}_request_batch_{batch_index:03d}.json"
     request_path = cfg.stage_record_dir / request_name
     request_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     _log(f"[翻译] AI 请求内容已写入: {request_path}")
@@ -1452,7 +1528,7 @@ def _translate_ai_batch(
     _log(f"[翻译] AI 批量接口已响应: batch={batch_index}/{batch_count}, HTTP {response.status_code}")
     response.raise_for_status()
     data = response.json()
-    response_name = "ai_translation_response.json" if batch_count == 1 else f"ai_translation_response_batch_{batch_index:03d}.json"
+    response_name = f"{artifact_prefix}_response.json" if batch_count == 1 else f"{artifact_prefix}_response_batch_{batch_index:03d}.json"
     response_path = cfg.stage_record_dir / response_name
     response_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     _log(f"[翻译] AI 返回内容已写入: {response_path}")
@@ -1528,6 +1604,16 @@ def _ordered_translations(source_texts: list[str], translations: dict[str, str])
     return OrderedDict((text, translations[text]) for text in source_texts if text in translations)
 
 
+def _is_identifier_like_translation_key(text: str) -> bool:
+    stripped = text.strip()
+    return bool(
+        stripped
+        and stripped == text
+        and not any(char.isspace() for char in stripped)
+        and _IDENTIFIER_LIKE_TEXT_PATTERN.fullmatch(stripped)
+    )
+
+
 def _format_log_text(text: str) -> str:
     return (
         text.replace("\\", "\\\\")
@@ -1579,14 +1665,44 @@ def _start_wait_logger(prefix: str, interval_seconds: int = 30) -> tuple[threadi
 def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> OrderedDict[str, str]:
     source_texts = unique_preserve_order(record.source_text for record in records)
     cache_path = cfg.stage_record_dir / cfg.output_trans_json
+    maybe_title_path = cfg.stage_record_dir / MAYBE_TITLE_TRANS_FILENAME
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    translations: OrderedDict[str, str] = OrderedDict((text, "") for text in source_texts)
+    maybe_title_texts = [
+        text for text in source_texts if _is_identifier_like_translation_key(text)
+    ]
+    maybe_title_set = set(maybe_title_texts)
+    translatable_texts = [
+        text for text in source_texts if text not in maybe_title_set
+    ]
+    translations: OrderedDict[str, str] = OrderedDict(
+        (text, "") for text in translatable_texts
+    )
     atomic_write_json(cache_path, dict(translations))
-    _log(f"[翻译] 已依据 records.json 重新生成空 trans.json 任务表: {cache_path}，键数={len(translations)}")
+    _log(
+        f"[翻译] 已依据 records.json 重新生成 trans.json 任务表: "
+        f"{cache_path}，键数={len(translations)}"
+    )
+    atomic_write_json(
+        maybe_title_path,
+        {text: text for text in maybe_title_texts},
+    )
+    if maybe_title_texts:
+        _log_blue(
+            f"[翻译] 本地识别到疑似资源键/标题键: {len(maybe_title_texts)} 条，"
+            "已从 trans.json 移除且不发送给 AI 或回落翻译。"
+        )
+        _log_blue(f"[翻译] 疑似资源键清单: {maybe_title_path}")
+    else:
+        _log(f"[翻译] 未发现由 _ 或 - 连接的疑似资源键，已写入空清单: {maybe_title_path}")
 
     failed_fallbacks: OrderedDict[str, str] = OrderedDict()
-    pending_items: list[tuple[int, str]] = list(enumerate(source_texts))
-    _log(f"[翻译] 待翻译去重文本数: {len(source_texts)}")
+    pending_items: list[tuple[int, str]] = [
+        (index, text) for index, text in enumerate(translatable_texts)
+    ]
+    _log(
+        f"[翻译] 待翻译去重文本数: {len(pending_items)}"
+        f"（总键数={len(source_texts)}，本地保留={len(maybe_title_texts)}）"
+    )
 
     if cfg.enable_ai_translation and pending_items:
         if _ai_translation_request_configured(cfg):
@@ -1598,6 +1714,7 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
                 f"单批预计输出预算={getattr(strategy, 'batch_output_budget_chars', 'unknown')}"
             )
             ai_translated_ids: set[int] = set()
+            failed_ai_batches: list[int] = []
             for batch_index, batch in enumerate(batches, start=1):
                 batch_size = len(strategy.user_content(batch, batch_index, len(batches)))
                 estimated_output = sum(strategy.estimate_output_chars(text) for _index, text in batch)
@@ -1609,9 +1726,14 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
                 try:
                     batch_result = _translate_ai_batch(batch, cfg, strategy, batch_index, len(batches))
                 except Exception as exc:
+                    failed_ai_batches.append(batch_index)
                     _log_dark_green(
                         f"[翻译] AI batch={batch_index}/{len(batches)} "
                         f"失败，将本批回落到 {cfg.translate_provider}: {exc}"
+                    )
+                    _log_blue(
+                        f"[翻译][后续处理] 可在工具脚本中运行 7「AI 翻译单批补跑 / 修补 trans.json」，"
+                        f"选择失败的 batch {batch_index:03d}，使用选项 3 重发并立即修补。"
                     )
                     continue
                 finally:
@@ -1623,7 +1745,23 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
                         continue
                     translations[source_text] = translated
                     ai_translated_ids.add(item_index)
-                ordered_cache = _ordered_translations(source_texts, translations)
+                expected_batch_ids = {item_index for item_index, _source_text in batch}
+                returned_batch_ids = {
+                    item_index
+                    for item_index, translated in batch_result.items()
+                    if item_index in expected_batch_ids and translated
+                }
+                missing_batch_count = len(expected_batch_ids - returned_batch_ids)
+                if missing_batch_count:
+                    if batch_index not in failed_ai_batches:
+                        failed_ai_batches.append(batch_index)
+                    _log_blue(
+                        f"[翻译][后续处理] batch={batch_index}/{len(batches)} 返回不完整 "
+                        f"({len(returned_batch_ids)}/{len(expected_batch_ids)}，"
+                        f"缺少={missing_batch_count})。请在工具脚本中运行 7，"
+                        "选择该批次并使用选项 3 重发并立即修补。"
+                    )
+                ordered_cache = _ordered_translations(translatable_texts, translations)
                 atomic_write_json(cache_path, dict(ordered_cache))
                 _log_blue(
                     f"[翻译] AI batch={batch_index}/{len(batches)} 完成，"
@@ -1632,6 +1770,17 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
             if ai_translated_ids:
                 pending_items = [(index, text) for index, text in pending_items if index not in ai_translated_ids]
                 _log(f"[翻译] AI 批量翻译成功: {len(ai_translated_ids)} 条；剩余回落请求: {len(pending_items)} 条")
+            if failed_ai_batches:
+                batch_names = ", ".join(
+                    f"batch_{batch_index:03d}" for batch_index in sorted(set(failed_ai_batches))
+                )
+                _log_blue(
+                    f"[翻译][补批提醒] 需要检查或重跑的 AI 批次: {batch_names}。"
+                )
+                _log_blue(
+                    "[翻译][补批提醒] 工具脚本选择 7 -> 选项 3；修补完成后，"
+                    "回到主菜单从脚本 3 开始继续执行。"
+                )
         else:
             _log(f"[翻译] AI 翻译已启用但配置不完整，将直接回落到 {cfg.translate_provider}。")
 
@@ -1643,18 +1792,18 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
             failed_fallbacks[source_text] = str(exc)
             _log(
                 f"[翻译] {cfg.translate_provider} 连续失败，已中断翻译: "
-                f"({index + 1}/{len(source_texts)}) {_format_log_text(source_text)} ({exc})"
+                f"({index + 1}/{len(translatable_texts)}) {_format_log_text(source_text)} ({exc})"
             )
             raise
         translations[source_text] = translated
-        ordered_cache = _ordered_translations(source_texts, translations)
+        ordered_cache = _ordered_translations(translatable_texts, translations)
         atomic_write_json(cache_path, dict(ordered_cache))
         _log(
             f"[翻译] 回落 {completed}/{len(pending_items)} "
-            f"({index + 1}/{len(source_texts)}) {_format_log_text(source_text)} -> {_format_log_text(translated)}"
+            f"({index + 1}/{len(translatable_texts)}) {_format_log_text(source_text)} -> {_format_log_text(translated)}"
         )
 
-    translations = _ordered_translations(source_texts, translations)
+    translations = _ordered_translations(translatable_texts, translations)
 
     if failed_fallbacks:
         _log(f"[翻译] 有 {len(failed_fallbacks)} 条请求失败，已使用原文兜底。")
@@ -1767,6 +1916,29 @@ MATERIAL_EFFECT_COLOR_ALPHA_ZERO_KEYS = {
     "_GlowColor",
 }
 
+MATERIAL_OUTLINE_EFFECT_KEYS = {
+    "_OutlineWidth",
+    "_OutlineSoftness",
+    "_OutlineColor",
+}
+
+MATERIAL_UNDERLAY_EFFECT_KEYS = {
+    "_UnderlayOffsetX",
+    "_UnderlayOffsetY",
+    "_UnderlayDilate",
+    "_UnderlaySoftness",
+    "_UnderlayOffset",
+    "_UnderlayColor",
+}
+
+MATERIAL_GLOW_EFFECT_KEYS = {
+    "_GlowOffset",
+    "_GlowInner",
+    "_GlowOuter",
+    "_GlowPower",
+    "_GlowColor",
+}
+
 # Generic scene shaders also commonly expose _OutlineWidth/_OutlineColor.  A
 # material must have several TMP SDF-specific properties before we ever alter it.
 TMP_SDF_MATERIAL_MARKERS = {
@@ -1825,13 +1997,68 @@ def _disable_material_property_value(property_name: str, value: Any) -> tuple[An
     return value, 0
 
 
-def _disable_material_effect_properties(node: Any) -> int:
+def _material_effect_kinds(data: Any) -> set[str]:
+    if not isinstance(data, dict):
+        return set()
+    values: dict[str, Any] = {}
+    floats = data.get("m_SavedProperties", {}).get("m_Floats", {}).get("Array", [])
+    if isinstance(floats, list):
+        for item in floats:
+            if isinstance(item, dict) and isinstance(item.get("first"), str):
+                values[item["first"]] = item.get("second")
+
+    keywords_node = data.get("m_ValidKeywords")
+    keywords = keywords_node.get("Array") if isinstance(keywords_node, dict) else []
+    keyword_set = {
+        value.upper()
+        for value in keywords
+        if isinstance(value, str)
+    } if isinstance(keywords, list) else set()
+
+    def nonzero(name: str) -> bool:
+        value = values.get(name)
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and value != 0
+
+    kinds: set[str] = set()
+    if "OUTLINE_ON" in keyword_set or nonzero("_OutlineWidth"):
+        kinds.add("outline")
+    if (
+        any(keyword.startswith("UNDERLAY_") for keyword in keyword_set)
+        or any(
+            nonzero(name)
+            for name in (
+                "_UnderlayOffsetX",
+                "_UnderlayOffsetY",
+                "_UnderlayDilate",
+                "_UnderlaySoftness",
+                "_UnderlayOffset",
+            )
+        )
+    ):
+        kinds.add("underlay")
+    if "GLOW_ON" in keyword_set:
+        kinds.add("glow")
+    return kinds
+
+
+def _material_effect_keys_for_kinds(kinds: set[str]) -> set[str]:
+    keys: set[str] = set()
+    if "outline" in kinds:
+        keys.update(MATERIAL_OUTLINE_EFFECT_KEYS)
+    if "underlay" in kinds:
+        keys.update(MATERIAL_UNDERLAY_EFFECT_KEYS)
+    if "glow" in kinds:
+        keys.update(MATERIAL_GLOW_EFFECT_KEYS)
+    return keys
+
+
+def _disable_material_effect_properties(node: Any, allowed_names: set[str] | None = None) -> int:
     changes = 0
     if isinstance(node, dict):
         pair_name = node.get("first")
         if not isinstance(pair_name, str):
             pair_name = node.get("name") if isinstance(node.get("name"), str) else None
-        if isinstance(pair_name, str):
+        if isinstance(pair_name, str) and (allowed_names is None or pair_name in allowed_names):
             for value_key in ("second", "value", "m_Value"):
                 if value_key not in node:
                     continue
@@ -1839,13 +2066,13 @@ def _disable_material_effect_properties(node: Any) -> int:
                 changes += changed
 
         for key, value in list(node.items()):
-            if isinstance(key, str):
+            if isinstance(key, str) and (allowed_names is None or key in allowed_names):
                 node[key], changed = _disable_material_property_value(key, value)
                 changes += changed
-            changes += _disable_material_effect_properties(node[key])
+            changes += _disable_material_effect_properties(node[key], allowed_names)
     elif isinstance(node, list):
         for item in node:
-            changes += _disable_material_effect_properties(item)
+            changes += _disable_material_effect_properties(item, allowed_names)
     return changes
 
 
@@ -1932,6 +2159,146 @@ def _material_paths_for_translated_records(
     return material_sources
 
 
+def _material_paths_for_component_paths(
+    cfg: PipelineConfig,
+    component_paths: set[Path],
+    material_map: dict[str, dict[str, Any]],
+    path_id_map: dict[str, dict[str, str]],
+    file_id_map: dict[str, dict[str, str]],
+    marker: str,
+) -> dict[str, list[dict[str, Any]]]:
+    records: list[ScanRecord] = []
+    translations = {marker: marker}
+    for path in component_paths:
+        try:
+            relative = str(path.relative_to(cfg.resource_input_root))
+        except ValueError:
+            continue
+        records.append(
+            ScanRecord(
+                file_path=relative,
+                field="<component-material>",
+                source_text=marker,
+            )
+        )
+    return _material_paths_for_translated_records(
+        cfg,
+        records,
+        translations,
+        material_map,
+        path_id_map,
+        file_id_map,
+    )
+
+
+def collect_translated_text_effect_material_sources(
+    cfg: PipelineConfig,
+    include_i2_bound_materials: bool = True,
+) -> dict[str, list[dict[str, Any]]]:
+    translations = _load_translation_dict(cfg)
+    scan_artifacts = _load_scan_artifacts(cfg)
+    if translations is None or scan_artifacts is None:
+        raise FileNotFoundError("需要先生成 records.json / trans.json / ref_map.json，再收集文本材质。")
+
+    records, _ids_map, _font_map, ref_map = scan_artifacts
+    if not _is_reverse_ref_map_format(ref_map):
+        raise ValueError("ref_map.json 不是被引用表格式，请先重新执行脚本 0。")
+    path_id_map = _load_path_id_map(cfg)
+    if not path_id_map:
+        raise FileNotFoundError("path_id_map.json 为空或读取失败，请先重新执行脚本 0。")
+    material_map = _load_material_usage_map(cfg)
+    refresh_stats = refresh_material_map_external_refs(cfg)
+    if refresh_stats["changed"]:
+        material_map = _load_material_usage_map(cfg)
+    file_id_map = _load_file_id_map(cfg)
+
+    runtime_sources = _load_runtime_binding_sources_for_translations(cfg, dict(translations))
+    has_i2_language_table = any(
+        isinstance(item, dict) and item.get("kind") == "i2_language_table"
+        for item in runtime_sources
+    )
+    detected_i2_bound_game_objects = (
+        _i2_bound_game_objects_for_translations(cfg, dict(translations))
+        if has_i2_language_table
+        else set()
+    )
+    if include_i2_bound_materials and runtime_sources and not has_i2_language_table:
+        _log_blue("[I2材质阴影描边] 运行时来源中没有 I2 语言表，已跳过 I2 精确绑定扫描。")
+    i2_bound_game_objects = detected_i2_bound_game_objects if include_i2_bound_materials else set()
+
+    component_paths: set[Path] = set()
+    translated_game_objects: set[tuple[str, int]] = set()
+
+    def add_game_object_components(key: tuple[str, int]) -> None:
+        if key in translated_game_objects:
+            return
+        translated_game_objects.add(key)
+        asset_key, game_object_path_id = key
+        entries = ref_map.get(asset_key, {}).get(str(game_object_path_id), [])
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            source_path_id = entry.get("path_id")
+            relative = (
+                path_id_map.get(asset_key, {}).get(str(source_path_id))
+                if isinstance(source_path_id, int)
+                else None
+            )
+            if not isinstance(relative, str):
+                relative = entry.get("file") if isinstance(entry.get("file"), str) else None
+            if relative:
+                component_paths.add(_resolve_input_json_path(cfg, relative))
+
+    for record in records:
+        if record.source_text not in translations or not isinstance(record.path_id, int) or record.path_id <= 0:
+            continue
+        json_path = _resolve_input_json_path(cfg, record.file_path)
+        add_game_object_components((_bundle_key_for_json_path(cfg, json_path), record.path_id))
+    for key in i2_bound_game_objects:
+        add_game_object_components(key)
+
+    material_records = list(records)
+    if component_paths and translations:
+        marker_text = next(iter(translations))
+        material_records.extend(
+            ScanRecord(
+                file_path=str(path),
+                field="<translated-or-i2-bound-component>",
+                source_text=marker_text,
+            )
+            for path in component_paths
+        )
+
+    material_sources = _material_paths_for_translated_records(
+        cfg,
+        material_records,
+        dict(translations),
+        material_map,
+        path_id_map,
+        file_id_map,
+    )
+    _log(
+        f"[材质阴影描边] 已收集待统一处理材质: {len(material_sources)} 个；"
+        f"I2 GameObject={len(i2_bound_game_objects)}；同物体组件={len(component_paths)}"
+    )
+    return material_sources
+
+
+def disable_tmp_sdf_material_effects(data: dict[str, Any]) -> tuple[int, set[str], str]:
+    if not _is_tmp_sdf_material_json(data):
+        return 0, set(), "not_tmp_sdf_material"
+    effect_kinds = _material_effect_kinds(data)
+    if not effect_kinds:
+        return 0, effect_kinds, "no_active_effect"
+    changes = _disable_material_effect_properties(
+        data,
+        _material_effect_keys_for_kinds(effect_kinds),
+    )
+    return changes, effect_kinds, ""
+
+
 def _all_text_effect_material_paths(cfg: PipelineConfig) -> dict[str, list[dict[str, Any]]]:
     """Find every TMP SDF Material that has outline, underlay, or glow properties."""
     effect_names = MATERIAL_EFFECT_FLOAT_ZERO_KEYS | MATERIAL_EFFECT_COLOR_ALPHA_ZERO_KEYS
@@ -1944,7 +2311,11 @@ def _all_text_effect_material_paths(cfg: PipelineConfig) -> dict[str, list[dict[
             data = json.loads(raw_text)
         except Exception:
             continue
-        if not any(name in raw_text for name in effect_names) or not _is_tmp_sdf_material_json(data):
+        if (
+            not any(name in raw_text for name in effect_names)
+            or not _is_tmp_sdf_material_json(data)
+            or not _material_effect_kinds(data)
+        ):
             continue
         relative = str(json_path.relative_to(cfg.resource_input_root))
         material_sources[relative] = [{"text_file": "<runtime-binding fallback>", "field": "", "file_id": None, "path_id": None}]
@@ -1993,6 +2364,94 @@ def _remove_stale_global_material_overlays(cfg: PipelineConfig, remove_tmp: bool
     return removed
 
 
+def _remove_recorded_component_overlays(
+    cfg: PipelineConfig,
+    record_path: Path | None = None,
+) -> int:
+    """Remove Shadow/Outline component outputs left by an earlier script 5 run."""
+    if record_path is None:
+        record_path = cfg.stage_record_dir / cfg.output_disabled_effect_components_json
+    if not record_path.is_file():
+        return 0
+    try:
+        record_data = read_json(record_path)
+    except Exception:
+        return 0
+    components = record_data.get("components") if isinstance(record_data, dict) else None
+    if not isinstance(components, list):
+        return 0
+
+    output_root = cfg.translated_dump_dir.resolve()
+    removed = 0
+    for item in components:
+        if not isinstance(item, dict):
+            continue
+        relative = item.get("output_file")
+        if not isinstance(relative, str) or not relative:
+            continue
+        output_path = (cfg.stage_dir / relative).resolve()
+        if not output_path.is_relative_to(output_root) or not output_path.is_file():
+            continue
+        output_path.unlink()
+        removed += 1
+
+    if removed:
+        _log_blue(
+            f"[阴影描边] 已移除旧的 Shadow/Outline 组件覆盖层: {removed} 个；"
+            "默认流程不再重写这些 MonoBehaviour。"
+        )
+    return removed
+
+
+def _remove_recorded_material_overlays(
+    cfg: PipelineConfig,
+    record_path: Path | None = None,
+) -> int:
+    """Remove Material outputs recorded by the previous effect-cleaning pass."""
+    if record_path is None:
+        record_path = cfg.stage_record_dir / cfg.output_disabled_effect_components_json
+    if not record_path.is_file():
+        return 0
+    try:
+        record_data = read_json(record_path)
+    except Exception:
+        return 0
+    materials = record_data.get("materials") if isinstance(record_data, dict) else None
+    if not isinstance(materials, list):
+        return 0
+
+    output_root = cfg.translated_dump_dir.resolve()
+    removed = 0
+    for item in materials:
+        if not isinstance(item, dict):
+            continue
+        relative = item.get("output_file")
+        if not isinstance(relative, str) or not relative:
+            continue
+        output_path = (cfg.stage_dir / relative).resolve()
+        if not output_path.is_relative_to(output_root) or not output_path.is_file():
+            continue
+        output_path.unlink()
+        removed += 1
+    if removed:
+        _log_blue(f"[材质阴影描边] 已清理上次生成的材质覆盖层: {removed} 个")
+    return removed
+
+
+def remove_text_effect_material_overlays(cfg: PipelineConfig) -> int:
+    """Remove material overlays created by text-effect cleanup passes."""
+    removed = 0
+    removed += _remove_recorded_material_overlays(
+        cfg,
+        cfg.stage_record_dir / cfg.output_disabled_effect_components_json,
+    )
+    removed += _remove_recorded_material_overlays(
+        cfg,
+        cfg.stage_record_dir / "disabled_i2_text_effect_materials.json",
+    )
+    return removed
+
+
 def _load_runtime_binding_sources_for_translations(
     cfg: PipelineConfig,
     translations: dict[str, str],
@@ -2020,9 +2479,74 @@ def _i2_bound_game_objects_for_translations(
     cfg: PipelineConfig,
     translations: dict[str, str],
 ) -> set[tuple[str, int]]:
-    """Find GameObjects whose I2 Localize term is present in trans.json."""
+    """Find GameObjects whose I2 term contains text translated by trans.json."""
+    translated_source_texts = set(translations)
+    translated_terms: set[str] = set()
+    translated_terms_folded: set[str] = set()
+
+    _log(f"[I2材质阴影描边] 正在枚举 JSON: {cfg.resource_input_root}")
+    json_files = collect_json_files(cfg.resource_input_root)
+    total_files = len(json_files)
+    progress_interval = max(1000, total_files // 50) if total_files else 1000
+    _log(f"[I2材质阴影描边] 开始扫描 I2 语言表: JSON={total_files}")
+    language_table_count = 0
+    for index, json_path in enumerate(json_files, start=1):
+        if index == 1 or index % progress_interval == 0 or index == total_files:
+            _log(
+                f"[I2材质阴影描边] 语言表扫描: {index}/{total_files}，"
+                f"语言表={language_table_count}，已匹配 Term={len(translated_terms)}"
+            )
+        try:
+            raw_text = json_path.read_text(encoding="utf-8-sig", errors="ignore")
+        except OSError:
+            continue
+        if '"mTerms"' not in raw_text or '"Languages"' not in raw_text:
+            continue
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            continue
+        if not _is_i2_language_table_json(data):
+            continue
+        language_table_count += 1
+        source = data.get("mSource")
+        terms = source.get("mTerms", {}).get("Array", []) if isinstance(source, dict) else []
+        if not isinstance(terms, list):
+            continue
+        for item in terms:
+            if not isinstance(item, dict):
+                continue
+            term = item.get("Term")
+            languages = item.get("Languages")
+            language_values = languages.get("Array") if isinstance(languages, dict) else None
+            if (
+                isinstance(term, str)
+                and term
+                and isinstance(language_values, list)
+                and any(
+                    isinstance(value, str) and value in translated_source_texts
+                    for value in language_values
+                )
+            ):
+                translated_terms.add(term)
+                translated_terms_folded.add(term.casefold())
+
+    _log(
+        f"[I2材质阴影描边] 语言表扫描完成: 语言表={language_table_count}，"
+        f"匹配已翻译 Term={len(translated_terms)}"
+    )
+    if not translated_terms:
+        _log_blue("[I2材质阴影描边] 没有匹配到已翻译 I2 Term，跳过 I2 组件扫描。")
+        return set()
+
     result: set[tuple[str, int]] = set()
-    for json_path in collect_json_files(cfg.resource_input_root):
+    _log(f"[I2材质阴影描边] 开始扫描 I2 Localize 组件: JSON={total_files}")
+    for index, json_path in enumerate(json_files, start=1):
+        if index == 1 or index % progress_interval == 0 or index == total_files:
+            _log(
+                f"[I2材质阴影描边] 组件扫描: {index}/{total_files}，"
+                f"已匹配 GameObject={len(result)}"
+            )
         try:
             raw_text = json_path.read_text(encoding="utf-8-sig", errors="ignore")
         except OSError:
@@ -2040,7 +2564,10 @@ def _i2_bound_game_objects_for_translations(
         game_object = data.get("m_GameObject")
         if (
             not isinstance(term, str)
-            or term not in translations
+            or (
+                term not in translated_terms
+                and term.casefold() not in translated_terms_folded
+            )
             or not isinstance(target_name, str)
             or "Text" not in target_name
             or not isinstance(game_object, dict)
@@ -2049,7 +2576,35 @@ def _i2_bound_game_objects_for_translations(
         ):
             continue
         result.add((_bundle_key_for_json_path(cfg, json_path), game_object["m_PathID"]))
+    _log(f"[I2材质阴影描边] I2 组件扫描完成: GameObject={len(result)}")
     return result
+
+
+def _component_paths_for_game_objects(
+    cfg: PipelineConfig,
+    ref_map: dict[str, Any],
+    path_id_map: dict[str, dict[str, str]],
+    game_objects: set[tuple[str, int]],
+) -> set[Path]:
+    component_paths: set[Path] = set()
+    for asset_key, game_object_path_id in game_objects:
+        entries = ref_map.get(asset_key, {}).get(str(game_object_path_id), [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            source_path_id = entry.get("path_id")
+            relative = (
+                path_id_map.get(asset_key, {}).get(str(source_path_id))
+                if isinstance(source_path_id, int)
+                else None
+            )
+            if not relative and isinstance(entry.get("file"), str):
+                relative = entry["file"]
+            if relative:
+                component_paths.add(_resolve_input_json_path(cfg, relative))
+    return component_paths
 
 
 def _load_path_id_map(cfg: PipelineConfig) -> dict[str, dict[str, str]]:
@@ -2285,9 +2840,15 @@ def _post_ai_field_review_batch(
                 "role": "system",
                 "content": (
                     "你是 Unity 游戏汉化字段筛选助手。"
-                    "只判断字段名是否可能是会显示给玩家的文本字段。"
+                    "必须综合完整字段路径、count 和 sample_values，判断字段是否可能包含会展示给玩家的文本。"
+                    "每个 field 块必须独立判断；相同 leaf_key 的多个完整字段也必须分别判断，"
+                    "禁止合并、去重或用短字段代表其它完整路径。"
+                    "只要样本中存在明显的玩家可见自然语言文本，就必须保留该完整字段；"
+                    "不确定时优先保留，以避免汉化漏项。"
+                    "玩家可见文本可能使用任意语言，包括繁体中文和非英语文本。"
                     "输入中的 Array[数字] 已归一化为 Array[]。"
                     "只返回输入中出现过的 normalized field 字段路径，不要返回 leaf_key 或短字段名。"
+                    "返回前逐块自检，确保没有因 leaf_key 相同、字段用途相似或候选较多而漏掉应保留字段。"
                     "用英文逗号分隔；不要解释，不要编号，不要换行。"
                 ),
             },
@@ -2411,10 +2972,28 @@ def apply_ai_field_selection_to_records(cfg: PipelineConfig) -> None:
 
     selected_set = set(selected_fields)
     records, _ids_map, font_map, ref_map = scan_artifacts
+    unfiltered_path = cfg.stage_record_dir / UNFILTERED_RECORDS_FILENAME
+    if unfiltered_path.is_file():
+        raw_unfiltered = read_json(unfiltered_path)
+        if isinstance(raw_unfiltered, list):
+            records = [
+                record
+                for item in raw_unfiltered
+                if (record := _record_from_dict(item)) is not None
+            ]
+            _log(f"[AI字段] 使用未过滤完整记录重新筛选: {unfiltered_path}，记录={len(records)}")
+    else:
+        _log_blue(
+            f"[AI字段] 尚无 {UNFILTERED_RECORDS_FILENAME}；本次只能基于当前 records.json 筛选。"
+            "重新运行脚本 0 后将自动生成完整备份。"
+        )
     record_fields = unique_preserve_order(record.field for record in records)
     matched_fields = [field for field in selected_fields if any(_is_ai_selected_text_field(cfg, record_field, {field}) for record_field in record_fields)]
     missing_fields = [field for field in selected_fields if field not in matched_fields]
-    kept_records = [record for record in records if _is_ai_selected_text_field(cfg, record.field, selected_set)]
+    kept_records = [
+        record for record in records
+        if _is_ai_selected_text_field(cfg, record.field, selected_set)
+    ]
     removed_count = len(records) - len(kept_records)
     _log(
         f"[AI字段] records 字段统计: 记录数={len(records)}，唯一字段={len(record_fields)}，"
@@ -2528,16 +3107,30 @@ def disable_translated_text_effect_components(
     cfg: PipelineConfig,
     force_all_text_effect_materials: bool = False,
     material_only: bool = False,
+    include_i2_bound_materials: bool = False,
+    i2_only_materials: bool = False,
+    write_material_overlays: bool = False,
+    cleanup_previous_outputs: bool = False,
 ) -> None:
     translations = _load_translation_dict(cfg)
     scan_artifacts = _load_scan_artifacts(cfg)
     if translations is None or scan_artifacts is None:
         raise FileNotFoundError("需要先生成 records.json / trans.json / ref_map.json，再执行阴影描边组件屏蔽。")
 
-    _remove_stale_global_material_overlays(
-        cfg,
-        remove_tmp=not force_all_text_effect_materials,
+    record_path = (
+        cfg.stage_record_dir / "disabled_i2_text_effect_materials.json"
+        if i2_only_materials
+        else cfg.stage_record_dir / cfg.output_disabled_effect_components_json
     )
+
+    if cleanup_previous_outputs:
+        _remove_stale_global_material_overlays(
+            cfg,
+            remove_tmp=not force_all_text_effect_materials,
+        )
+        if material_only:
+            _remove_recorded_component_overlays(cfg, record_path)
+            _remove_recorded_material_overlays(cfg, record_path)
     records, _ids_map, _font_map, ref_map = scan_artifacts
     if not _is_reverse_ref_map_format(ref_map):
         raise ValueError("ref_map.json 不是被引用表格式，请先重新执行脚本 0。")
@@ -2545,27 +3138,79 @@ def disable_translated_text_effect_components(
     if not path_id_map:
         raise FileNotFoundError("path_id_map.json 为空或读取失败，请先重新执行脚本 0。")
     material_map = _load_material_usage_map(cfg)
+    refresh_stats = refresh_material_map_external_refs(cfg)
+    if refresh_stats["changed"]:
+        material_map = _load_material_usage_map(cfg)
     file_id_map = _load_file_id_map(cfg)
 
     runtime_sources = _load_runtime_binding_sources_for_translations(cfg, dict(translations))
+    has_i2_language_table = any(
+        isinstance(item, dict) and item.get("kind") == "i2_language_table"
+        for item in runtime_sources
+    )
     clean_all_text_effect_materials = force_all_text_effect_materials
     if force_all_text_effect_materials:
         _log("\033[94m[材质阴影描边] 已由工具脚本强制启用全部 TMP 效果材质清理。\033[0m")
+    elif runtime_sources and include_i2_bound_materials and has_i2_language_table:
+        kinds = sorted({str(item.get("kind", "unknown")) for item in runtime_sources})
+        _log_blue(
+            "[阴影描边][运行时绑定] 检测到 "
+            f"{len(runtime_sources)} 个运行时文本来源（{', '.join(kinds)}）。"
+            "将通过精确 I2 绑定定位 GameObject，只重写关联的 Shadow/Outline 组件；"
+            "不重写 Text/TMP/SDF 字体组件。"
+        )
+    elif runtime_sources and include_i2_bound_materials:
+        kinds = sorted({str(item.get("kind", "unknown")) for item in runtime_sources})
+        _log_blue(
+            "[阴影描边][运行时绑定] 检测到 "
+            f"{len(runtime_sources)} 个运行时文本来源（{', '.join(kinds)}），"
+            "但没有 I2 语言表；已跳过 I2 精确绑定扫描。"
+            "普通译文仍会重写关联 Shadow/Outline 组件，不重写 Text/TMP/SDF 字体组件。"
+        )
     elif runtime_sources:
         kinds = sorted({str(item.get("kind", "unknown")) for item in runtime_sources})
         _log_blue(
             "[阴影描边][运行时绑定] 检测到 "
             f"{len(runtime_sources)} 个运行时文本来源（{', '.join(kinds)}）。"
-            "脚本 5 只处理可精确定位的 I2 绑定，不再自动全量修改 TMP 材质。"
+            "I2 TMP 字体和材质已由脚本 9 统一处理。"
         )
 
     component_paths: set[Path] = set()
     translated_game_objects: set[tuple[str, int]] = set()
-    i2_bound_game_objects = (
-        set()
-        if material_only
-        else _i2_bound_game_objects_for_translations(cfg, dict(translations))
+    detected_i2_bound_game_objects = (
+        _i2_bound_game_objects_for_translations(cfg, dict(translations))
+        if has_i2_language_table
+        else set()
     )
+    i2_bound_game_objects = (
+        detected_i2_bound_game_objects
+        if include_i2_bound_materials
+        else set()
+    )
+    i2_bound_component_paths = (
+        _component_paths_for_game_objects(cfg, ref_map, path_id_map, detected_i2_bound_game_objects)
+        if detected_i2_bound_game_objects
+        else set()
+    )
+    i2_bound_material_sources = (
+        _material_paths_for_component_paths(
+            cfg,
+            i2_bound_component_paths,
+            material_map,
+            path_id_map,
+            file_id_map,
+            "<i2-bound-material>",
+        )
+        if i2_bound_component_paths
+        else {}
+    )
+
+    if i2_bound_material_sources and not include_i2_bound_materials:
+        _log_blue(
+            "[材质阴影描边][I2保护] 已识别 "
+            f"{len(i2_bound_material_sources)} 个 I2 绑定 TMP 材质；"
+            "脚本 5 将排除这些共享材质；I2 TMP 字体和材质由脚本 9 统一处理。"
+        )
 
     def add_game_object_components(key: tuple[str, int]) -> None:
         if key in translated_game_objects:
@@ -2588,7 +3233,9 @@ def disable_translated_text_effect_components(
                 continue
             component_paths.add(_resolve_input_json_path(cfg, relative))
 
-    component_records = [] if material_only else records
+    # Even in material-only mode, use translated Text/TMP records to find sibling
+    # components on the same GameObject; only the component rewrite output is disabled.
+    component_records = records
     for record in component_records:
         if record.source_text not in translations or not isinstance(record.path_id, int) or record.path_id <= 0:
             continue
@@ -2610,7 +3257,7 @@ def disable_translated_text_effect_components(
             f"候选材质={len(material_sources)}。\033[0m"
         )
     else:
-        material_records = list(records)
+        material_records = [] if i2_only_materials else list(records)
         if component_paths and translations:
             marker_text = next(iter(translations))
             material_records.extend(
@@ -2629,8 +3276,21 @@ def disable_translated_text_effect_components(
             path_id_map,
             file_id_map,
         )
+        if i2_bound_material_sources and not include_i2_bound_materials:
+            for relative in i2_bound_material_sources:
+                material_sources.pop(relative, None)
     material_paths = {_resolve_input_json_path(cfg, relative) for relative in material_sources}
-    _log(f"[阴影描边] 候选文本材质: {len(material_paths)} 个")
+    if material_only:
+        write_material_overlays = True
+    if not write_material_overlays:
+        if material_paths:
+            _log(
+                f"[材质阴影描边] 已识别候选文本材质: {len(material_paths)} 个；"
+                "脚本 5 默认不写 Material 覆盖层，避免被 SDF 字体替换覆盖或影响共享材质。"
+            )
+        material_paths = set()
+    else:
+        _log(f"[阴影描边] 候选文本材质: {len(material_paths)} 个")
 
     matched_count = 0
     changed_count = 0
@@ -2641,10 +3301,12 @@ def disable_translated_text_effect_components(
     material_changed_count = 0
     material_disabled_fields_total = 0
     material_skipped_without_effect = 0
+    material_skipped_inactive_effect = 0
     material_skipped_non_tmp = 0
     disabled_material_records: list[dict[str, Any]] = []
-    total_components = len(component_paths)
-    for index, json_path in enumerate(sorted(component_paths), start=1):
+    effect_component_paths = set() if material_only else component_paths
+    total_components = len(effect_component_paths)
+    for index, json_path in enumerate(sorted(effect_component_paths), start=1):
         if index == 1 or index % 2000 == 0 or index == total_components:
             _log(
                 f"[阴影描边] 扫描进度: {index}/{total_components}；"
@@ -2695,7 +3357,7 @@ def disable_translated_text_effect_components(
         output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         changed_count += 1
         if changed_count <= 30 or changed_count % 500 == 0:
-            _log(f"[阴影描边] {index}/{len(component_paths)} 已屏蔽: {relative}，修改字段: {changes}")
+            _log(f"[阴影描边] {index}/{len(effect_component_paths)} 已屏蔽: {relative}，修改字段: {changes}")
 
     total_materials = len(material_paths)
     for index, json_path in enumerate(sorted(material_paths), start=1):
@@ -2727,7 +3389,14 @@ def disable_translated_text_effect_components(
         if not _is_tmp_sdf_material_json(data):
             material_skipped_non_tmp += 1
             continue
-        changes = _disable_material_effect_properties(data)
+        effect_kinds = _material_effect_kinds(data)
+        if not effect_kinds:
+            material_skipped_inactive_effect += 1
+            continue
+        changes = _disable_material_effect_properties(
+            data,
+            _material_effect_keys_for_kinds(effect_kinds),
+        )
         material_matched_count += 1
         source_entries = material_sources.get(str(relative), [])
         disabled_material_records.append(
@@ -2737,6 +3406,7 @@ def disable_translated_text_effect_components(
                 "changed_this_run": changes > 0,
                 "changed_fields": changes,
                 "already_disabled": changes == 0,
+                "effect_kinds": sorted(effect_kinds),
                 "used_by": source_entries,
             }
         )
@@ -2749,7 +3419,6 @@ def disable_translated_text_effect_components(
         if material_changed_count <= 30 or material_changed_count % 200 == 0:
             _log(f"[材质阴影描边] {index}/{len(material_paths)} 已屏蔽: {relative}，修改字段: {changes}")
 
-    record_path = cfg.stage_record_dir / cfg.output_disabled_effect_components_json
     write_json(record_path, {"components": disabled_records, "materials": disabled_material_records})
     tsv_path = record_path.with_suffix(".tsv")
     tsv_rows = [
@@ -2805,10 +3474,295 @@ def disable_translated_text_effect_components(
         f"[材质阴影描边] 命中材质: {material_matched_count} 个；"
         f"写出屏蔽 JSON: {material_changed_count} 个；修改字段: {material_disabled_fields_total} 处；"
         f"跳过无效果参数材质: {material_skipped_without_effect} 个；"
+        f"跳过未启用效果材质: {material_skipped_inactive_effect} 个；"
         f"跳过非 TMP 材质: {material_skipped_non_tmp} 个"
     )
     _log(f"[阴影描边] 屏蔽组件记录: {record_path}")
     _log(f"[阴影描边] 屏蔽组件 TSV: {tsv_path}")
+
+
+def repoint_i2_text_effect_materials(cfg: PipelineConfig) -> None:
+    """Repoint I2-bound TMP components to compatible no-effect materials."""
+    translations = _load_translation_dict(cfg)
+    scan_artifacts = _load_scan_artifacts(cfg)
+    if translations is None or scan_artifacts is None:
+        raise FileNotFoundError("需要先生成 records.json / trans.json / ref_map.json。")
+
+    _records, _ids_map, _font_map, ref_map = scan_artifacts
+    path_id_map = _load_path_id_map(cfg)
+    file_id_map = _load_file_id_map(cfg)
+    material_map = _load_material_usage_map(cfg)
+    refresh_stats = refresh_material_map_external_refs(cfg)
+    if refresh_stats["changed"]:
+        material_map = _load_material_usage_map(cfg)
+
+    i2_game_objects = _i2_bound_game_objects_for_translations(cfg, dict(translations))
+    component_paths: set[Path] = set()
+    for asset_key, game_object_path_id in i2_game_objects:
+        entries = ref_map.get(asset_key, {}).get(str(game_object_path_id), [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            source_path_id = entry.get("path_id")
+            relative = (
+                path_id_map.get(asset_key, {}).get(str(source_path_id))
+                if isinstance(source_path_id, int)
+                else None
+            )
+            if not relative and isinstance(entry.get("file"), str):
+                relative = entry["file"]
+            if relative:
+                component_paths.add(_resolve_input_json_path(cfg, relative))
+
+    def resolve_pptr(asset_key: str, value: Any) -> tuple[str, int] | None:
+        if not isinstance(value, dict):
+            return None
+        file_id = value.get("m_FileID")
+        path_id = value.get("m_PathID")
+        if not isinstance(file_id, int) or not isinstance(path_id, int) or path_id <= 0:
+            return None
+        target_asset = asset_key if file_id == 0 else file_id_map.get(asset_key, {}).get(str(file_id))
+        return (target_asset, path_id) if target_asset else None
+
+    def material_signature(asset_key: str, data: dict[str, Any]) -> tuple[Any, Any] | None:
+        shader = resolve_pptr(asset_key, data.get("m_Shader"))
+        main_texture = None
+        tex_envs = data.get("m_SavedProperties", {}).get("m_TexEnvs", {}).get("Array", [])
+        if isinstance(tex_envs, list):
+            for item in tex_envs:
+                if not isinstance(item, dict) or item.get("first") != "_MainTex":
+                    continue
+                second = item.get("second")
+                texture = second.get("m_Texture") if isinstance(second, dict) else None
+                main_texture = resolve_pptr(asset_key, texture)
+                break
+        if shader is None or main_texture is None:
+            return None
+        return shader, main_texture
+
+    material_catalog: list[dict[str, Any]] = []
+    material_by_relative: dict[str, dict[str, Any]] = {}
+    for asset_key, bucket in path_id_map.items():
+        for path_id_text, relative in bucket.items():
+            if "\\Material\\" not in relative:
+                continue
+            json_path = _resolve_input_json_path(cfg, relative)
+            try:
+                data = read_json(json_path)
+                path_id = int(path_id_text)
+            except Exception:
+                continue
+            if not isinstance(data, dict) or not _is_tmp_sdf_material_json(data):
+                continue
+            item = {
+                "asset": asset_key,
+                "path_id": path_id,
+                "relative": relative,
+                "name": str(data.get("m_Name", "")),
+                "signature": material_signature(asset_key, data),
+                "effect_kinds": _material_effect_kinds(data),
+            }
+            material_catalog.append(item)
+            material_by_relative[relative] = item
+
+    replacement_by_effect_material: dict[str, dict[str, Any]] = {}
+    for effect_material in material_catalog:
+        if not effect_material["effect_kinds"] or effect_material["signature"] is None:
+            continue
+        candidates = [
+            candidate
+            for candidate in material_catalog
+            if not candidate["effect_kinds"]
+            and candidate["signature"] == effect_material["signature"]
+        ]
+        if not candidates:
+            continue
+        candidates.sort(
+            key=lambda candidate: (
+                0 if "material" in candidate["name"].casefold() else 1,
+                len(candidate["name"]),
+                candidate["relative"],
+            )
+        )
+        replacement_by_effect_material[effect_material["relative"]] = candidates[0]
+
+    record_path = cfg.stage_record_dir / "disabled_i2_text_effect_materials.json"
+    component_changes: list[dict[str, Any]] = []
+    removed_shared_materials: set[str] = set()
+    missing_replacements: set[str] = set()
+    missing_components: dict[str, set[str]] = {}
+
+    for component_path in sorted(component_paths):
+        if not component_path.is_file():
+            continue
+        relative = str(component_path.relative_to(cfg.resource_input_root))
+        usage = material_map.get(relative)
+        materials = usage.get("materials") if isinstance(usage, dict) else None
+        if not isinstance(materials, list):
+            continue
+
+        replacements: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+        for material in materials:
+            if not isinstance(material, dict):
+                continue
+            effect_relative = material.get("material_file")
+            field = material.get("field")
+            if not isinstance(effect_relative, str) or not isinstance(field, str):
+                continue
+            effect_item = material_by_relative.get(effect_relative)
+            if not effect_item or not effect_item["effect_kinds"]:
+                continue
+            replacement = replacement_by_effect_material.get(effect_relative)
+            if replacement is None:
+                missing_replacements.add(effect_relative)
+                missing_components.setdefault(effect_relative, set()).add(relative)
+                continue
+            replacements.append((field, effect_item, replacement))
+        if not replacements:
+            continue
+
+        output_path = cfg.translated_dump_dir / relative
+        source_path = output_path if output_path.is_file() else component_path
+        try:
+            data = read_json(source_path)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        component_asset = _bundle_key_for_json_path(cfg, component_path)
+        changed_fields: list[dict[str, Any]] = []
+        for field, effect_item, replacement in replacements:
+            current = data.get(field)
+            if not isinstance(current, dict):
+                continue
+            replacement_asset = replacement["asset"]
+            if replacement_asset == component_asset:
+                replacement_file_id = 0
+            else:
+                replacement_file_id = next(
+                    (
+                        int(file_id)
+                        for file_id, target_asset in file_id_map.get(component_asset, {}).items()
+                        if target_asset == replacement_asset
+                    ),
+                    None,
+                )
+            if replacement_file_id is None:
+                missing_replacements.add(effect_item["relative"])
+                missing_components.setdefault(effect_item["relative"], set()).add(relative)
+                continue
+            new_pointer = {
+                "m_FileID": replacement_file_id,
+                "m_PathID": replacement["path_id"],
+            }
+            if current == new_pointer:
+                continue
+            data[field] = new_pointer
+            changed_fields.append(
+                {
+                    "field": field,
+                    "from": current,
+                    "from_material": effect_item["relative"],
+                    "to": new_pointer,
+                    "to_material": replacement["relative"],
+                }
+            )
+            effect_output = cfg.translated_dump_dir / effect_item["relative"]
+            if effect_output.is_file():
+                effect_output.unlink()
+                removed_shared_materials.add(effect_item["relative"])
+        if not changed_fields:
+            continue
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        component_changes.append(
+            {
+                "file": relative,
+                "output_file": str(output_path.relative_to(cfg.stage_dir)),
+                "changes": changed_fields,
+            }
+        )
+
+    sample_dirs: list[str] = []
+    for effect_relative in sorted(missing_replacements) if cfg.enable_sample_collection else []:
+        effect_item = material_by_relative.get(effect_relative, {})
+        safe_name = re.sub(
+            r"[^0-9A-Za-z._-]+",
+            "_",
+            Path(effect_relative).stem,
+        ).strip("._") or "material"
+        sample_dir = cfg.root_dir / "样本" / f"I2MaterialMissing_{safe_name}"
+        if sample_dir.exists():
+            shutil.rmtree(sample_dir)
+        sample_dir.mkdir(parents=True, exist_ok=True)
+
+        source_material = _resolve_input_json_path(cfg, effect_relative)
+        if source_material.is_file():
+            destination = sample_dir / "original_material" / source_material.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_material, destination)
+
+        component_relatives = sorted(missing_components.get(effect_relative, set()))
+        for component_relative in component_relatives:
+            source_component = _resolve_input_json_path(cfg, component_relative)
+            if not source_component.is_file():
+                continue
+            destination = sample_dir / "i2_tmp_components" / component_relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_component, destination)
+
+        asset_key = effect_item.get("asset") if isinstance(effect_item, dict) else None
+        if isinstance(asset_key, str):
+            manifest_path = cfg.resource_input_root / asset_key / "manifest.json"
+            if manifest_path.is_file():
+                shutil.copy2(manifest_path, sample_dir / "manifest.json")
+
+        write_json(
+            sample_dir / "context.json",
+            {
+                "reason": "No compatible no-effect TMP material with the same Shader and MainTex.",
+                "effect_material": effect_relative,
+                "effect_asset": asset_key,
+                "effect_path_id": effect_item.get("path_id") if isinstance(effect_item, dict) else None,
+                "effect_kinds": sorted(effect_item.get("effect_kinds", [])) if isinstance(effect_item, dict) else [],
+                "signature": effect_item.get("signature") if isinstance(effect_item, dict) else None,
+                "referencing_i2_tmp_components": component_relatives,
+                "asset_file_ids": file_id_map.get(asset_key, {}) if isinstance(asset_key, str) else {},
+            },
+        )
+        sample_dirs.append(str(sample_dir))
+        _log(f"\033[95m[I2材质阴影描边][样本] 已保存并覆盖: {sample_dir}\033[0m")
+
+    if missing_replacements and not cfg.enable_sample_collection:
+        _log("\033[94m[I2材质阴影描边][样本] 自动保存已关闭，可通过 enable_sample_collection 启用。\033[0m")
+
+    if missing_replacements:
+        _log(
+            "\033[91m[I2材质阴影描边][需要处理] "
+            f"有 {len(missing_replacements)} 个效果材质找不到兼容基础材质，已跳过对应 TMP。\033[0m"
+        )
+        for effect_relative in sorted(missing_replacements):
+            _log(f"\033[91m[I2材质阴影描边][需要处理] {effect_relative}\033[0m")
+
+    write_json(
+        record_path,
+        {
+            "mode": "component_material_repoint",
+            "i2_game_objects": len(i2_game_objects),
+            "changed_components": component_changes,
+            "removed_shared_material_overlays": sorted(removed_shared_materials),
+            "missing_compatible_materials": sorted(missing_replacements),
+            "sample_directories": sample_dirs,
+        },
+    )
+    _log(
+        f"[I2材质阴影描边] 组件级改指完成: I2 GameObject={len(i2_game_objects)}，"
+        f"修改 TMP={len(component_changes)}，移除共享材质覆盖={len(removed_shared_materials)}，"
+        f"无兼容基础材质={len(missing_replacements)}"
+    )
+    _log(f"[I2材质阴影描边] 独立记录: {record_path}")
 
 
 def translate_and_record(cfg: PipelineConfig) -> None:

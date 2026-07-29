@@ -14,6 +14,8 @@ namespace UnityResourceCLI
         private StreamReader? sr;
         private AssetsFileWriter? aw;
         public int PreservedManagedReferencesCount { get; private set; }
+        public int PreservedMissingJsonFieldsCount { get; private set; }
+        public List<string> PreservedMissingJsonFieldNames { get; } = new List<string>();
 
         public void DumpTextAsset(StreamWriter sw, AssetTypeValueField baseField)
         {
@@ -51,6 +53,8 @@ namespace UnityResourceCLI
         {
             this.sr = sr;
             PreservedManagedReferencesCount = 0;
+            PreservedMissingJsonFieldsCount = 0;
+            PreservedMissingJsonFieldNames.Clear();
             using MemoryStream ms = new MemoryStream();
             aw = new AssetsFileWriter(ms) { BigEndian = false };
 
@@ -76,6 +80,8 @@ namespace UnityResourceCLI
         {
             this.sr = sr;
             PreservedManagedReferencesCount = 0;
+            PreservedMissingJsonFieldsCount = 0;
+            PreservedMissingJsonFieldNames.Clear();
             using MemoryStream ms = new MemoryStream();
             aw = new AssetsFileWriter(ms) { BigEndian = false };
 
@@ -469,7 +475,16 @@ namespace UnityResourceCLI
                 {
                     JToken? childToken = token[childTempField.Name];
                     if (childToken == null)
-                        throw new Exception($"Missing field {childTempField.Name} in JSON.");
+                    {
+                        AssetTypeValueField? originalChild = GetOriginalChild(originalField, childTempField.Name);
+                        if (originalChild == null)
+                            throw new Exception($"Missing field {childTempField.Name} in JSON and original asset.");
+
+                        originalChild.Write(aw!);
+                        PreservedMissingJsonFieldsCount++;
+                        PreservedMissingJsonFieldNames.Add(childTempField.Name);
+                        continue;
+                    }
 
                     RecurseJsonImport(childTempField, childToken, GetOriginalChild(originalField, childTempField.Name));
                 }

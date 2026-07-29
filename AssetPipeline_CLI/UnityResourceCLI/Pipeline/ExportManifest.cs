@@ -17,6 +17,7 @@ namespace UnityResourceCLI
     {
         public string RelativeBase { get; set; } = "";
         public string BundleEntryName { get; set; } = "";
+        public string UnityVersion { get; set; } = "";
         public List<ExportManifestExternal> Externals { get; set; } = new();
     }
 
@@ -48,5 +49,8 @@ namespace UnityResourceCLI
         public string ExportKind { get; set; } = "";
         public string RelativePath { get; set; } = "";
         public string BundleEntryName { get; set; } = "";
+        public string ReferenceUnityVersion { get; set; } = "";
+        public string TypeTreeFingerprint { get; set; } = "";
+        public string JsonSchemaFingerprint { get; set; } = "";
     }
 }

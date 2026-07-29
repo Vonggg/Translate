@@ -1,29 +1,28 @@
 from __future__ import annotations
 
-import argparse
 import json
+import hashlib
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 from support.config import load_config
 from support.image_import_utils import copy_image_for_import
-from pipeline.ai_translation_strategy import get_strategy
-from pipeline.catalog_tools import (
-    auto_patch_and_repack_catalog_after_import,
-    calculate_final_bundle_crcs_manually,
-    patch_expanded_catalog_from_final_bundles,
-    parse_catalog_to_output,
-    repack_expanded_catalog,
-    validate_catalog_crc_algorithm,
-    _rebuild_request_option_raw,
-    _source_catalog_android_root,
+from support.menu_selection import parse_number_ranges
+from support.script_output_cleanup import (
+    MANIFEST_PATH as SCRIPT_OUTPUT_MANIFEST_PATH,
+    collect_script_cleanup_targets,
+    delete_script_cleanup_targets,
+    load_script_output_manifest,
+    target_size,
 )
-from pipeline.translation import _is_blacklisted_string_field, disable_translated_text_effect_components
-from pipeline.tmp_pipeline import sync_generated_tmp_material_parameters
+from pipeline.ai_translation_strategy import get_strategy
+from pipeline.shared import atomic_write_json
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -33,7 +32,14 @@ DEFAULT_ALL_IMAGE_ROOT = SCRIPT_DIR / "workspace" / "AllPNG"
 DEFAULT_ALL_IMAGE_PNG_ROOT = DEFAULT_ALL_IMAGE_ROOT / "PNG"
 DEFAULT_EDITED_IMAGE_ROOT = SCRIPT_DIR / "workspace" / "output" / "Image" / "修改后的图片目录"
 DEFAULT_IMAGE_TO_IMPORT_ROOT = SCRIPT_DIR / "workspace" / "output" / "Image" / "ToImport"
+DEFAULT_OBJECT_TO_IMPORT_ROOT = SCRIPT_DIR / "workspace" / "output" / "Object" / "ToImport"
 DEFAULT_ALL_IMAGE_MAP = DEFAULT_ALL_IMAGE_ROOT / "_allpng_map.json"
+DEFAULT_BLOCK_IMAGE_ROOT = DEFAULT_ALL_IMAGE_ROOT / "BlockImages"
+DEFAULT_BLOCK_RECORD = SCRIPT_DIR / "workspace" / "records" / "blocked_image_objects.json"
+DEFAULT_IMAGE_OBJECT_INDEX = SCRIPT_DIR / "workspace" / "records" / "image_object_index.json"
+DEFAULT_CATALOG_OUTPUT = SCRIPT_DIR / "workspace" / "output" / "catalog" / "Output.json"
+DEFAULT_ALL_SPRITE_ROOT = DEFAULT_ALL_IMAGE_ROOT / "Sprite"
+DEFAULT_ALL_SPRITE_MAP = DEFAULT_ALL_SPRITE_ROOT / "_allsprite_map.json"
 DEFAULT_MISSING_TTF_CHARS_FILE = SCRIPT_DIR / "workspace" / "records" / "translation_chars_missing_from_ttf.txt"
 DEFAULT_TRANS_JSON = SCRIPT_DIR / "workspace" / "records" / "trans.json"
 DEFAULT_RECORDS_JSON = SCRIPT_DIR / "workspace" / "records" / "records.json"
@@ -41,8 +47,16 @@ FIND_PATH_ID_SCRIPT = SCRIPT_DIR / "support" / "查找PathID文件.py"
 FIND_ASSET_NAME_SCRIPT = SCRIPT_DIR / "support" / "查找资源名文件.py"
 AI_TRANSLATION_BATCH_TOOL = SCRIPT_DIR / "tools" / "ai_translation_batch_tool.py"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".webp"}
-M_NAME_JSON_RE = re.compile(r'("m_Name"\s*:\s*)"(?:\\.|[^"\\])*"')
-M_NAME_YAML_RE = re.compile(r"(^\s*m_Name:\s*)(.*)$", re.MULTILINE)
+OBJECT_INDEX_DIR_NAMES = {
+    "gameobject",
+    "transform",
+    "recttransform",
+    "sprite",
+    "spriterenderer",
+    "mesh",
+    "meshfilter",
+    "skinnedmeshrenderer",
+}
 
 
 def prompt_input(message: str) -> str:
@@ -56,9 +70,18 @@ def iter_json_files(root: Path):
 
 
 def iter_monobehaviour_json_files(root: Path):
-    for path in root.rglob("*.json"):
-        if path.is_file() and "MonoBehaviour" in path.parts:
-            yield path
+    for current_root, dir_names, file_names in os.walk(root, topdown=True):
+        dir_names.sort()
+        dir_names[:] = [
+            name for name in dir_names
+            if name.lower() not in OBJECT_INDEX_DIR_NAMES
+        ]
+        current_path = Path(current_root)
+        if current_path.name.lower() != "monobehaviour":
+            continue
+        for file_name in sorted(file_names):
+            if file_name.lower().endswith(".json"):
+                yield current_path / file_name
 
 
 def iter_image_files(root: Path):
@@ -78,345 +101,38 @@ def file_contains_text(path: Path, needle: str) -> bool:
     return False
 
 
-def read_text_fallback(path: Path) -> str:
+def _search_worker_count(total_files: int) -> int:
+    auto_count = 1 if total_files < 200 else max(2, min(16, (os.cpu_count() or 4) * 2))
     try:
-        return path.read_text(encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        return path.read_text(encoding="utf-8", errors="ignore")
-
-
-def extract_m_name(path: Path) -> str:
-    text = read_text_fallback(path)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        data = None
-
-    if isinstance(data, dict):
-        value = data.get("m_Name")
-        if isinstance(value, str) and value:
-            return value
-
-    match = M_NAME_JSON_RE.search(text)
-    if match:
-        value_text = match.group(0).split(":", 1)[1].strip()
-        try:
-            value = json.loads(value_text)
-        except json.JSONDecodeError:
-            value = ""
-        if isinstance(value, str) and value:
-            return value
-
-    match = M_NAME_YAML_RE.search(text)
-    if match:
-        value = match.group(2).strip()
-        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-            value = value[1:-1]
-        if value:
-            return value
-
-    return path.stem
-
-
-def replace_m_name_text(text: str, name: str) -> str:
-    json_name = json.dumps(name, ensure_ascii=False)
-    if M_NAME_JSON_RE.search(text):
-        return M_NAME_JSON_RE.sub(lambda match: f"{match.group(1)}{json_name}", text, count=1)
-    if M_NAME_YAML_RE.search(text):
-        return M_NAME_YAML_RE.sub(lambda match: f"{match.group(1)}{name}", text, count=1)
-    raise ValueError("空 mesh 文件中没有找到 m_Name 属性")
-
-
-def looks_like_mesh_dump(path: Path, text: str) -> bool:
-    if "Mesh" in path.parts:
-        return True
-    mesh_markers = (
-        '"m_SubMeshes"',
-        '"m_VertexData"',
-        '"m_IndexBuffer"',
-        '"m_MeshCompression"',
-        "m_SubMeshes:",
-        "m_VertexData:",
-        "m_IndexBuffer:",
-        "m_MeshCompression:",
-    )
-    return any(marker in text for marker in mesh_markers)
-
-
-def iter_empty_mesh_targets(target_root: Path, include_all_files: bool):
-    for path in sorted(target_root.rglob("*")):
-        if not path.is_file():
-            continue
-        if path.name.lower() == "manifest.json":
-            continue
-        if include_all_files or path.suffix.lower() == ".json":
-            yield path
-
-
-def clear_unity_array(value):
-    if isinstance(value, dict) and isinstance(value.get("Array"), list):
-        value["Array"] = []
-    elif isinstance(value, list):
-        value.clear()
-
-
-def clear_packed_mesh_stream(value):
-    if not isinstance(value, dict):
-        return
-    for key in ("m_NumItems", "m_BitSize", "m_Start", "m_Range"):
-        if key in value and isinstance(value[key], (int, float)):
-            value[key] = 0
-    if "m_Data" in value:
-        if isinstance(value["m_Data"], str):
-            value["m_Data"] = ""
-        else:
-            clear_unity_array(value["m_Data"])
-
-
-def clear_compressed_mesh(value):
-    if not isinstance(value, dict):
-        return
-    for child in value.values():
-        if isinstance(child, dict):
-            clear_packed_mesh_stream(child)
-
-
-def clear_mesh_shapes(value):
-    if not isinstance(value, dict):
-        return
-    for key in ("vertices", "shapes", "channels", "fullWeights"):
-        if key in value:
-            clear_unity_array(value[key])
-
-
-def clear_stream_data(value):
-    if not isinstance(value, dict):
-        return
-    for key in ("offset", "size"):
-        if key in value:
-            value[key] = 0
-    if "path" in value:
-        value["path"] = ""
-
-
-def clear_vertex_data(value):
-    if not isinstance(value, dict):
-        return
-    if "m_VertexCount" in value:
-        value["m_VertexCount"] = 0
-    if "m_Channels" in value:
-        clear_unity_array(value["m_Channels"])
-    if "m_DataSize" in value:
-        if isinstance(value["m_DataSize"], str):
-            value["m_DataSize"] = ""
-        else:
-            clear_unity_array(value["m_DataSize"])
-    if "m_StreamData" in value:
-        clear_stream_data(value["m_StreamData"])
-
-
-def clear_mesh_data(data: dict) -> None:
-    for key in (
-        "m_SubMeshes",
-        "m_BindPose",
-        "m_BoneNameHashes",
-        "m_BakedConvexCollisionMesh",
-        "m_BakedTriangleCollisionMesh",
-    ):
-        if key in data:
-            clear_unity_array(data[key])
-
-    for key in ("m_RootBoneNameHash", "m_MeshUsageFlags", "m_IndexFormat", "m_MeshCompression"):
-        if key in data:
-            data[key] = 0
-
-    for key in ("m_IsReadable", "m_KeepVertices", "m_KeepIndices"):
-        if key in data:
-            data[key] = 1
-
-    for key in ("m_IndexBuffer", "m_Skin"):
-        if key in data:
-            if isinstance(data[key], str):
-                data[key] = ""
-            else:
-                clear_unity_array(data[key])
-
-    if "m_Shapes" in data:
-        clear_mesh_shapes(data["m_Shapes"])
-    if "m_VertexData" in data:
-        clear_vertex_data(data["m_VertexData"])
-    if "m_CompressedMesh" in data:
-        clear_compressed_mesh(data["m_CompressedMesh"])
-    if "m_StreamData" in data:
-        clear_stream_data(data["m_StreamData"])
-
-    for key in ("m_LocalAABB", "m_CollisionMeshAABB"):
-        if isinstance(data.get(key), dict):
-            center = data[key].get("m_Center")
-            extent = data[key].get("m_Extent")
-            for vector in (center, extent):
-                if isinstance(vector, dict):
-                    for axis in ("x", "y", "z"):
-                        if axis in vector:
-                            vector[axis] = 0
-
-
-def clear_mesh_files(target_root: Path, include_all_files: bool = False) -> int:
-    if not target_root.is_dir():
-        raise FileNotFoundError(f"目标目录不存在: {target_root}")
-
-    cleared = 0
-    skipped = 0
-    files = list(iter_empty_mesh_targets(target_root, include_all_files))
-    print(f"[清空Mesh] 待处理文件数: {len(files)}")
-    for index, target_path in enumerate(files, start=1):
-        if index == 1 or index % 200 == 0 or index == len(files):
-            print(f"[清空Mesh] 进度: {index}/{len(files)}，已清空: {cleared}，已跳过: {skipped}", flush=True)
-
-        target_text = read_text_fallback(target_path)
-        if not looks_like_mesh_dump(target_path, target_text):
-            skipped += 1
-            continue
-        try:
-            data = json.loads(target_text)
-        except json.JSONDecodeError:
-            skipped += 1
-            print(f"[SKIP] 暂不支持非 JSON Mesh dump: {target_path}")
-            continue
-        if not isinstance(data, dict):
-            skipped += 1
-            continue
-
-        clear_mesh_data(data)
-        target_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        cleared += 1
-        print(f"[CLEAR] {target_path}，m_Name={data.get('m_Name', target_path.stem)}")
-
-    if skipped:
-        print(f"[清空Mesh] 已跳过 {skipped} 个文件。")
-    return cleared
-
-
-def replace_with_empty_mesh(target_root: Path, empty_mesh_file: Path, include_all_files: bool = False) -> int:
-    if not target_root.is_dir():
-        raise FileNotFoundError(f"目标目录不存在: {target_root}")
-    if not empty_mesh_file.is_file():
-        raise FileNotFoundError(f"空 mesh 文件不存在: {empty_mesh_file}")
-
-    template_text = read_text_fallback(empty_mesh_file)
-    if not looks_like_mesh_dump(empty_mesh_file, template_text):
-        raise ValueError(f"空 mesh 文件不像 Mesh 导出文件，已停止: {empty_mesh_file}")
-
-    replaced = 0
-    skipped = 0
-    files = list(iter_empty_mesh_targets(target_root, include_all_files))
-    print(f"[空Mesh] 待处理文件数: {len(files)}")
-    for index, target_path in enumerate(files, start=1):
-        if target_path.resolve() == empty_mesh_file.resolve():
-            continue
-        if index == 1 or index % 200 == 0 or index == len(files):
-            print(f"[空Mesh] 替换进度: {index}/{len(files)}，已替换: {replaced}，已跳过: {skipped}", flush=True)
-
-        target_text = read_text_fallback(target_path)
-        if not looks_like_mesh_dump(target_path, target_text):
-            skipped += 1
-            continue
-        original_name = extract_m_name(target_path)
-        new_text = replace_m_name_text(template_text, original_name)
-        target_path.write_text(new_text, encoding="utf-8")
-        replaced += 1
-        print(f"[REPLACE] {target_path}，m_Name={original_name}")
-
-    if skipped:
-        print(f"[空Mesh] 已跳过 {skipped} 个不像 Mesh 导出的文件。")
-    return replaced
-
-
-def run_clear_empty_mesh() -> None:
-    print()
-    print("清空成空 Mesh")
-    print("说明: 不使用模板覆盖，而是在原 Mesh JSON 中清空顶点、索引、压缩网格、子网格等数据，保留 m_Name 和原文件结构。")
-    print()
-    target_root = prompt_path("要清空的 Mesh 目录", DEFAULT_DEST_ROOT)
-
-    try:
-        cleared = clear_mesh_files(target_root)
-    except FileNotFoundError as exc:
-        print(exc)
-        return
-
-    print(f"完成，已清空 {cleared} 个 Mesh 文件。")
-
-
-def run_clear_empty_mesh_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="把指定目录下的 Mesh JSON 就地清空为空 Mesh，保留原文件结构和 m_Name。")
-    parser.add_argument("target_dir", type=Path, help="要批量清空的 Mesh 目录")
-    parser.add_argument("--all-files", action="store_true", help="允许扫描非 .json 文件；非 JSON Mesh dump 仍会跳过")
-    args = parser.parse_args(argv)
-
-    try:
-        cleared = clear_mesh_files(args.target_dir, args.all_files)
-    except FileNotFoundError as exc:
-        print(exc)
-        return 1
-
-    print(f"完成，已清空 {cleared} 个 Mesh 文件。")
-    return 0
-
-
-def run_replace_empty_mesh() -> None:
-    print()
-    print("快捷替换空 Mesh")
-    print("说明: 用一个空 mesh 文件覆盖指定目录下的所有文件；文件名不变，文件内 m_Name 使用原文件的 m_Name。")
-    print()
-    target_root = prompt_path("要替换的目录", DEFAULT_DEST_ROOT)
-    empty_mesh_file = Path(prompt_text("空 mesh 文件路径"))
-
-    try:
-        replaced = replace_with_empty_mesh(target_root, empty_mesh_file)
-    except (FileNotFoundError, ValueError) as exc:
-        print(exc)
-        return
-
-    print(f"完成，已替换 {replaced} 个文件。")
-
-
-def run_replace_empty_mesh_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="用空 mesh 文件替换指定目录下的所有文件，并保留原文件名和原 m_Name。")
-    parser.add_argument("target_dir", type=Path, help="要批量替换的目录")
-    parser.add_argument("empty_mesh_file", type=Path, help="作为模板的空 mesh 文件")
-    parser.add_argument("--all-files", action="store_true", help="允许处理非 .json 文件；默认只处理 .json 并跳过 manifest.json")
-    args = parser.parse_args(argv)
-
-    try:
-        replaced = replace_with_empty_mesh(args.target_dir, args.empty_mesh_file, args.all_files)
-    except (FileNotFoundError, ValueError) as exc:
-        print(exc)
-        return 1
-
-    print(f"完成，已替换 {replaced} 个文件。")
-    return 0
+        configured = int(load_config().max_scan_workers)
+    except Exception:
+        configured = 0
+    return max(1, min(auto_count, configured)) if configured > 0 else auto_count
 
 
 def copy_matched_json_files(source_root: Path, dest_root: Path, needle: str) -> list[Path]:
     matched: list[Path] = []
     json_files = list(iter_monobehaviour_json_files(source_root))
     print(f"[查找] 仅扫描 MonoBehaviour JSON，文件数: {len(json_files)}")
-    for index, json_path in enumerate(json_files, start=1):
-        if index == 1 or index % 500 == 0 or index == len(json_files):
-            try:
-                display_path = json_path.relative_to(source_root)
-            except ValueError:
-                display_path = json_path
-            print(f"[查找] 扫描进度: {index}/{len(json_files)}，当前命中: {len(matched)}，当前文件: {display_path}", flush=True)
-        if not file_contains_text(json_path, needle):
-            continue
-        relative_path = json_path.relative_to(source_root)
-        target_path = dest_root / relative_path
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(json_path, target_path)
-        matched.append(target_path)
-        print(f"[MATCH] {json_path} -> {target_path}")
+    worker_count = _search_worker_count(len(json_files))
+    print(f"[查找] 并发搜索线程数: {worker_count}")
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        results = executor.map(lambda path: file_contains_text(path, needle), json_files)
+        for index, (json_path, contains) in enumerate(zip(json_files, results), start=1):
+            if index == 1 or index % 500 == 0 or index == len(json_files):
+                try:
+                    display_path = json_path.relative_to(source_root)
+                except ValueError:
+                    display_path = json_path
+                print(f"[查找] 扫描进度: {index}/{len(json_files)}，当前命中: {len(matched)}，当前文件: {display_path}", flush=True)
+            if not contains:
+                continue
+            relative_path = json_path.relative_to(source_root)
+            target_path = dest_root / relative_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(json_path, target_path)
+            matched.append(target_path)
+            print(f"[MATCH] {json_path} -> {target_path}")
     return matched
 
 
@@ -631,6 +347,1311 @@ def run_restore_edited_images_to_import() -> None:
     print(f"完成，已恢复 {restored} 个图片到: {to_import_root}")
 
 
+def _manifest_value(data: dict, *names: str, default=None):
+    for name in names:
+        if name in data:
+            return data[name]
+    return default
+
+
+def _pptr(value: object) -> tuple[int, int]:
+    if not isinstance(value, dict):
+        return (0, 0)
+    return (
+        int(_manifest_value(value, "m_FileID", "FileID", default=0) or 0),
+        int(_manifest_value(value, "m_PathID", "PathID", default=0) or 0),
+    )
+
+
+def _load_object_graph() -> tuple[dict, dict]:
+    scopes: dict[tuple[str, str], dict] = {}
+    texture_by_relative_path: dict[str, tuple[tuple[str, str], int]] = {}
+    manifests = list(DEFAULT_SOURCE_ROOT.rglob("manifest.json"))
+    print(f"[对象索引] 读取 manifest: {len(manifests)} 个", flush=True)
+
+    for manifest_index, manifest_path in enumerate(manifests, start=1):
+        manifest = _safe_read_json(manifest_path)
+        if not isinstance(manifest, dict):
+            continue
+        items = _manifest_value(manifest, "Items", "items", default=[])
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            type_name = str(_manifest_value(item, "TypeName", "typeName", default=""))
+            if type_name not in {
+                "Texture2D", "Sprite", "GameObject", "Transform",
+                "RectTransform", "SpriteRenderer", "MonoBehaviour",
+                "Mesh", "MeshFilter", "SkinnedMeshRenderer",
+            }:
+                continue
+            relative_path = str(_manifest_value(item, "RelativePath", "relativePath", default=""))
+            path_id = int(_manifest_value(item, "PathId", "PathID", "pathId", default=0) or 0)
+            bundle_entry = str(_manifest_value(item, "BundleEntryName", "bundleEntryName", default=""))
+            scope_key = (str(manifest_path), bundle_entry)
+            scope = scopes.setdefault(
+                scope_key,
+                {
+                    "manifest": manifest_path,
+                    "source": str(_manifest_value(manifest, "SourceRelativePath", default="")),
+                    "bundle_entry": bundle_entry,
+                    "items": {},
+                },
+            )
+            json_path = manifest_path.parent / Path(relative_path)
+            scope["items"][(type_name, path_id)] = {
+                "item": item,
+                "path": json_path,
+                "data": None,
+            }
+            if type_name == "Texture2D":
+                try:
+                    input_relative_path = json_path.relative_to(DEFAULT_SOURCE_ROOT).as_posix().lower()
+                except ValueError:
+                    input_relative_path = relative_path.replace("\\", "/").lower()
+                texture_by_relative_path[input_relative_path] = (scope_key, path_id)
+        if manifest_index == 1 or manifest_index % 100 == 0 or manifest_index == len(manifests):
+            print(f"[对象索引] manifest 进度: {manifest_index}/{len(manifests)}", flush=True)
+    return scopes, texture_by_relative_path
+
+
+def _entry_data(entry: dict) -> dict | None:
+    if entry["data"] is None:
+        entry["data"] = _safe_read_json(entry["path"])
+    return entry["data"] if isinstance(entry["data"], dict) else None
+
+
+def _scope_entry(scope: dict, type_names: tuple[str, ...], path_id: int) -> dict | None:
+    for type_name in type_names:
+        entry = scope["items"].get((type_name, path_id))
+        if entry:
+            return entry
+    return None
+
+
+def _sprite_texture_path_id(sprite_data: dict) -> int:
+    render_data = sprite_data.get("m_RD")
+    if not isinstance(render_data, dict):
+        render_data = sprite_data.get("m_RenderData")
+    if not isinstance(render_data, dict):
+        return 0
+    return _pptr(render_data.get("texture"))[1] or _pptr(render_data.get("m_Texture"))[1]
+
+
+def _sprite_render_data(sprite_data: dict) -> dict:
+    value = sprite_data.get("m_RD")
+    if not isinstance(value, dict):
+        value = sprite_data.get("m_RenderData")
+    return value if isinstance(value, dict) else {}
+
+
+def _number(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def run_split_sprite_atlases() -> None:
+    try:
+        from PIL import Image
+    except ImportError:
+        print("[图集拆分][错误] 当前 Python 环境缺少 Pillow。")
+        return
+
+    print()
+    print("拆分 Sprite 图集")
+    print("说明: 按 Sprite 的 textureRect 从对应 Texture2D 中裁出独立 PNG。")
+    scopes, _ = _load_object_graph()
+    if DEFAULT_ALL_SPRITE_ROOT.exists():
+        shutil.rmtree(DEFAULT_ALL_SPRITE_ROOT)
+    png_root = DEFAULT_ALL_SPRITE_ROOT / "PNG"
+    png_root.mkdir(parents=True, exist_ok=True)
+    mapping: list[dict] = []
+    atlas_texture_paths: set[str] = set()
+    skipped = 0
+
+    for scope_key, scope in scopes.items():
+        for (type_name, sprite_path_id), sprite_entry in scope["items"].items():
+            if type_name != "Sprite":
+                continue
+            sprite_data = _entry_data(sprite_entry)
+            if not sprite_data:
+                skipped += 1
+                continue
+            render_data = _sprite_render_data(sprite_data)
+            file_id, texture_path_id = _pptr(render_data.get("texture") or render_data.get("m_Texture"))
+            if file_id != 0 or not texture_path_id:
+                skipped += 1
+                continue
+            texture_entry = _scope_entry(scope, ("Texture2D",), texture_path_id)
+            texture_path = texture_entry["path"] if texture_entry else None
+            rect = render_data.get("textureRect") or render_data.get("m_TextureRect")
+            if not texture_path or not texture_path.is_file() or not isinstance(rect, dict):
+                skipped += 1
+                continue
+            x = round(_number(rect.get("x")))
+            y = round(_number(rect.get("y")))
+            width = round(_number(rect.get("width")))
+            height = round(_number(rect.get("height")))
+            if width <= 0 or height <= 0:
+                skipped += 1
+                continue
+            try:
+                with Image.open(texture_path) as atlas:
+                    top = atlas.height - y - height
+                    cropped = atlas.crop((x, top, x + width, top + height))
+                    settings_raw = int(render_data.get("settingsRaw", 0) or 0)
+                    rotation = (settings_raw >> 2) & 0xF
+                    if rotation == 1:
+                        cropped = cropped.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+                    elif rotation == 2:
+                        cropped = cropped.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+                    elif rotation == 3:
+                        cropped = cropped.transpose(Image.Transpose.ROTATE_180)
+                    elif rotation == 4:
+                        cropped = cropped.transpose(Image.Transpose.ROTATE_90)
+                    asset_name = str(
+                        _manifest_value(sprite_entry["item"], "AssetName", "assetName", default="")
+                        or f"Sprite_{sprite_path_id}"
+                    )
+                    safe_asset_name = re.sub(r'[<>:"/\\|?*]', "_", asset_name)
+                    target = make_flat_unique_path(
+                        png_root,
+                        f"{safe_asset_name}_{sprite_path_id}.png",
+                    )
+                    cropped.save(target, "PNG")
+            except Exception as exc:
+                skipped += 1
+                print(f"[图集拆分][跳过] Sprite PathID={sprite_path_id}: {exc}")
+                continue
+            try:
+                atlas_texture_paths.add(
+                    texture_path.relative_to(DEFAULT_SOURCE_ROOT).as_posix().lower()
+                )
+            except ValueError:
+                pass
+            mapping.append(
+                {
+                    "item_type": "sprite",
+                    "flat_name": target.name,
+                    "sprite_name": asset_name,
+                    "sprite_path_id": sprite_path_id,
+                    "texture_path_id": texture_path_id,
+                    "source_resource": scope["source"],
+                    "bundle_entry": scope["bundle_entry"],
+                    "sprite_json": str(sprite_entry["path"]),
+                    "texture_png": str(texture_path),
+                    "rect": {"x": x, "y": y, "width": width, "height": height},
+                    "packing_rotation": rotation,
+                }
+            )
+            if len(mapping) == 1 or len(mapping) % 200 == 0:
+                print(f"[图集拆分] 已输出: {len(mapping)}，跳过: {skipped}", flush=True)
+
+    copied_regular = 0
+    try:
+        allpng_items = load_allpng_map(DEFAULT_ALL_IMAGE_MAP)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        allpng_items = []
+    for item in allpng_items:
+        original_relative = str(item.get("original_relative_path", "")).replace("\\", "/")
+        if original_relative.lower() in atlas_texture_paths:
+            continue
+        flat_name = str(item.get("flat_name", ""))
+        source_path = DEFAULT_ALL_IMAGE_PNG_ROOT / flat_name
+        if not flat_name or not source_path.is_file():
+            continue
+        target = make_flat_unique_path(png_root, flat_name)
+        shutil.copy2(source_path, target)
+        mapping.append(
+            {
+                **item,
+                "item_type": "texture",
+                "flat_name": target.name,
+            }
+        )
+        copied_regular += 1
+
+    DEFAULT_ALL_SPRITE_MAP.write_text(
+        json.dumps({"items": mapping}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    sprite_count = sum(1 for item in mapping if item.get("item_type") == "sprite")
+    print(
+        f"[图集拆分][完成] 拆分 Sprite={sprite_count}，"
+        f"普通图片={copied_regular}，跳过={skipped}"
+    )
+    print(f"[图集拆分] 输出目录: {png_root}")
+    print(f"[图集拆分] 映射文件: {DEFAULT_ALL_SPRITE_MAP}")
+
+
+def _game_object_name(scope: dict, path_id: int) -> str:
+    entry = _scope_entry(scope, ("GameObject",), path_id)
+    data = _entry_data(entry) if entry else None
+    if not data:
+        return f"<GameObject PathID={path_id}>"
+    return str(data.get("m_Name") or f"<GameObject PathID={path_id}>")
+
+
+def _build_transform_by_game_object(scope: dict) -> dict[int, tuple[int, dict]]:
+    transform_by_game_object: dict[int, tuple[int, dict]] = {}
+    for (type_name, path_id), entry in scope["items"].items():
+        if type_name not in {"Transform", "RectTransform"}:
+            continue
+        data = _entry_data(entry)
+        if not data:
+            continue
+        _, object_id = _pptr(data.get("m_GameObject"))
+        if object_id:
+            transform_by_game_object[object_id] = (path_id, data)
+    return transform_by_game_object
+
+
+def _game_object_component_path_ids(game_object_data: dict) -> list[int]:
+    components = game_object_data.get("m_Component")
+    if isinstance(components, dict):
+        components = components.get("Array")
+    if not isinstance(components, list):
+        return []
+    result: list[int] = []
+    for item in components:
+        if not isinstance(item, dict):
+            continue
+        pointer = item.get("component") or item.get("m_Component") or item
+        file_id, path_id = _pptr(pointer)
+        if file_id == 0 and path_id:
+            result.append(path_id)
+    return result
+
+
+def _find_game_object_transform(scope: dict, game_object_path_id: int) -> dict | None:
+    object_entry = _scope_entry(scope, ("GameObject",), game_object_path_id)
+    object_data = _entry_data(object_entry) if object_entry else None
+    if not object_data:
+        return None
+    for component_path_id in _game_object_component_path_ids(object_data):
+        transform_entry = _scope_entry(
+            scope,
+            ("Transform", "RectTransform"),
+            component_path_id,
+        )
+        if transform_entry:
+            return _entry_data(transform_entry)
+    return None
+
+
+def _object_chain(
+    scope: dict,
+    game_object_path_id: int,
+    max_parent_count: int = 8,
+    transform_by_game_object: dict[int, tuple[int, dict]] | None = None,
+) -> list[dict]:
+    if transform_by_game_object is None:
+        transform_by_game_object = _build_transform_by_game_object(scope)
+    chain: list[dict] = []
+    current_object = game_object_path_id
+    visited: set[int] = set()
+    while current_object and current_object not in visited and len(chain) <= max_parent_count:
+        visited.add(current_object)
+        object_entry = _scope_entry(scope, ("GameObject",), current_object)
+        chain.append(
+            {
+                "path_id": current_object,
+                "name": _game_object_name(scope, current_object),
+                "source_json": str(object_entry["path"]) if object_entry else "",
+            }
+        )
+        transform = transform_by_game_object.get(current_object)
+        if not transform:
+            break
+        _, parent_transform_id = _pptr(transform[1].get("m_Father"))
+        if not parent_transform_id:
+            break
+        parent_entry = _scope_entry(scope, ("Transform", "RectTransform"), parent_transform_id)
+        parent_data = _entry_data(parent_entry) if parent_entry else None
+        if not parent_data:
+            break
+        _, current_object = _pptr(parent_data.get("m_GameObject"))
+    return chain
+
+
+def _object_chain_direct(
+    scope: dict,
+    game_object_path_id: int,
+    max_parent_count: int = 8,
+) -> list[dict]:
+    chain: list[dict] = []
+    current_object = game_object_path_id
+    visited: set[int] = set()
+    while current_object and current_object not in visited and len(chain) <= max_parent_count:
+        visited.add(current_object)
+        object_entry = _scope_entry(scope, ("GameObject",), current_object)
+        chain.append(
+            {
+                "path_id": current_object,
+                "name": _game_object_name(scope, current_object),
+                "source_json": str(object_entry["path"]) if object_entry else "",
+            }
+        )
+        transform_data = _find_game_object_transform(scope, current_object)
+        if not transform_data:
+            break
+        file_id, parent_transform_id = _pptr(transform_data.get("m_Father"))
+        if file_id != 0 or not parent_transform_id:
+            break
+        parent_entry = _scope_entry(scope, ("Transform", "RectTransform"), parent_transform_id)
+        parent_data = _entry_data(parent_entry) if parent_entry else None
+        if not parent_data:
+            break
+        parent_file_id, current_object = _pptr(parent_data.get("m_GameObject"))
+        if parent_file_id != 0:
+            break
+    return chain
+
+
+def _selected_allpng_items() -> list[dict]:
+    items = load_allpng_map(DEFAULT_ALL_IMAGE_MAP)
+    available = {
+        str(item.get("flat_name", "")).lower(): {**item, "_selection_kind": "texture"}
+        for item in items
+    }
+    sprite_map = _safe_read_json(DEFAULT_ALL_SPRITE_MAP)
+    if isinstance(sprite_map, dict) and isinstance(sprite_map.get("items"), list):
+        for item in sprite_map["items"]:
+            if isinstance(item, dict):
+                available[str(item.get("flat_name", "")).lower()] = {
+                    **item,
+                    "_selection_kind": str(item.get("item_type", "sprite")),
+                }
+    selected_names: list[str]
+    if DEFAULT_BLOCK_IMAGE_ROOT.is_dir():
+        selected_names = [path.name for path in DEFAULT_BLOCK_IMAGE_ROOT.iterdir() if path.is_file()]
+        if selected_names:
+            print(f"[屏蔽对象] 从 {DEFAULT_BLOCK_IMAGE_ROOT} 读取指定图片: {len(selected_names)} 个")
+        else:
+            selected_names = []
+    else:
+        selected_names = []
+    if not selected_names:
+        raw = prompt_input("请输入 AllPNG 图片名称，多个名称用逗号分隔: ").strip()
+        selected_names = [name.strip() for name in re.split(r"[,，]", raw) if name.strip()]
+    missing = [name for name in selected_names if name.lower() not in available]
+    for name in missing:
+        print(f"[屏蔽对象][未找到] {name}")
+    return [available[name.lower()] for name in selected_names if name.lower() in available]
+
+
+def _object_manifest_snapshot() -> dict:
+    digest = hashlib.sha256()
+    count = 0
+    total_size = 0
+    latest_mtime_ns = 0
+    for path in sorted(DEFAULT_SOURCE_ROOT.rglob("manifest.json")):
+        try:
+            stat = path.stat()
+            relative = path.relative_to(DEFAULT_SOURCE_ROOT).as_posix()
+        except (OSError, ValueError):
+            continue
+        count += 1
+        total_size += stat.st_size
+        latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+        digest.update(relative.encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update(b"\n")
+    return {
+        "manifest_count": count,
+        "manifest_total_size": total_size,
+        "latest_mtime_ns": latest_mtime_ns,
+        "fingerprint": digest.hexdigest(),
+    }
+
+
+def _entry_contains_any_path_id(entry: dict, path_ids: set[int]) -> bool:
+    try:
+        text = entry["path"].read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        return False
+    return any(
+        f'"m_PathID": {path_id}' in text or f'"m_PathID":{path_id}' in text
+        for path_id in path_ids
+    )
+
+
+def _prefilter_reference_entries(
+    scope: dict,
+    type_names: set[str],
+    path_ids: set[int],
+) -> list[tuple[str, int, dict]]:
+    if not path_ids:
+        return []
+    entries = [
+        (type_name, path_id, entry)
+        for (type_name, path_id), entry in scope["items"].items()
+        if type_name in type_names
+    ]
+    if not entries:
+        return []
+    entry_by_path = {
+        str(entry["path"].resolve()).lower(): (type_name, path_id, entry)
+        for type_name, path_id, entry in entries
+    }
+    search_dirs = sorted({str(entry["path"].parent) for _, _, entry in entries})
+    matched_paths: set[str] = set()
+    try:
+        path_id_list = sorted(path_ids)
+        for start in range(0, len(path_id_list), 100):
+            command = ["rg", "-l", "-F", "--glob", "*.json"]
+            for path_id in path_id_list[start:start + 100]:
+                command.extend(["-e", f'"m_PathID": {path_id}'])
+                command.extend(["-e", f'"m_PathID":{path_id}'])
+            command.extend(search_dirs)
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if result.returncode not in {0, 1}:
+                raise RuntimeError(result.stderr.strip() or f"rg 返回码 {result.returncode}")
+            matched_paths.update(
+                str(Path(line.strip()).resolve()).lower()
+                for line in result.stdout.splitlines()
+                if line.strip()
+            )
+        return [
+            entry_by_path[path]
+            for path in sorted(matched_paths)
+            if path in entry_by_path
+        ]
+    except (FileNotFoundError, OSError, RuntimeError):
+        pass
+
+    worker_count = _search_worker_count(len(entries))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        flags = executor.map(
+            lambda item: _entry_contains_any_path_id(item[2], path_ids),
+            entries,
+        )
+        return [item for item, matched in zip(entries, flags) if matched]
+
+
+def _find_image_object_matches(
+    scopes: dict,
+    texture_targets: set[tuple[tuple[str, str], int]],
+    sprite_targets: set[tuple[tuple[str, str], int]],
+) -> list[dict]:
+    matches: list[dict] = []
+    total_scopes = len(scopes)
+    for scope_index, (scope_key, scope) in enumerate(scopes.items(), start=1):
+        target_texture_ids = {path_id for key, path_id in texture_targets if key == scope_key}
+        target_sprite_ids = {path_id for key, path_id in sprite_targets if key == scope_key}
+        if not target_texture_ids and not target_sprite_ids:
+            continue
+        print(
+            f"[对象索引] 关系分析: {scope_index}/{total_scopes} "
+            f"{scope['source']} {scope['bundle_entry']}",
+            flush=True,
+        )
+        sprite_ids: set[int] = set(target_sprite_ids)
+        sprite_candidates = _prefilter_reference_entries(
+            scope,
+            {"Sprite"},
+            target_texture_ids,
+        )
+        print(
+            f"[对象索引] Sprite 预筛选: "
+            f"{sum(1 for type_name, _ in scope['items'] if type_name == 'Sprite')}"
+            f" -> {len(sprite_candidates)}",
+            flush=True,
+        )
+        for _type_name, path_id, entry in sprite_candidates:
+            data = _entry_data(entry)
+            if data and _sprite_texture_path_id(data) in target_texture_ids:
+                sprite_ids.add(path_id)
+        if not sprite_ids:
+            continue
+        chain_cache: dict[int, list[dict]] = {}
+        component_candidates = _prefilter_reference_entries(
+            scope,
+            {"MonoBehaviour", "SpriteRenderer"},
+            sprite_ids,
+        )
+        checked_components = len(component_candidates)
+        print(
+            f"[对象索引] 组件预筛选: "
+            f"{sum(1 for type_name, _ in scope['items'] if type_name in {'MonoBehaviour', 'SpriteRenderer'})}"
+            f" -> {checked_components}",
+            flush=True,
+        )
+        for type_name, component_id, entry in component_candidates:
+            data = _entry_data(entry)
+            if not data:
+                continue
+            _, sprite_id = _pptr(data.get("m_Sprite"))
+            _, game_object_id = _pptr(data.get("m_GameObject"))
+            if sprite_id not in sprite_ids or not game_object_id:
+                continue
+            sprite_entry = _scope_entry(scope, ("Sprite",), sprite_id)
+            sprite_data = _entry_data(sprite_entry) if sprite_entry else None
+            chain = chain_cache.get(game_object_id)
+            if chain is None:
+                chain = _object_chain_direct(scope, game_object_id)
+                chain_cache[game_object_id] = chain
+            matches.append(
+                {
+                    "scope_key": scope_key,
+                    "scope": scope,
+                    "source": scope["source"],
+                    "bundle_entry": scope["bundle_entry"],
+                    "component_type": type_name,
+                    "component_path_id": component_id,
+                    "sprite_path_id": sprite_id,
+                    "texture_path_id": _sprite_texture_path_id(sprite_data or {}),
+                    "chain": chain,
+                }
+            )
+        print(
+            f"[对象索引] 关系完成: Sprite={len(sprite_ids)}，"
+            f"组件={checked_components}，累计引用={len(matches)}",
+            flush=True,
+        )
+    return matches
+
+
+def _find_mesh_object_matches(
+    scopes: dict,
+    mesh_targets: set[tuple[tuple[str, str], int]],
+) -> list[dict]:
+    matches: list[dict] = []
+    total_scopes = len(scopes)
+    for scope_index, (scope_key, scope) in enumerate(scopes.items(), start=1):
+        mesh_ids = {
+            path_id for key, path_id in mesh_targets if key == scope_key
+        }
+        if not mesh_ids:
+            continue
+        print(
+            f"[Mesh索引] 关系分析: {scope_index}/{total_scopes} "
+            f"{scope['source']} {scope['bundle_entry']}",
+            flush=True,
+        )
+        candidates = _prefilter_reference_entries(
+            scope,
+            {"MeshFilter", "SkinnedMeshRenderer"},
+            mesh_ids,
+        )
+        print(
+            f"[Mesh索引] 组件预筛选: "
+            f"{sum(1 for type_name, _ in scope['items'] if type_name in {'MeshFilter', 'SkinnedMeshRenderer'})}"
+            f" -> {len(candidates)}",
+            flush=True,
+        )
+        chain_cache: dict[int, list[dict]] = {}
+        for type_name, component_id, entry in candidates:
+            data = _entry_data(entry)
+            if not data:
+                continue
+            file_id, mesh_id = _pptr(data.get("m_Mesh"))
+            _, game_object_id = _pptr(data.get("m_GameObject"))
+            if file_id != 0 or mesh_id not in mesh_ids or not game_object_id:
+                continue
+            chain = chain_cache.get(game_object_id)
+            if chain is None:
+                chain = _object_chain_direct(scope, game_object_id)
+                chain_cache[game_object_id] = chain
+            if not chain:
+                continue
+            matches.append(
+                {
+                    "scope_key": scope_key,
+                    "scope": scope,
+                    "component_type": type_name,
+                    "component_path_id": component_id,
+                    "mesh_path_id": mesh_id,
+                    "chain": chain,
+                }
+            )
+        print(
+            f"[Mesh索引] 关系完成: Mesh={len(mesh_ids)}，"
+            f"组件={len(candidates)}，累计引用={len(matches)}",
+            flush=True,
+        )
+    return matches
+
+
+def _selected_mesh_queries(scopes: dict) -> list[tuple[str, set[tuple[tuple[str, str], int]]]]:
+    available: dict[str, list[tuple[str, tuple[str, str], int]]] = {}
+    for scope_key, scope in scopes.items():
+        for (type_name, path_id), entry in scope["items"].items():
+            if type_name != "Mesh":
+                continue
+            asset_name = str(
+                _manifest_value(
+                    entry["item"],
+                    "AssetName",
+                    "assetName",
+                    default="",
+                )
+                or entry["path"].stem
+            )
+            aliases = {
+                asset_name.lower(),
+                entry["path"].name.lower(),
+                entry["path"].stem.lower(),
+                re.sub(r"_[-]?\d+$", "", entry["path"].stem).lower(),
+            }
+            for alias in aliases:
+                if alias:
+                    available.setdefault(alias, []).append(
+                        (asset_name, scope_key, path_id)
+                    )
+    if not available:
+        print(
+            "[Mesh屏蔽][错误] workspace/input 中没有 Mesh 导出数据。"
+            "请在一键导出中选择第 3 类。"
+        )
+        return []
+
+    raw = prompt_input("请输入 Mesh 名称，多个名称用逗号分隔: ").strip()
+    names = [
+        value.strip()
+        for value in re.split(r"[,，]", raw)
+        if value.strip()
+    ]
+    queries: list[tuple[str, set[tuple[tuple[str, str], int]]]] = []
+    for name in names:
+        rows = available.get(name.lower(), [])
+        if not rows:
+            print(f"[Mesh屏蔽][未找到] {name}")
+            continue
+        targets = {(scope_key, path_id) for _asset_name, scope_key, path_id in rows}
+        queries.append((name, targets))
+    return queries
+
+
+def _catalog_image_locations(item: dict) -> list[dict]:
+    catalog = _safe_read_json(DEFAULT_CATALOG_OUTPUT)
+    if not isinstance(catalog, dict):
+        return []
+    locations = catalog.get("Locations")
+    if not isinstance(locations, list):
+        locations = catalog.get("locations")
+    if not isinstance(locations, list):
+        entry_data = catalog.get("m_EntryDataString")
+        if isinstance(entry_data, dict):
+            locations = entry_data.get("locations")
+    if not isinstance(locations, list):
+        return []
+
+    def normalized_name(value: object) -> str:
+        stem = Path(str(value).replace("\\", "/")).stem.lower()
+        return re.sub(r"_[-]?\d+$", "", stem)
+
+    names = {
+        normalized_name(item.get("original_name", "")),
+        normalized_name(item.get("sprite_name", "")),
+        normalized_name(item.get("original_relative_path", "")),
+    }
+    names.discard("")
+    result: list[dict] = []
+    for location in locations:
+        if not isinstance(location, dict):
+            continue
+        internal_id = str(location.get("InternalId", ""))
+        internal_name = normalized_name(internal_id)
+        if internal_name not in names:
+            continue
+        result.append(
+            {
+                "internal_id": internal_id,
+                "primary_key": str(location.get("PrimaryKey", "")),
+                "resource_type": location.get("ResourceType"),
+            }
+        )
+    return result
+
+
+def _find_addressable_config_matches(
+    scopes: dict,
+    item: dict,
+    locations: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    exact_needles: set[str] = set()
+    for location in locations:
+        exact_needles.add(str(location.get("internal_id", "")))
+        exact_needles.add(str(location.get("primary_key", "")))
+    needles = {value for value in exact_needles if value}
+    if not needles:
+        needles = {
+            str(item.get("sprite_name", "")),
+            re.sub(
+                r"_[-]?\d+$",
+                "",
+                Path(str(item.get("original_relative_path", ""))).stem,
+            ),
+        }
+        needles.discard("")
+    if not needles:
+        return [], []
+
+    config_hits: list[dict] = []
+    object_matches: list[dict] = []
+    candidates = [
+        (scope_key, scope, type_name, path_id, entry)
+        for scope_key, scope in scopes.items()
+        for (type_name, path_id), entry in scope["items"].items()
+        if type_name == "MonoBehaviour"
+    ]
+    if not candidates:
+        return [], []
+    candidate_by_path = {
+        str(entry["path"].resolve()).lower(): (
+            scope_key, scope, type_name, path_id, entry
+        )
+        for scope_key, scope, type_name, path_id, entry in candidates
+    }
+    matched_entries: dict[str, tuple] = {}
+    def contains_addressable(entry: tuple) -> str | None:
+        path = entry[4]["path"]
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            return None
+        if any(needle in text for needle in needles):
+            return str(path.resolve()).lower()
+        return None
+
+    worker_count = _search_worker_count(len(candidates))
+    print(
+        f"[对象索引] Addressables 配置预筛选: "
+        f"MonoBehaviour={len(candidates)}，线程={worker_count}",
+        flush=True,
+    )
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        for resolved in executor.map(contains_addressable, candidates):
+            if resolved and resolved in candidate_by_path:
+                matched_entries[resolved] = candidate_by_path[resolved]
+
+    for (
+        scope_key,
+        scope,
+        type_name,
+        component_id,
+        entry,
+    ) in matched_entries.values():
+        data = _entry_data(entry)
+        if not data:
+            continue
+        hit = {
+            "source": scope["source"],
+            "bundle_entry": scope["bundle_entry"],
+            "component_type": type_name,
+            "component_path_id": component_id,
+            "json_path": str(entry["path"]),
+        }
+        config_hits.append(hit)
+        file_id, game_object_id = _pptr(data.get("m_GameObject"))
+        if file_id != 0 or not game_object_id:
+            continue
+        chain = _object_chain_direct(scope, game_object_id)
+        if not chain:
+            continue
+        object_matches.append(
+            {
+                **hit,
+                "scope_key": scope_key,
+                "scope": scope,
+                "sprite_path_id": int(item.get("sprite_path_id", 0) or 0),
+                "texture_path_id": int(item.get("texture_path_id", 0) or 0),
+                "chain": chain,
+                "reference_kind": "addressables_config",
+            }
+        )
+    return config_hits, object_matches
+
+
+def _serializable_object_match(match: dict) -> dict:
+    scope = match["scope"]
+    return {
+        "source": scope["source"],
+        "bundle_entry": scope["bundle_entry"],
+        "component_type": match["component_type"],
+        "component_path_id": match["component_path_id"],
+        "sprite_path_id": match["sprite_path_id"],
+        "texture_path_id": match.get("texture_path_id", 0),
+        "chain": match["chain"],
+    }
+
+
+def _image_query_cache_key(selected: list[dict]) -> str:
+    identities: list[dict] = []
+    for item in selected:
+        if item.get("_selection_kind") == "sprite":
+            identities.append(
+                {
+                    "kind": "sprite",
+                    "source": str(item.get("source_resource", "")),
+                    "bundle_entry": str(item.get("bundle_entry", "")),
+                    "sprite_path_id": int(item.get("sprite_path_id", 0) or 0),
+                }
+            )
+        else:
+            identities.append(
+                {
+                    "kind": "texture",
+                    "relative_path": str(item.get("original_relative_path", ""))
+                    .replace("\\", "/")
+                    .lower(),
+                }
+            )
+    identities.sort(key=lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True))
+    payload = json.dumps(identities, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_incremental_image_index(snapshot: dict) -> dict:
+    cached = _safe_read_json(DEFAULT_IMAGE_OBJECT_INDEX)
+    if (
+        isinstance(cached, dict)
+        and cached.get("version") == 5
+        and cached.get("manifest_snapshot") == snapshot
+        and isinstance(cached.get("queries"), dict)
+    ):
+        return cached
+    if DEFAULT_IMAGE_OBJECT_INDEX.is_file():
+        print("[对象索引] 导出 manifest 已变化或缓存格式已升级，清空旧索引。")
+    return {
+        "version": 5,
+        "manifest_snapshot": snapshot,
+        "queries": {},
+    }
+
+
+def _write_incremental_image_index(index_data: dict) -> None:
+    DEFAULT_IMAGE_OBJECT_INDEX.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_IMAGE_OBJECT_INDEX.write_text(
+        json.dumps(index_data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _print_object_match(index: int, match: dict) -> None:
+    scope = match.get("scope")
+    source = match.get("source") or (scope["source"] if scope else "")
+    bundle_entry = match.get("bundle_entry") or (scope["bundle_entry"] if scope else "")
+    print()
+    print(f"[{index}] 来源文件: {source}")
+    if bundle_entry:
+        print(f"    Bundle entry: {bundle_entry}")
+    print(f"    组件: {match['component_type']} (PathID={match['component_path_id']})")
+    print("    层级（0 是图片所在对象，数字越大层级越高）:")
+    for level, node in enumerate(match["chain"]):
+        print(f"      {level}. {node['name']} (PathID={node['path_id']})")
+
+
+def _load_block_records() -> dict:
+    data = _safe_read_json(DEFAULT_BLOCK_RECORD)
+    if not isinstance(data, dict):
+        return {"items": []}
+    if not isinstance(data.get("items"), list):
+        data["items"] = []
+    return data
+
+
+def _write_block_records(records: dict) -> None:
+    DEFAULT_BLOCK_RECORD.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_BLOCK_RECORD.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _block_game_object(match: dict, level: int) -> bool:
+    if level < 0 or level >= len(match["chain"]):
+        print("[屏蔽对象][错误] 层级编号无效。")
+        return False
+    node = match["chain"][level]
+    source_path = Path(str(node.get("source_json", "")))
+    data = _safe_read_json(source_path)
+    if not data:
+        print("[屏蔽对象][错误] 没有找到对应 GameObject JSON。")
+        return False
+    try:
+        relative = source_path.relative_to(DEFAULT_SOURCE_ROOT)
+    except ValueError:
+        print("[屏蔽对象][错误] GameObject JSON 不在 workspace/input 中。")
+        return False
+    target = DEFAULT_OBJECT_TO_IMPORT_ROOT / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    original_active = int(data.get("m_IsActive", 1))
+    patched = dict(data)
+    patched["m_IsActive"] = 0
+    target.write_text(json.dumps(patched, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    records = _load_block_records()
+    record_key = f"{source_path}|{node['path_id']}"
+    for old_item in records["items"]:
+        if not isinstance(old_item, dict) or old_item.get("record_key") != record_key:
+            continue
+        old_replacement = Path(str(old_item.get("replacement_json", "")))
+        if old_replacement != target and old_replacement.is_file():
+            old_replacement.unlink()
+            print(f"[屏蔽对象] 已清理旧待导入文件: {old_replacement}")
+    records["items"] = [
+        item for item in records["items"]
+        if not isinstance(item, dict) or item.get("record_key") != record_key
+    ]
+    records["items"].append(
+        {
+            "record_key": record_key,
+            "source_json": str(source_path),
+            "replacement_json": str(target),
+            "source_resource": match.get("source", ""),
+            "bundle_entry": match.get("bundle_entry", ""),
+            "game_object_name": node["name"],
+            "game_object_path_id": node["path_id"],
+            "original_m_IsActive": original_active,
+            "blocked_m_IsActive": 0,
+        }
+    )
+    _write_block_records(records)
+    print(f"[屏蔽对象][完成] {node['name']} (PathID={node['path_id']})")
+    print(f"[屏蔽对象] 待导入 JSON: {target}")
+    return True
+
+
+def run_block_objects_by_image() -> None:
+    print()
+    print("按图片定位并屏蔽 GameObject")
+    print("说明: 图片可放入 AllPNG/BlockImages，也可直接输入 AllPNG 文件名。")
+    print("      每个匹配项按 0-8 显示对象父链，可选择屏蔽链上的任意对象。")
+    selected = _selected_allpng_items()
+    if not selected:
+        print("[屏蔽对象] 没有有效图片。")
+        return
+    snapshot = _object_manifest_snapshot()
+    index_data = _load_incremental_image_index(snapshot)
+    queries = index_data["queries"]
+    scopes = None
+    textures = None
+
+    for image_index, item in enumerate(selected, start=1):
+        image_name = str(item.get("flat_name", ""))
+        print()
+        print(
+            f"\033[94m[屏蔽对象] 图片 {image_index}/{len(selected)}: "
+            f"{image_name}\033[0m"
+        )
+        query_key = _image_query_cache_key([item])
+        cached_query = queries.get(query_key)
+        if isinstance(cached_query, dict):
+            matches = [
+                match for match in cached_query.get("matches", [])
+                if isinstance(match, dict)
+            ]
+            addressable_locations = [
+                value for value in cached_query.get("addressable_locations", [])
+                if isinstance(value, dict)
+            ]
+            addressable_configs = [
+                value for value in cached_query.get("addressable_configs", [])
+                if isinstance(value, dict)
+            ]
+            print(
+                f"[对象索引] 命中图片缓存: {image_name}，"
+                f"对象引用={len(matches)}"
+            )
+        else:
+            if scopes is None or textures is None:
+                scopes, textures = _load_object_graph()
+            texture_targets: set[tuple[tuple[str, str], int]] = set()
+            sprite_targets: set[tuple[tuple[str, str], int]] = set()
+            if item.get("_selection_kind") == "sprite":
+                source_resource = str(item.get("source_resource", ""))
+                bundle_entry = str(item.get("bundle_entry", ""))
+                scope_key = next(
+                    (
+                        key
+                        for key, scope in scopes.items()
+                        if scope["source"] == source_resource
+                        and scope["bundle_entry"] == bundle_entry
+                    ),
+                    None,
+                )
+                if scope_key is not None:
+                    sprite_targets.add(
+                        (scope_key, int(item.get("sprite_path_id", 0) or 0))
+                    )
+            else:
+                relative = (
+                    str(item.get("original_relative_path", ""))
+                    .replace("\\", "/")
+                    .lower()
+                )
+                target = textures.get(relative)
+                if target:
+                    texture_targets.add(target)
+                else:
+                    print(f"[屏蔽对象][未索引] {image_name}: {relative}")
+            matches = [
+                _serializable_object_match(match)
+                for match in _find_image_object_matches(
+                    scopes,
+                    texture_targets,
+                    sprite_targets,
+                )
+            ]
+            addressable_locations: list[dict] = []
+            addressable_configs: list[dict] = []
+            direct_match_count = len(matches)
+            addressable_locations = _catalog_image_locations(item)
+            if addressable_locations:
+                print(
+                    f"[对象索引] 继续反查 Addressables: "
+                    f"位置={len(addressable_locations)}",
+                    flush=True,
+                )
+                addressable_configs, addressable_matches = _find_addressable_config_matches(
+                    scopes,
+                    item,
+                    addressable_locations,
+                )
+                matches.extend(
+                    _serializable_object_match(match)
+                    for match in addressable_matches
+                )
+                print(
+                    f"[对象索引] 双链路完成: 直接组件={direct_match_count}，"
+                    f"Addressables配置={len(addressable_configs)}，"
+                    f"Addressables对象={len(addressable_matches)}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[对象索引] 双链路完成: 直接组件={direct_match_count}，"
+                    "Addressables位置=0",
+                    flush=True,
+                )
+            queries[query_key] = {
+                "matches": matches,
+                "addressable_locations": addressable_locations,
+                "addressable_configs": addressable_configs,
+            }
+            _write_incremental_image_index(index_data)
+            print(
+                f"[对象索引] 图片查询完成: {image_name}，"
+                f"对象引用={len(matches)}",
+                flush=True,
+            )
+            print(f"[对象索引] 增量缓存已写入: {DEFAULT_IMAGE_OBJECT_INDEX}")
+
+        unique_matches: dict[tuple[str, str, str, int], dict] = {}
+        for match in matches:
+            match_key = (
+                str(match.get("source", "")),
+                str(match.get("bundle_entry", "")),
+                str(match.get("component_type", "")),
+                int(match.get("component_path_id", 0) or 0),
+            )
+            unique_matches[match_key] = match
+        matches = list(unique_matches.values())
+        if not matches:
+            if addressable_locations:
+                print(
+                    f"[屏蔽对象][提示] {image_name} 已在 Addressables 中定位，"
+                    f"但没有找到可静态屏蔽的 GameObject。"
+                )
+                for location in addressable_locations:
+                    print(
+                        f"  地址: {location.get('internal_id', '')} "
+                        f"(Key={location.get('primary_key', '')})"
+                    )
+                if addressable_configs:
+                    print(f"  命中配置 JSON: {len(addressable_configs)} 个")
+                    for config_hit in addressable_configs[:10]:
+                        print(f"    {config_hit.get('json_path', '')}")
+                    if len(addressable_configs) > 10:
+                        print(f"    ... 其余 {len(addressable_configs) - 10} 个")
+                print(
+                    "[屏蔽对象][提示] 该对象可能由代码在运行时动态创建；"
+                    "当前不会误改无关对象。"
+                )
+            else:
+                print(
+                    f"[屏蔽对象] {image_name} 没有找到静态引用对象，"
+                    "也没有匹配到 Addressables 位置。"
+                )
+            continue
+
+        for match_index, match in enumerate(matches, start=1):
+            _print_object_match(match_index, match)
+        if len(matches) == 1:
+            selected_matches = [1]
+        else:
+            print()
+            raw = prompt_input(
+                f"选择当前图片的匹配项编号 [1-{len(matches)}]；"
+                "支持 1-2 或 1,2；q 跳过，x 结束: "
+            ).strip().lower()
+            if raw == "x":
+                return
+            if raw == "q":
+                continue
+            try:
+                selected_matches = [
+                    int(value)
+                    for value in parse_number_ranges(raw, set(range(1, len(matches) + 1)))
+                ]
+            except ValueError as exc:
+                print(f"[屏蔽对象][错误] {exc}，已跳过当前图片。")
+                continue
+
+        for match_index in selected_matches:
+            match = matches[match_index - 1]
+            if len(matches) > 1:
+                _print_object_match(match_index, match)
+            level_raw = prompt_input(
+                "选择要屏蔽的层级编号；0 为当前对象，q 跳过此匹配项: "
+            ).strip().lower()
+            if level_raw == "q":
+                continue
+            try:
+                level = int(level_raw)
+            except ValueError:
+                print("[屏蔽对象][错误] 请输入数字。")
+                continue
+            _block_game_object(match, level)
+
+
+def run_block_objects_by_mesh() -> None:
+    print()
+    print("按 Mesh 定位并屏蔽 GameObject")
+    print("说明: 需要一键导出的第 2 类对象数据和第 3 类 Mesh 数据。")
+    print("      每个匹配项显示对象父链，可选择屏蔽链上的任意对象。")
+    scopes, _textures = _load_object_graph()
+    if not any(
+        type_name == "GameObject"
+        for scope in scopes.values()
+        for type_name, _path_id in scope["items"]
+    ):
+        print(
+            "[Mesh屏蔽][错误] 没有 GameObject 对象数据。"
+            "请在一键导出中同时选择第 2 类。"
+        )
+        return
+    queries = _selected_mesh_queries(scopes)
+    if not queries:
+        return
+
+    for query_index, (mesh_name, mesh_targets) in enumerate(queries, start=1):
+        print()
+        print(
+            f"\033[94m[Mesh屏蔽] Mesh {query_index}/{len(queries)}: "
+            f"{mesh_name}\033[0m"
+        )
+        matches = _find_mesh_object_matches(scopes, mesh_targets)
+        unique_matches: dict[tuple[str, str, str, int], dict] = {}
+        for match in matches:
+            key = (
+                str(match.get("source", "")),
+                str(match.get("bundle_entry", "")),
+                str(match.get("component_type", "")),
+                int(match.get("component_path_id", 0) or 0),
+            )
+            unique_matches[key] = match
+        matches = list(unique_matches.values())
+        if not matches:
+            print(
+                f"[Mesh屏蔽][提示] {mesh_name} 没有找到静态 "
+                "MeshFilter/SkinnedMeshRenderer 引用，可能由代码运行时创建或赋值。"
+            )
+            continue
+
+        for match_index, match in enumerate(matches, start=1):
+            _print_object_match(match_index, match)
+        if len(matches) == 1:
+            selected_matches = [1]
+        else:
+            raw = prompt_input(
+                f"选择当前 Mesh 的匹配项编号 [1-{len(matches)}]；"
+                "支持 1-2 或 1,2；q 跳过，x 结束: "
+            ).strip().lower()
+            if raw == "x":
+                return
+            if raw == "q":
+                continue
+            try:
+                selected_matches = [
+                    int(value)
+                    for value in parse_number_ranges(
+                        raw,
+                        set(range(1, len(matches) + 1)),
+                    )
+                ]
+            except ValueError as exc:
+                print(f"[Mesh屏蔽][错误] {exc}，已跳过当前 Mesh。")
+                continue
+
+        for match_index in selected_matches:
+            match = matches[match_index - 1]
+            if len(matches) > 1:
+                _print_object_match(match_index, match)
+            level_raw = prompt_input(
+                "选择要屏蔽的层级编号；0 为当前对象，q 跳过此匹配项: "
+            ).strip().lower()
+            if level_raw == "q":
+                continue
+            try:
+                level = int(level_raw)
+            except ValueError:
+                print("[Mesh屏蔽][错误] 请输入数字。")
+                continue
+            _block_game_object(match, level)
+
+
+def run_restore_blocked_objects() -> None:
+    records = _load_block_records()
+    items = [item for item in records["items"] if isinstance(item, dict)]
+    if not items:
+        print("[撤销屏蔽] 没有屏蔽记录。")
+        return
+    print()
+    print("已屏蔽 GameObject:")
+    for index, item in enumerate(items, start=1):
+        print(
+            f"{index}. {item.get('game_object_name')} "
+            f"(PathID={item.get('game_object_path_id')}, 文件={item.get('source_resource')})"
+        )
+    raw = prompt_input("选择要撤销的编号，支持逗号、1-3 或 a，q 取消: ").strip().lower()
+    if raw == "q":
+        return
+    selected = (
+        list(range(1, len(items) + 1))
+        if raw == "a"
+        else [int(value) for value in parse_number_ranges(raw, set(range(1, len(items) + 1)))]
+    )
+    removed: set[int] = set()
+    for index in selected:
+        item = items[index - 1]
+        source = Path(str(item.get("source_json", "")))
+        target = Path(str(item.get("replacement_json", "")))
+        source_data = _safe_read_json(source)
+        if not isinstance(source_data, dict):
+            print(f"[撤销屏蔽][失败] 原始 JSON 不存在或无效: {source}")
+            continue
+        source_data["m_IsActive"] = int(item.get("original_m_IsActive", 1))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(source_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        removed.add(index - 1)
+        print(f"[撤销屏蔽][完成] {item.get('game_object_name')} -> m_IsActive={source_data['m_IsActive']}")
+    records["items"] = [item for index, item in enumerate(items) if index not in removed]
+    _write_block_records(records)
+
+
 def _safe_read_json(path: Path):
     try:
         return json.loads(path.read_text(encoding="utf-8-sig"))
@@ -702,6 +1723,188 @@ def _inspect_monobehaviour_exports(input_root: Path) -> dict[str, int]:
         "custom_field_files": custom_field_files,
         "nonempty_string_values": nonempty_string_values,
     }
+
+
+def run_restore_records_by_field() -> None:
+    from pipeline.translation import (
+        _ai_translation_request_configured,
+        _start_wait_logger,
+        _translate_ai_batch,
+        _translate_one_text_with_provider_retry,
+        rebuild_game_text_outputs,
+    )
+
+    cfg = load_config(quiet=True)
+    backup_path = cfg.stage_record_dir / "records_unfiltered.json"
+    records_path = cfg.stage_record_dir / cfg.output_scan_records_json
+    trans_path = cfg.stage_record_dir / cfg.output_trans_json
+    if not backup_path.is_file():
+        print(
+            f"[字段恢复][错误] 未找到完整备份: {backup_path}\n"
+            "请先运行脚本 0；启用 AI 字段判断时会自动生成该备份。"
+        )
+        return
+    backup = _safe_read_json(backup_path)
+    current = _safe_read_json(records_path)
+    translations = _safe_read_json(trans_path)
+    if not isinstance(backup, list):
+        print(f"[字段恢复][错误] 备份格式无效: {backup_path}")
+        return
+    if not isinstance(current, list):
+        current = []
+    if not isinstance(translations, dict):
+        translations = {}
+
+    raw = prompt_input(
+        "输入要恢复的完整字段名，多个字段用逗号分隔"
+        "（数组下标可写成 []）: "
+    ).strip()
+    requested = {
+        value.strip()
+        for value in re.split(r"[,，]", raw)
+        if value.strip()
+    }
+    if not requested:
+        print("[字段恢复] 未输入字段。")
+        return
+
+    def normalized(value: object) -> str:
+        return re.sub(r"\[\d+\]", "[]", str(value))
+
+    restored = [
+        item for item in backup
+        if isinstance(item, dict)
+        and (
+            str(item.get("field", "")) in requested
+            or normalized(item.get("field", "")) in requested
+        )
+    ]
+    if not restored:
+        print("[字段恢复][错误] 完整备份中没有命中指定字段。")
+        suggestions = sorted(
+            {
+                normalized(item.get("field", ""))
+                for item in backup
+                if isinstance(item, dict)
+                and any(
+                    str(item.get("field", "")).endswith(value)
+                    for value in requested
+                )
+            }
+        )
+        if suggestions:
+            print("[字段恢复][提示] 可能要输入的完整字段:")
+            for value in suggestions[:30]:
+                print(f"  {value}")
+        return
+
+    def record_key(item: dict) -> tuple:
+        return (
+            item.get("file_path"),
+            item.get("field"),
+            item.get("source_text"),
+            item.get("path_id"),
+            item.get("font_path_id"),
+        )
+
+    existing_keys = {
+        record_key(item) for item in current if isinstance(item, dict)
+    }
+    added_records = [
+        item for item in restored if record_key(item) not in existing_keys
+    ]
+    current.extend(added_records)
+    atomic_write_json(records_path, current)
+
+    restored_texts = list(
+        dict.fromkeys(
+            str(item.get("source_text", ""))
+            for item in restored
+            if isinstance(item.get("source_text"), str)
+            and item.get("source_text")
+        )
+    )
+    pending_texts: list[str] = []
+    for text in restored_texts:
+        old_value = translations.get(text)
+        if not isinstance(old_value, str) or not old_value:
+            translations[text] = ""
+            pending_texts.append(text)
+    atomic_write_json(trans_path, translations)
+    print(
+        f"[字段恢复] 命中记录={len(restored)}，新增 records={len(added_records)}，"
+        f"待翻译文本={len(pending_texts)}"
+    )
+    print(f"[字段恢复] records: {records_path}")
+    print(f"[字段恢复] trans: {trans_path}")
+    if not pending_texts:
+        rebuild_game_text_outputs(cfg, translations)
+        print("\033[92m[字段恢复] 对应文本已有译文，无需重跑 AI。\033[0m")
+        return
+
+    pending_items = list(enumerate(pending_texts))
+    completed_ids: set[int] = set()
+    if _ai_translation_request_configured(cfg):
+        strategy = get_strategy(cfg)
+        batches = strategy.build_batches(pending_items)
+        for batch_index, batch in enumerate(batches, start=1):
+            print(
+                f"\033[92m[字段恢复] 开始 AI batch={batch_index}/{len(batches)}，"
+                f"条目={len(batch)}\033[0m",
+                flush=True,
+            )
+            wait_stop, wait_thread = _start_wait_logger(
+                f"[字段恢复] AI batch={batch_index}/{len(batches)}"
+            )
+            try:
+                result = _translate_ai_batch(
+                    batch,
+                    cfg,
+                    strategy,
+                    batch_index,
+                    len(batches),
+                    artifact_prefix="ai_translation_restore",
+                )
+            except Exception as exc:
+                print(
+                    f"[字段恢复] AI batch={batch_index}/{len(batches)} 失败，"
+                    f"本批回落到 {cfg.translate_provider}: {exc}"
+                )
+                continue
+            finally:
+                wait_stop.set()
+                wait_thread.join(timeout=1)
+            for item_id, source_text in batch:
+                translated = result.get(item_id)
+                if isinstance(translated, str) and translated:
+                    translations[source_text] = translated
+                    completed_ids.add(item_id)
+            atomic_write_json(trans_path, translations)
+
+    remaining = [
+        (item_id, text)
+        for item_id, text in pending_items
+        if item_id not in completed_ids
+    ]
+    for completed, (_item_id, source_text) in enumerate(remaining, start=1):
+        _, translated = _translate_one_text_with_provider_retry(
+            cfg,
+            source_text,
+            max_attempts=3,
+        )
+        translations[source_text] = translated
+        atomic_write_json(trans_path, translations)
+        print(
+            f"[字段恢复] 回落翻译 {completed}/{len(remaining)}: "
+            f"{source_text} -> {translated}",
+            flush=True,
+        )
+
+    rebuild_game_text_outputs(cfg, translations)
+    print(
+        f"\033[92m[字段恢复][完成] 已恢复字段并更新 trans.json，"
+        f"新增译文={len(pending_texts)}。\033[0m"
+    )
 
 
 def run_compatibility_check() -> None:
@@ -839,7 +2042,7 @@ def _ai_request_item_count(request_path: Path) -> int | None:
         return None
 
 
-def _ai_response_state(request_path: Path, response_path: Path) -> str:
+def _ai_response_state(request_path: Path, response_path: Path, strategy: object) -> str:
     if not response_path.is_file():
         return "未生成 response"
     try:
@@ -856,7 +2059,7 @@ def _ai_response_state(request_path: Path, response_path: Path) -> str:
         content = str(message.get("content", ""))
         if finish_reason == "length":
             return "解析失败: length 截断"
-        parsed = get_strategy(load_config()).parse_response(content)
+        parsed = strategy.parse_response(content)
         request_count = _ai_request_item_count(request_path)
         if request_count is not None and len(parsed) != request_count:
             return f"可解析但数量不一致: {len(parsed)}/{request_count}, finish_reason={finish_reason or '未知'}"
@@ -875,9 +2078,10 @@ def _select_ai_batch_request_path() -> Path | None:
 
     print()
     print("可用 AI request 批次文件:")
+    strategy = get_strategy(load_config(quiet=True))
     for index, request_path in enumerate(request_files, start=1):
         response_path = _default_response_path_for_ai_request(request_path)
-        response_state = _ai_response_state(request_path, response_path)
+        response_state = _ai_response_state(request_path, response_path, strategy)
         print(f"{index}. {request_path.name} ({response_state})")
     print("q. 返回")
 
@@ -959,7 +2163,21 @@ def run_ai_translation_batch_menu() -> None:
         return
     response_path = _default_response_path_for_ai_request(request_path)
     print(f"response 文件将使用: {response_path}")
-    run_ai_translation_batch_tool(mode, request_path, response_path)
+    result = run_ai_translation_batch_tool(mode, request_path, response_path)
+    if result != 0:
+        print(f"\033[91m[AI补批][失败] 操作未完成，返回码={result}。\033[0m")
+        return
+    if mode == "resend":
+        print(
+            "\033[94m[AI补批][下一步] response 已重新生成。"
+            "请继续使用工具脚本 7 的选项 2，将该 response 修补进 trans.json。\033[0m"
+        )
+        return
+    print("\033[92m[AI补批] 已成功修补 trans.json。\033[0m")
+    print(
+        "\033[94m[AI补批][下一步] 请回到主菜单运行脚本 3，"
+        "从 trans.json 重建 game.txt 和 game_chars.txt；之后继续运行脚本 4-9。\033[0m"
+    )
 
 
 def atomic_write_json_file(path: Path, value: object) -> None:
@@ -1012,12 +2230,40 @@ def format_preview_text(text: str, max_len: int = 120) -> str:
     return text if len(text) <= max_len else text[:max_len] + "..."
 
 
+def format_char_contexts(text: str, char: str, radius: int = 45, limit: int = 3) -> list[str]:
+    contexts: list[str] = []
+    start = 0
+    while len(contexts) < limit:
+        index = text.find(char, start)
+        if index < 0:
+            break
+        left = text[max(0, index - radius):index]
+        right = text[index + len(char):index + len(char) + radius]
+        prefix = "..." if index > radius else ""
+        suffix = "..." if index + len(char) + radius < len(text) else ""
+        context = f"{prefix}{left}>>>{char}<<<{right}{suffix}"
+        contexts.append(
+            context.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+        )
+        start = index + len(char)
+    return contexts
+
+
 def run_clean_unsupported_ttf_chars() -> None:
     print()
     print("清理 trans.json 中模板 TTF 不支持的字符")
-    print("说明: 逐个读取 translation_chars_missing_from_ttf.txt 中的字符，查找 trans.json 译文中包含该字符的条目。")
-    print("      确认替换后，直接回车代表删除该字符；输入内容则统一替换为输入内容。")
+    print("说明: 读取 translation_chars_missing_from_ttf.txt，清理 trans.json 译文中的不支持字符。")
+    print("  1. 一键删除全部不支持字符")
+    print("  2. 逐字符查看并选择替换或删除")
+    print("  q. 返回")
     print()
+
+    mode = prompt_input("请选择清理方式: ").strip().lower()
+    if mode in {"q", "quit", "exit"}:
+        return
+    if mode not in {"1", "2"}:
+        print("[清理字符][错误] 无效选择，请输入 1、2 或 q。")
+        return
 
     missing_path = prompt_path("不支持字符清单", DEFAULT_MISSING_TTF_CHARS_FILE)
     trans_path = prompt_path("trans.json", DEFAULT_TRANS_JSON)
@@ -1037,6 +2283,47 @@ def run_clean_unsupported_ttf_chars() -> None:
     for char, count in counts:
         print(f"[清理字符]   {repr(char)}: {count}")
 
+    if mode == "1":
+        missing_set = set(missing_chars)
+        affected_keys = [
+            source
+            for source, translated in trans_data.items()
+            if any(char in missing_set for char in translated)
+        ]
+        occurrence_total = sum(
+            sum(1 for char in translated if char in missing_set)
+            for translated in trans_data.values()
+        )
+        print()
+        print(
+            f"\033[38;5;208m[清理字符][确认] 将从 {len(affected_keys)} 个译文条目中，"
+            f"删除全部 {len(missing_chars)} 种不支持字符，共 {occurrence_total} 次出现。\033[0m"
+        )
+        confirm = prompt_input(
+            "确认一键删除全部不支持字符? 输入 y 确认，其它任意键取消: "
+        ).strip().lower()
+        if confirm != "y":
+            print("\033[94m[清理字符] 已取消，trans.json 未修改。\033[0m")
+            return
+        translation_table = str.maketrans("", "", "".join(missing_chars))
+        changed = 0
+        for source, translated in list(trans_data.items()):
+            new_value = translated.translate(translation_table)
+            if new_value == translated:
+                continue
+            trans_data[source] = new_value
+            changed += 1
+        atomic_write_json_file(trans_path, trans_data)
+        print(
+            f"\033[92m[清理字符] 一键清理完成，更新译文条目={changed}，"
+            f"删除字符出现次数={occurrence_total}: {trans_path}\033[0m"
+        )
+        print(
+            "\033[94m[清理字符][下一步] 请运行主菜单脚本 3 重建 game.txt 和 "
+            "game_chars.txt，然后重新运行主菜单脚本 7。\033[0m"
+        )
+        return
+
     changed_total = 0
     for index, char in enumerate(missing_chars, start=1):
         matches = find_trans_values_containing_char(trans_data, char)
@@ -1046,7 +2333,13 @@ def run_clean_unsupported_ttf_chars() -> None:
         print(f"[清理字符] {index}/{len(missing_chars)} 当前字符: {repr(char)}，命中 {len(matches)} 条")
         for item_index, (source, translated) in enumerate(matches[:50], start=1):
             print(f"  {item_index}. key:   {format_preview_text(source)}")
-            print(f"     value: {format_preview_text(translated)}")
+            contexts = format_char_contexts(translated, char)
+            for context_index, context in enumerate(contexts, start=1):
+                label = "value命中" if len(contexts) == 1 else f"value命中{context_index}"
+                print(f"     {label}: {context}")
+            occurrence_count = translated.count(char)
+            if occurrence_count > len(contexts):
+                print(f"     ... 本条共出现 {occurrence_count} 次，仅显示前 {len(contexts)} 处")
         if len(matches) > 50:
             print(f"  ... 其余 {len(matches) - 50} 条省略")
 
@@ -1068,325 +2361,168 @@ def run_clean_unsupported_ttf_chars() -> None:
     print()
     print(f"[清理字符] 完成，累计更新条目次数: {changed_total}")
     print(f"[清理字符] 已写回: {trans_path}")
+    if changed_total:
+        print(
+            "\033[94m[清理字符][下一步] 请运行主菜单脚本 3 重建 game.txt 和 "
+            "game_chars.txt，然后重新运行主菜单脚本 7。\033[0m"
+        )
 
 
-def run_clean_blacklisted_records() -> None:
+def run_remove_maybe_titles_from_trans() -> None:
     cfg = load_config()
+    trans_path = cfg.stage_record_dir / cfg.output_trans_json
+    maybe_title_path = cfg.stage_record_dir / "trans_maybe_title.json"
     print()
-    print("清理 records.json 中当前黑名单字段")
-    print("说明: 读取 config.json 的 string_field_blacklist，删除 records.json 中命中的记录。")
-    print("      被删除记录对应的 source_text 如果不再被其它保留记录使用，也会从 trans.json 删除。")
-    print()
+    print("从 trans.json 清理疑似资源键/标题键")
+    print(f"\033[94m[清理资源键] trans.json: {trans_path}\033[0m")
+    print(f"\033[94m[清理资源键] 排除清单: {maybe_title_path}\033[0m")
 
-    records_path = prompt_path("records.json", DEFAULT_RECORDS_JSON)
-    trans_path = prompt_path("trans.json", DEFAULT_TRANS_JSON)
-    try:
-        records_data = json.loads(records_path.read_text(encoding="utf-8-sig"))
-        trans_data = json.loads(trans_path.read_text(encoding="utf-8-sig"))
-    except (FileNotFoundError, json.JSONDecodeError) as exc:
-        print(f"[清理黑名单] 读取失败: {exc}")
+    missing_files = [
+        path for path in (trans_path, maybe_title_path) if not path.is_file()
+    ]
+    if missing_files:
+        for path in missing_files:
+            print(f"\033[91m[清理资源键][失败] 文件不存在: {path}\033[0m")
         return
-    if not isinstance(records_data, list):
-        print(f"[清理黑名单] records.json 不是数组: {records_path}")
+
+    try:
+        trans_data = _safe_read_json(trans_path)
+        maybe_title_data = _safe_read_json(maybe_title_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"\033[91m[清理资源键][失败] 读取 JSON 失败: {exc}\033[0m")
         return
     if not isinstance(trans_data, dict):
-        print(f"[清理黑名单] trans.json 不是对象: {trans_path}")
+        print(f"\033[91m[清理资源键][失败] trans.json 不是 JSON 对象: {trans_path}\033[0m")
+        return
+    if not isinstance(maybe_title_data, dict):
+        print(
+            f"\033[91m[清理资源键][失败] trans_maybe_title.json 不是 JSON 对象: "
+            f"{maybe_title_path}\033[0m"
+        )
         return
 
-    kept_records: list[object] = []
-    removed_records: list[dict] = []
-    for item in records_data:
-        if not isinstance(item, dict):
-            kept_records.append(item)
-            continue
-        field = item.get("field")
-        if isinstance(field, str) and _is_blacklisted_string_field(cfg, field):
-            removed_records.append(item)
-        else:
-            kept_records.append(item)
+    excluded_keys = [key for key in maybe_title_data if isinstance(key, str)]
+    matched_keys = [key for key in excluded_keys if key in trans_data]
+    missing_count = len(excluded_keys) - len(matched_keys)
+    print(
+        f"\033[94m[清理资源键] 清单={len(excluded_keys)}，"
+        f"trans 命中={len(matched_keys)}，已不存在={missing_count}\033[0m"
+    )
+    if not matched_keys:
+        print("\033[92m[清理资源键] trans.json 中没有需要删除的键。\033[0m")
+        return
 
-    kept_source_texts = {
-        item.get("source_text")
-        for item in kept_records
-        if isinstance(item, dict) and isinstance(item.get("source_text"), str)
+    preview_limit = 30
+    print("\033[94m[清理资源键] 即将删除的键:\033[0m")
+    for index, key in enumerate(matched_keys[:preview_limit], start=1):
+        print(f"  {index}. {format_preview_text(key)}")
+    if len(matched_keys) > preview_limit:
+        print(f"  ... 其余 {len(matched_keys) - preview_limit} 条省略")
+
+    confirm = prompt_input(
+        f"确认从 trans.json 删除以上 {len(matched_keys)} 个键? 输入 y 确认，其它任意键取消: "
+    ).strip().lower()
+    if confirm != "y":
+        print("\033[94m[清理资源键] 已取消，trans.json 未修改。\033[0m")
+        return
+
+    matched_set = set(matched_keys)
+    cleaned_data = {
+        key: value for key, value in trans_data.items() if key not in matched_set
     }
-    removed_source_texts = {
-        item.get("source_text")
-        for item in removed_records
-        if isinstance(item.get("source_text"), str)
-    }
-    trans_keys_to_remove = sorted(
-        text
-        for text in removed_source_texts
-        if text not in kept_source_texts and text in trans_data
+    atomic_write_json_file(trans_path, cleaned_data)
+    print(
+        f"\033[92m[清理资源键] 已从 trans.json 删除 {len(matched_keys)} 个键，"
+        f"剩余={len(cleaned_data)}: {trans_path}\033[0m"
     )
 
-    print(f"[清理黑名单] records 原记录: {len(records_data)}")
-    print(f"[清理黑名单] 命中黑名单记录: {len(removed_records)}")
-    print(f"[清理黑名单] records 保留记录: {len(kept_records)}")
-    print(f"[清理黑名单] trans 将删除键值: {len(trans_keys_to_remove)}")
-    if removed_records:
-        field_counts: dict[str, int] = {}
-        for item in removed_records:
-            field = str(item.get("field", ""))
-            field_counts[field] = field_counts.get(field, 0) + 1
-        print("[清理黑名单] 命中字段统计:")
-        for field, count in sorted(field_counts.items(), key=lambda row: (-row[1], row[0]))[:50]:
-            print(f"  {field}: {count}")
-        if len(field_counts) > 50:
-            print(f"  ... 其余字段 {len(field_counts) - 50} 个省略")
 
-    confirm = prompt_input("确认写回 records.json 并清理 trans.json ? 输入 y 确认，其它任意键取消: ").strip().lower()
+
+def _format_file_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{size} B"
+
+
+def run_clean_script_outputs() -> None:
+    cfg = load_config()
+    try:
+        manifest = load_script_output_manifest()
+    except Exception as exc:
+        print(f"\033[91m[脚本产物清理] 无法读取清单: {exc}\033[0m")
+        return
+
+    scripts = manifest["scripts"]
+    print()
+    print("按脚本清理生成文件")
+    print(f"\033[94m[脚本产物清理] 清单: {SCRIPT_OUTPUT_MANIFEST_PATH}\033[0m")
+    print("支持 1-2、4-7 或逗号组合；输入 a 会包含脚本 0 至 9。")
+    ordered_script_ids = sorted(
+        scripts,
+        key=lambda value: (value == "a", int(value) if value.isdigit() else 0),
+    )
+    for script_id in ordered_script_ids:
+        entry = scripts[script_id]
+        outputs = entry.get("outputs", []) if isinstance(entry, dict) else []
+        name = entry.get("name", "") if isinstance(entry, dict) else ""
+        print(f"{script_id}. {name}（清单规则 {len(outputs)} 条）")
+
+    raw = prompt_input("请选择要清理的脚本，可输入多个编号并用逗号分隔，q 取消: ").strip().lower()
+    if raw in {"", "q", "quit", "exit"}:
+        print("[脚本产物清理] 已取消。")
+        return
+    try:
+        script_ids = ["a"] if raw == "a" else parse_number_ranges(raw, set(range(10)))
+    except ValueError as exc:
+        print(f"\033[91m[脚本产物清理] {exc}\033[0m")
+        return
+
+    try:
+        targets, notes = collect_script_cleanup_targets(cfg, script_ids)
+    except Exception as exc:
+        print(f"\033[91m[脚本产物清理] 解析清单失败: {exc}\033[0m")
+        return
+
+    for note in dict.fromkeys(notes):
+        print(f"\033[94m[脚本产物清理][说明] {note}\033[0m")
+    existing = [target for target in targets if target.path.exists() or target.path.is_symlink()]
+    if not existing:
+        print("\033[92m[脚本产物清理] 清单中的产物均不存在，无需删除。\033[0m")
+        return
+
+    total_files = 0
+    total_size = 0
+    print("\033[94m[脚本产物清理] 即将删除:\033[0m")
+    for index, target in enumerate(existing, start=1):
+        file_count, size = target_size(target.path)
+        total_files += file_count
+        total_size += size
+        kind = "目录" if target.path.is_dir() else "文件"
+        detail = f"，内部文件={file_count}" if target.path.is_dir() else ""
+        print(f"  {index}. [{kind}] {target.path}{detail}，大小={_format_file_size(size)}")
+    print(
+        f"\033[94m[脚本产物清理] 目标={len(existing)}，"
+        f"文件={total_files}，总大小={_format_file_size(total_size)}\033[0m"
+    )
+
+    confirm = prompt_input("确认按清单删除以上产物? 输入 y 确认，其它任意键取消: ").strip().lower()
     if confirm != "y":
-        print("[清理黑名单] 已取消，未修改文件。")
-        return
-
-    for key in trans_keys_to_remove:
-        trans_data.pop(key, None)
-
-    report = {
-        "records_path": str(records_path),
-        "trans_path": str(trans_path),
-        "original_records": len(records_data),
-        "removed_records": len(removed_records),
-        "kept_records": len(kept_records),
-        "removed_trans_keys": trans_keys_to_remove,
-        "removed_record_samples": removed_records[:200],
-    }
-    report_path = records_path.with_name("blacklisted_records_cleanup_report.json")
-
-    atomic_write_json_file(records_path, kept_records)
-    atomic_write_json_file(trans_path, trans_data)
-    atomic_write_json_file(report_path, report)
-    print(f"[清理黑名单] 已写回 records.json: {records_path}")
-    print(f"[清理黑名单] 已写回 trans.json: {trans_path}")
-    print(f"[清理黑名单] 清理报告: {report_path}")
-
-
-def run_sync_generated_tmp_material_parameters() -> None:
-    cfg = load_config()
-    print()
-    print("同步生成字体的 SDF 材质参数")
-    print("说明: 主流程默认保留原游戏材质。本工具只在 SDF/ToImport 中新增 Material 替换 JSON。")
-    print("      保留原游戏材质的 PathID、Shader、纹理、颜色和遮罩设置，只同步影响 SDF 边缘的数值参数。")
-    print("      重新执行主流程的 SDF 待导入准备步骤，会清空本工具生成的材质替换。")
-    print()
-    confirm = prompt_input("确认同步生成材质参数到当前 SDF/ToImport ? 输入 y 确认，其它任意键取消: ").strip().lower()
-    if confirm != "y":
-        print("[TMP材质] 已取消，未修改文件。")
+        print("[脚本产物清理] 已取消，未删除文件。")
         return
     try:
-        sync_generated_tmp_material_parameters(cfg)
+        removed = delete_script_cleanup_targets(existing)
     except Exception as exc:
-        print(f"[TMP材质] 处理失败: {exc}")
-
-
-def run_clean_all_text_effect_materials() -> None:
-    cfg = load_config()
-    print()
-    print("清理全部 TMP 阴影/描边/发光材质")
-    print("说明: 扫描 workspace/input 中具有 TMP SDF 专属参数且带效果参数的 Material JSON，")
-    print("      将对应替换 JSON 写入 workspace/output/Text；本工具只处理材质，不处理组件。")
-    print("      高风险: 这会修改所有共享 TMP 字体材质，可能影响教程和运行时 UI。")
-    print("      主流程不会自动执行本功能，仅用于手工测试。")
-    print()
-    confirm = prompt_input("确认执行全部材质清理? 输入 y 确认，其它任意键取消: ").strip().lower()
-    if confirm != "y":
-        print("[材质阴影描边] 已取消，未修改文件。")
+        print(f"\033[91m[脚本产物清理] 删除失败: {exc}\033[0m")
         return
-    try:
-        disable_translated_text_effect_components(
-            cfg,
-            force_all_text_effect_materials=True,
-            material_only=True,
-        )
-    except Exception as exc:
-        print(f"[材质阴影描边] 处理失败: {exc}")
-
-
-def run_parse_catalog() -> None:
-    cfg = load_config()
-    print()
-    print("解析 Addressables catalog")
-    print("说明: 从配置的 catalog_source_subpath 读取 catalog.json，输出格式化版和四个字段展开版。")
-    print(f"[catalog] 源文件: {cfg.catalog_source_path}")
-    print(f"[catalog] 输出目录: {cfg.result_dir / 'catalog'}")
-    try:
-        formatted_path, expanded_path = parse_catalog_to_output(cfg)
-    except Exception as exc:
-        print(f"[catalog] 解析失败: {exc}")
-        return
-    print(f"[catalog] 已输出格式化 catalog: {formatted_path}")
-    print(f"[catalog] 已输出展开解析结果: {expanded_path}")
-    print(f"[catalog] 解析报告: {expanded_path.with_name('catalog_parse_report.txt')}")
-
-
-def run_repack_catalog() -> None:
-    cfg = load_config()
-    default_output_json = cfg.result_dir / "catalog" / "Output.json"
-    default_destination = cfg.result_dir / "catalog" / "catalog.repacked.json"
-    print()
-    print("回打 Addressables catalog")
-    print("说明: 读取展开后的 Output.json，将四个字段重新编码回原始 catalog 格式。")
-    output_json = prompt_path("展开后的 Output.json", default_output_json)
-    destination = prompt_path("输出 catalog 文件", default_destination)
-    try:
-        result_path = repack_expanded_catalog(output_json, destination)
-    except Exception as exc:
-        print(f"[catalog] 回打失败: {exc}")
-        return
-    print(f"[catalog] 已生成可导入 catalog: {result_path}")
-
-
-def run_auto_patch_catalog() -> None:
-    cfg = load_config()
-    final_result_root = cfg.root_dir / "workspace" / "FinalResult"
-    log_paths = sorted(cfg.log_dir.glob("*.log")) + sorted(cfg.log_dir.glob("*.txt"))
-    print()
-    print("按最终 Bundle 自动修正并回打 catalog")
-    print("说明: 解析原 catalog，匹配 FinalResult/Bundle/Android 下的 bundle，修正 size，并将命中条目的 m_Crc 置为 0。")
-    print(f"[catalog] 最终输出目录: {final_result_root}")
-    try:
-        bundle_root = final_result_root / "Bundle"
-        android_root = bundle_root / "Android"
-        if bundle_root.is_dir():
-            move_sources = [
-                path for path in bundle_root.iterdir()
-                if path.name != "Android" and path.name.lower() != "catalog.json"
-            ]
-            if move_sources:
-                android_root.mkdir(parents=True, exist_ok=True)
-                for source in move_sources:
-                    target = android_root / source.name
-                    if target.exists():
-                        if target.is_dir():
-                            shutil.rmtree(target)
-                        else:
-                            target.unlink()
-                    shutil.move(str(source), str(target))
-                print(f"[catalog] 已整理 Bundle 输出目录: {android_root}")
-        result_path = auto_patch_and_repack_catalog_after_import(cfg, final_result_root, log_paths)
-    except Exception as exc:
-        print(f"[catalog] 自动修正失败: {exc}")
-        return
-    if result_path is None:
-        return
-    print(f"[catalog] 自动修正完成: {result_path}")
-
-
-def _catalog_row_original_runtime(row: dict):
-    raw = row.get("raw")
-    if not isinstance(raw, str) or not raw:
-        return {}
-    try:
-        raw_obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    return raw_obj if isinstance(raw_obj, dict) else {}
-
-
-def run_patch_catalog_real_crc_interactive() -> None:
-    cfg = load_config()
-    final_result_root = cfg.root_dir / "workspace" / "FinalResult"
-    output_dir = cfg.result_dir / "catalog"
-    output_json = output_dir / "Output.json"
-    final_catalog_path = final_result_root / "Bundle" / "catalog.json"
-    bundle_root = final_result_root / "Bundle" / "Android"
-    source_bundle_root = _source_catalog_android_root(cfg)
-    log_paths = sorted(cfg.log_dir.glob("*.log")) + sorted(cfg.log_dir.glob("*.txt"))
-
-    print()
-    print("按最终 Bundle 真实 CRC 修正 catalog（交互处理长度溢出）")
-    print("说明: 先用新 bundle 文件名匹配原 bundle，再用原 bundle 的 CRC/size 定位 Output.json 条目。")
-    print("说明: 能原位写入的条目写真实 CRC；真实 CRC 导致片段变长时，询问置 0 或跳过该条。")
-    print(f"[catalog] 最终 bundle 目录: {bundle_root}")
-
-    try:
-        _formatted_path, expanded_path = parse_catalog_to_output(cfg, cfg.catalog_source_path, output_dir)
-        if not validate_catalog_crc_algorithm(cfg, expanded_path, source_bundle_root, bundle_root, output_dir):
-            print("[catalog][停止] CRC 算法自校验未通过，本次不修改 catalog。")
-            return
-
-        manual_crc = calculate_final_bundle_crcs_manually(bundle_root)
-        size_updates, crc_updates, backup_path = patch_expanded_catalog_from_final_bundles(
-            output_json,
-            bundle_root,
-            log_paths=log_paths,
-            crc_by_bundle_name=manual_crc,
-            source_bundle_root=source_bundle_root,
-        )
-
-        catalog = json.loads(output_json.read_text(encoding="utf-8-sig"))
-        options = catalog.get("m_ExtraDataString", {}).get("AssetBundleRequestOptions", [])
-        overflow_rows = []
-        if isinstance(options, list):
-            for row in options:
-                if not isinstance(row, dict):
-                    continue
-                raw = row.get("raw")
-                if not isinstance(raw, str):
-                    continue
-                rebuilt = _rebuild_request_option_raw(row)
-                if len(rebuilt) > len(raw):
-                    overflow_rows.append(row)
-
-        if overflow_rows:
-            print(f"[catalog][需要处理] 有 {len(overflow_rows)} 条真实 CRC/size 原位回打会变长。")
-            changed = 0
-            skipped = 0
-            for index, row in enumerate(overflow_rows, 1):
-                original_runtime = _catalog_row_original_runtime(row)
-                print()
-                print(
-                    f"[catalog][{index}/{len(overflow_rows)}] "
-                    f"hash={row.get('m_Hash')} real_crc={row.get('m_Crc')} size={row.get('m_BundleSize')}"
-                )
-                while True:
-                    choice = prompt_input("输入 0 置 m_Crc=0 跳过校验；输入 s 跳过该条真实 CRC 替换: ").strip().lower()
-                    if choice in {"0", ""}:
-                        row["m_Crc"] = 0
-                        changed += 1
-                        break
-                    if choice in {"s", "skip"}:
-                        for key in (
-                            "m_Hash",
-                            "m_Crc",
-                            "m_Timeout",
-                            "m_ChunkedTransfer",
-                            "m_RedirectLimit",
-                            "m_RetryCount",
-                            "m_BundleName",
-                            "m_AssetLoadMode",
-                            "m_BundleSize",
-                            "m_UseCrcForCachedBundles",
-                            "m_UseUWRForLocalBundles",
-                            "m_ClearOtherCachedVersionsWhenLoaded",
-                        ):
-                            if key in original_runtime:
-                                row[key] = original_runtime[key]
-                        skipped += 1
-                        break
-                    print("请输入 0 或 s。")
-            output_json.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"[catalog] 长度溢出处理完成: 置0={changed}, 跳过={skipped}")
-
-        result_path = repack_expanded_catalog(output_json, final_catalog_path, crc_overflow="error")
-    except Exception as exc:
-        print(f"[catalog] 真实 CRC 修正失败: {exc}")
-        return
-
-    print(f"[catalog] 已按真实 CRC 修正 Output.json: size={size_updates}, crc={crc_updates}")
-    print(f"[catalog] Output.json 自动修正前备份: {backup_path}")
-    print(f"[catalog] 已回打 catalog 并输出到: {result_path}")
+    print(f"\033[92m[脚本产物清理] 已删除 {len(removed)} 个清单目标。\033[0m")
 
 
 def main() -> int:
     if len(sys.argv) > 1:
         command = sys.argv[1].strip().lower()
-        if command in {"clear-empty-mesh", "clear-mesh", "empty-mesh"}:
-            return run_clear_empty_mesh_cli(sys.argv[2:])
-        if command in {"replace-empty-mesh", "empty-mesh", "replace-mesh"}:
-            return run_replace_empty_mesh_cli(sys.argv[2:])
         if command in {"resend-ai-batch", "ai-batch-resend"}:
             if len(sys.argv) < 3:
                 print(f"用法: python {Path(__file__).name} resend-ai-batch <ai_translation_request_batch_XXX.json>")
@@ -1405,47 +2541,34 @@ def main() -> int:
         if command in {"clean-unsupported-ttf-chars", "clean-ttf-chars"}:
             run_clean_unsupported_ttf_chars()
             return 0
-        if command in {"clean-blacklisted-records", "clean-records-blacklist"}:
-            run_clean_blacklisted_records()
+        if command in {"clean-script-outputs", "clean-step-outputs"}:
+            run_clean_script_outputs()
             return 0
-        if command in {"sync-generated-sdf-material", "sync-sdf-material"}:
-            run_sync_generated_tmp_material_parameters()
+        if command in {"clean-trans-maybe-title", "clean-maybe-title"}:
+            run_remove_maybe_titles_from_trans()
             return 0
-        if command in {"clean-all-text-effects", "clean-all-tmp-effects"}:
-            run_clean_all_text_effect_materials()
+        if command in {"block-image-objects", "block-objects-by-image"}:
+            run_block_objects_by_image()
             return 0
-        if command in {"parse-catalog", "catalog"}:
-            run_parse_catalog()
+        if command in {"restore-blocked-objects", "undo-blocked-objects"}:
+            run_restore_blocked_objects()
             return 0
-        if command in {"repack-catalog", "pack-catalog"}:
-            cfg = load_config()
-            output_json = Path(sys.argv[2]) if len(sys.argv) >= 3 else cfg.result_dir / "catalog" / "Output.json"
-            destination = Path(sys.argv[3]) if len(sys.argv) >= 4 else cfg.result_dir / "catalog" / "catalog.repacked.json"
-            try:
-                result_path = repack_expanded_catalog(output_json, destination)
-            except Exception as exc:
-                print(f"[catalog] 回打失败: {exc}")
-                return 1
-            print(f"[catalog] 已生成可导入 catalog: {result_path}")
+        if command in {"split-sprite-atlases", "split-sprites"}:
+            run_split_sprite_atlases()
             return 0
-        if command in {"auto-patch-catalog", "patch-catalog"}:
-            run_auto_patch_catalog()
+        if command in {"restore-records-by-field", "restore-field"}:
+            run_restore_records_by_field()
             return 0
-        if command in {"patch-catalog-real-crc", "real-crc-catalog"}:
-            run_patch_catalog_real_crc_interactive()
+        if command in {"block-mesh-objects", "block-objects-by-mesh"}:
+            run_block_objects_by_mesh()
             return 0
         print(f"未知命令: {sys.argv[1]}")
-        print(f"用法: python {Path(__file__).name} clear-empty-mesh <要清空的Mesh目录>")
-        print(f"或: python {Path(__file__).name} replace-empty-mesh <要替换的目录> <空mesh文件>")
-        print(f"或: python {Path(__file__).name} resend-ai-batch <ai_translation_request_batch_XXX.json>")
+        print(f"用法: python {Path(__file__).name} resend-ai-batch <ai_translation_request_batch_XXX.json>")
+        print(f"或: python {Path(__file__).name} patch-ai-batch <ai_translation_request_batch_XXX.json>")
+        print(f"或: python {Path(__file__).name} resend-and-patch-ai-batch <ai_translation_request_batch_XXX.json>")
         print(f"或: python {Path(__file__).name} clean-unsupported-ttf-chars")
-        print(f"或: python {Path(__file__).name} clean-blacklisted-records")
-        print(f"或: python {Path(__file__).name} sync-generated-sdf-material")
-        print(f"或: python {Path(__file__).name} clean-all-text-effects")
-        print(f"或: python {Path(__file__).name} parse-catalog")
-        print(f"或: python {Path(__file__).name} repack-catalog [Output.json] [catalog.repacked.json]")
-        print(f"或: python {Path(__file__).name} auto-patch-catalog")
-        print(f"或: python {Path(__file__).name} patch-catalog-real-crc")
+        print(f"或: python {Path(__file__).name} clean-script-outputs")
+        print(f"或: python {Path(__file__).name} clean-trans-maybe-title")
         return 1
 
     while True:
@@ -1457,17 +2580,15 @@ def main() -> int:
         print("4. 一键复制导出图片到 workspace/AllPNG")
         print("5. 从修改后的图片目录恢复结构到 Image/ToImport")
         print("6. Unity 资源兼容性/导出状态检查")
-        print("7. 清空成空 Mesh")
-        print("8. 快捷替换空 Mesh（旧方式）")
-        print("9. AI 翻译单批补跑 / 修补 trans.json")
-        print("10. 清理 trans.json 中模板 TTF 不支持的字符")
-        print("11. 解析 Addressables catalog 到 workspace/output/catalog")
-        print("12. 将 Output.json 回打成原始 catalog 格式")
-        print("13. 按最终 Bundle 自动修正并回打 catalog（CRC 置 0）")
-        print("14. 按最终 Bundle 真实 CRC 修正 catalog（长度溢出时询问）")
-        print("15. 清理 records.json 中当前黑名单字段，并同步清理 trans.json")
-        print("16. 同步生成字体的 SDF 材质参数到待导入目录（可选实验）")
-        print("17. 清理全部 TMP 阴影/描边/发光材质")
+        print("7. AI 翻译单批补跑 / 修补 trans.json")
+        print("8. 清理 trans.json 中模板 TTF 不支持的字符")
+        print("9. 按脚本产物清单清理指定脚本生成的文件")
+        print("10. 按 trans_maybe_title.json 清理 trans.json")
+        print("11. 按图片定位对象并选择层级屏蔽")
+        print("12. 撤销已记录的对象屏蔽")
+        print("13. 按 Sprite 数据拆分 Texture2D 图集")
+        print("14. 从完整备份按字段恢复 records，并补译到 trans")
+        print("15. 按 Mesh 定位对象并选择层级屏蔽")
         print("q. 退出")
         try:
             choice = prompt_input("请选择: ").strip().lower()
@@ -1493,42 +2614,36 @@ def main() -> int:
             run_compatibility_check()
             continue
         if choice == "7":
-            run_clear_empty_mesh()
-            continue
-        if choice == "8":
-            run_replace_empty_mesh()
-            continue
-        if choice == "9":
             run_ai_translation_batch_menu()
             continue
-        if choice == "10":
+        if choice == "8":
             run_clean_unsupported_ttf_chars()
             continue
-        if choice == "15":
-            run_clean_blacklisted_records()
+        if choice == "9":
+            run_clean_script_outputs()
             continue
-        if choice == "16":
-            run_sync_generated_tmp_material_parameters()
-            continue
-        if choice == "17":
-            run_clean_all_text_effect_materials()
+        if choice == "10":
+            run_remove_maybe_titles_from_trans()
             continue
         if choice == "11":
-            run_parse_catalog()
+            run_block_objects_by_image()
             continue
         if choice == "12":
-            run_repack_catalog()
+            run_restore_blocked_objects()
             continue
         if choice == "13":
-            run_auto_patch_catalog()
+            run_split_sprite_atlases()
             continue
         if choice == "14":
-            run_patch_catalog_real_crc_interactive()
+            run_restore_records_by_field()
+            continue
+        if choice == "15":
+            run_block_objects_by_mesh()
             continue
         if choice in {"q", "quit", "exit"}:
             return 0
 
-        print("无效选择，请输入 1、2、3、4、5、6、7、8、9、10、11、12、13、14、15、16、17 或 q。")
+        print("无效选择，请输入 1-15 或 q。")
     return 0
 
 

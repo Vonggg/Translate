@@ -13,6 +13,7 @@ from typing import Any
 from support.config import PipelineConfig
 from .catalog_tools import parse_catalog_to_output
 from .split_bundle import find_split_bundle_groups, merge_split_bundle_group
+from tools.catalog_bin_tool import repack_binary_catalog_from_legacy_output
 
 
 REMOTE_PLACEHOLDER_RE = re.compile(r"\{[^}]*RemoteLoadPath[^}]*\}", re.IGNORECASE)
@@ -217,6 +218,8 @@ def _local_internal_id(relative_path: Path) -> str:
 def _localize_downloaded_catalog_resources(
     cfg: PipelineConfig,
     catalog: dict[str, Any],
+    *,
+    modify_source_catalog: bool,
 ) -> list[dict[str, str]]:
     internal_ids = catalog.get("m_InternalIds")
     if not isinstance(internal_ids, list):
@@ -248,28 +251,114 @@ def _localize_downloaded_catalog_resources(
         return []
 
     catalog_path = cfg.catalog_source_path
-    temp_path = catalog_path.with_name(catalog_path.name + ".localize.tmp")
-    temp_path.write_text(json.dumps(catalog, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    temp_path.replace(catalog_path)
+    output_path = cfg.result_dir / "catalog" / "Output.json"
+    if catalog_path.suffix.lower() == ".bin":
+        entry_field = catalog.get("m_EntryDataString")
+        locations = entry_field.get("locations") if isinstance(entry_field, dict) else None
+        if not isinstance(locations, list):
+            raise RuntimeError(
+                "binary Output.json 缺少 m_EntryDataString.locations"
+            )
+        replacements = {
+            row["remote_internal_id"]: row["local_internal_id"]
+            for row in changes
+        }
+        location_changes = 0
+        for location in locations:
+            if not isinstance(location, dict):
+                continue
+            current = location.get("InternalId")
+            replacement = replacements.get(current)
+            if replacement is None:
+                continue
+            location["InternalId"] = replacement
+            location_changes += 1
+        if location_changes == 0:
+            raise RuntimeError(
+                "binary catalog 中没有定位到需要本地化的 ResourceLocation"
+            )
+
+        output_temp = output_path.with_name(output_path.name + ".localize.tmp")
+        output_temp.parent.mkdir(parents=True, exist_ok=True)
+        output_temp.write_text(
+            json.dumps(catalog, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        try:
+            output_temp.replace(output_path)
+        finally:
+            if output_temp.exists():
+                output_temp.unlink()
+
+        if modify_source_catalog:
+            catalog_temp = catalog_path.with_name(catalog_path.name + ".localize.tmp")
+            hash_path = catalog_path.with_suffix(".hash")
+            hash_temp = hash_path.with_name(hash_path.name + ".localize.tmp")
+            try:
+                repack_binary_catalog_from_legacy_output(
+                    catalog_path,
+                    output_path,
+                    catalog_temp,
+                    hash_temp,
+                )
+                catalog_temp.replace(catalog_path)
+                hash_temp.replace(hash_path)
+            finally:
+                for temporary in (catalog_temp, hash_temp):
+                    if temporary.exists():
+                        temporary.unlink()
+    else:
+        if output_path.is_file():
+            expanded = json.loads(output_path.read_text(encoding="utf-8-sig"))
+            expanded_internal_ids = expanded.get("m_InternalIds")
+            if isinstance(expanded_internal_ids, list):
+                for change in changes:
+                    index = int(change["index"])
+                    if 0 <= index < len(expanded_internal_ids):
+                        expanded_internal_ids[index] = change["local_internal_id"]
+                _write_json(output_path, expanded)
+
+        if modify_source_catalog:
+            temp_path = catalog_path.with_name(catalog_path.name + ".localize.tmp")
+            temp_path.write_text(
+                json.dumps(catalog, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temp_path.replace(catalog_path)
     return changes
 
 
 def inspect_and_download_catalog_resources(cfg: PipelineConfig) -> bool:
     catalog_path = cfg.catalog_source_path
     if not catalog_path.is_file():
+        report_path = remote_resource_report_path(cfg)
+        if report_path.exists():
+            report_path.unlink()
         print(f"[catalog] 未找到 catalog，跳过远程资源检查: {catalog_path}")
         return True
 
     print(f"[catalog] 导出前解析: {catalog_path}")
-    try:
-        catalog = json.loads(catalog_path.read_text(encoding="utf-8-sig"))
-    except Exception as exc:
-        print(f"[catalog][停止] catalog JSON 读取失败: {exc}")
-        return False
-    try:
-        parse_catalog_to_output(cfg)
-    except Exception as exc:
-        print(f"[catalog][提示] catalog 四字段展开失败，仍继续检查 m_InternalIds: {exc}")
+    if catalog_path.suffix.lower() == ".bin":
+        try:
+            _raw_path, output_path = parse_catalog_to_output(
+                cfg,
+                catalog_path,
+                cfg.result_dir / "catalog",
+            )
+            catalog = json.loads(output_path.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            _log_red(f"[catalog.bin][停止] 二进制 catalog 解析失败: {exc}")
+            return False
+    else:
+        try:
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            print(f"[catalog][停止] catalog JSON 读取失败: {exc}")
+            return False
+        try:
+            parse_catalog_to_output(cfg)
+        except Exception as exc:
+            print(f"[catalog][提示] catalog 四字段展开失败，仍继续检查 m_InternalIds: {exc}")
 
     internal_ids = catalog.get("m_InternalIds")
     remote_internal_ids = [
@@ -353,7 +442,11 @@ def inspect_and_download_catalog_resources(cfg: PipelineConfig) -> bool:
         return False
 
     try:
-        localized = _localize_downloaded_catalog_resources(cfg, catalog)
+        localized = _localize_downloaded_catalog_resources(
+            cfg,
+            catalog,
+            modify_source_catalog=bool(remote_internal_ids),
+        )
     except Exception as exc:
         report["catalog_localization_error"] = str(exc)
         _write_json(report_path, report)
@@ -361,6 +454,8 @@ def inspect_and_download_catalog_resources(cfg: PipelineConfig) -> bool:
         return False
 
     report["localized_internal_ids"] = localized
+    report["localized_internal_id_count"] = len(localized)
+    report["source_catalog_modified"] = bool(localized)
     _write_json(report_path, report)
     if downloads:
         _log_green(f"[catalog] 远程资源全部下载成功: {len(downloads)} 个。")
@@ -377,10 +472,6 @@ def inspect_and_download_catalog_resources(cfg: PipelineConfig) -> bool:
     if localized:
         _log_orange(f"[源文件已修改] 已将 {len(localized)} 个远程 InternalId 改为本地 RuntimePath。")
         _log_orange(f"[源文件已修改] 已更新游戏 catalog: {catalog_path}")
-        try:
-            parse_catalog_to_output(cfg)
-        except Exception as exc:
-            print(f"[catalog][提示] 本地化后重新展开 catalog 失败: {exc}")
     return True
 
 
@@ -682,9 +773,23 @@ def print_final_addressables_sync_reminder(cfg: PipelineConfig, final_root: Path
         report = json.loads(report_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return
-    success_count = report.get("success_count") if isinstance(report, dict) else 0
-    if not isinstance(success_count, int) or isinstance(success_count, bool) or success_count <= 0:
+    if not isinstance(report, dict):
         return
+    localized_rows = report.get("localized_internal_ids")
+    localized_count = (
+        len(localized_rows)
+        if isinstance(localized_rows, list)
+        else report.get("localized_internal_id_count", 0)
+    )
+    if (
+        not isinstance(localized_count, int)
+        or isinstance(localized_count, bool)
+        or localized_count <= 0
+    ):
+        return
+    success_count = report.get("success_count", 0)
+    if not isinstance(success_count, int) or isinstance(success_count, bool):
+        success_count = 0
 
     source_aa = _addressables_root(cfg)
     expected_project_aa = (
@@ -695,7 +800,16 @@ def print_final_addressables_sync_reminder(cfg: PipelineConfig, final_root: Path
         if expected_project_aa.parent.is_dir()
         else "<实际项目目录>/assets/aa"
     )
-    _log_green(f"[导入完成] 本次已下载并本地化 {success_count} 个 Addressables 资源，位于: {source_aa}")
+    if success_count > 0:
+        _log_green(
+            f"[导入完成] 本次实际下载 {success_count} 个 Addressables 资源，"
+            f"并将 {localized_count} 个远程路径改为本地路径，资源位于: {source_aa}"
+        )
+    else:
+        _log_green(
+            f"[导入完成] 远程资源文件已存在，本次已将 {localized_count} 个 "
+            f"catalog 远程路径改为本地路径，资源位于: {source_aa}"
+        )
     _log_green("[导入完成] 推荐替换顺序:")
     _log_green(f"[导入完成] 1. 先把 {source_aa} 同步到 {target_text}")
     _log_green(f"[导入完成] 2. 再用 {final_root} 中的修改资源覆盖实际项目对应文件")

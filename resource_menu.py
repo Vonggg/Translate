@@ -16,6 +16,7 @@ from pipeline.resource_staging import (
     prepare_unified_resource_source,
     restore_imported_resource_paths,
 )
+from support.menu_selection import parse_number_ranges
 
 # The Python wrapper that calls UnityResourceCLI.
 PIPELINE_SCRIPT = Path(__file__).resolve().parent / "AssetPipeline_CLI" / "scripts" / "unity_resource_pipeline.py"
@@ -114,6 +115,11 @@ def run_pipeline(
     log_path: Path,
     replacement_root: Path | None = None,
     result_root: Path | None = None,
+    export_profile: str = "all",
+    export_workers: int = 0,
+    verbose_export_assets: bool = False,
+    import_workers: int = 0,
+    save_samples: bool = False,
 ) -> int:
     command = [
         sys.executable,
@@ -136,6 +142,15 @@ def run_pipeline(
         command.extend(["--replacement-root", str(replacement_root)])
     if result_root is not None:
         command.extend(["--result-root", str(result_root)])
+    if mode == "export":
+        command.extend(["--export-profile", export_profile])
+        command.extend(["--export-workers", str(max(0, export_workers))])
+        if verbose_export_assets:
+            command.append("--verbose-export-assets")
+    else:
+        command.extend(["--import-workers", str(max(0, import_workers))])
+        if save_samples:
+            command.append("--save-samples")
     print()
     print("Running:")
     print(" ".join(command))
@@ -215,6 +230,20 @@ def _resolve_external_asset_key(input_root: Path, manifest_dir: Path, path_name:
         candidates.append(manifest_dir / normalized_path.with_suffix(""))
         candidates.append(input_root / normalized_path.with_suffix(""))
         candidates.append(input_root / normalized_path)
+        # Scene assets commonly reference sharedassets*.assets and other files
+        # stored beside the scene in the original Data directory. Exported
+        # resources are directories without the .assets suffix, so search each
+        # ancestor of the scene export before falling back to a synthetic
+        # "<scene>/bundle/..." key.
+        for ancestor in manifest_dir.parents:
+            try:
+                ancestor.relative_to(input_root)
+            except ValueError:
+                break
+            candidates.append(ancestor / normalized_path.with_suffix(""))
+            candidates.append(ancestor / normalized_path)
+            if ancestor == input_root:
+                break
 
     if normalized.lower().startswith(("resources/", "library/")):
         parts = normalized.split("/")
@@ -354,7 +383,8 @@ def print_import_options() -> None:
     print("  2. TMP/SDF 字体替换 (workspace/output/Font/SDF/ToImport)")
     print("  3. TTF 字体替换 (workspace/output/Font/TTF/ToImport)")
     print("  4. 图片替换 (workspace/output/Image/ToImport)")
-    print("  5. 全部")
+    print("  5. Object 屏蔽 (workspace/output/Object/ToImport)")
+    print("  a. 全部")
     print("  q. 取消")
     print()
     print("提示: 可以一次输入多个编号，用逗号分隔，例如 2,3,4。")
@@ -373,10 +403,18 @@ def _merge_tree(source_root: Path, destination_root: Path, label: str = "") -> i
         print(f"[导入覆盖] 开始合并 {label}: {total} 个文件，{total_bytes / 1024 / 1024:.1f} MB")
 
     copied = 0
-    skipped = 0
     copied_bytes = 0
+    conflicts: list[tuple[Path, Path]] = []
     for source_path in files:
-        target_path = destination_root / source_path.relative_to(source_root)
+        relative = source_path.relative_to(source_root)
+        target_path = destination_root / relative
+        if target_path.is_file():
+            try:
+                same_content = source_path.read_bytes() == target_path.read_bytes()
+            except OSError:
+                same_content = False
+            if not same_content:
+                conflicts.append((relative, source_path))
         target_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, target_path)
         copied += 1
@@ -387,6 +425,12 @@ def _merge_tree(source_root: Path, destination_root: Path, label: str = "") -> i
                 f"{copied_bytes / 1024 / 1024:.1f}/{total_bytes / 1024 / 1024:.1f} MB",
                 flush=True,
             )
+    if conflicts:
+        print(f"[导入覆盖][警告] {label or source_root.name} 覆盖了已有不同内容文件: {len(conflicts)} 个")
+        for relative, source_path in conflicts[:20]:
+            print(f"[导入覆盖][警告] {relative} <- {source_path}")
+        if len(conflicts) > 20:
+            print(f"[导入覆盖][警告] 还有 {len(conflicts) - 20} 个冲突未显示。")
     return copied
 
 
@@ -577,6 +621,10 @@ def build_import_overlay(cfg, selection: set[str]) -> Path | None:
         image_count = _merge_tree(cfg.image_import_dir, overlay_root, "图片")
         copied_counts.append(f"图片={image_count}")
 
+    if "object" in selection:
+        object_count = _merge_tree(cfg.object_import_dir, overlay_root, "Object")
+        copied_counts.append(f"Object={object_count}")
+
     total_files = sum(1 for _ in overlay_root.rglob("*") if _.is_file())
     if total_files == 0:
         shutil.rmtree(overlay_root)
@@ -643,7 +691,8 @@ def prompt_import_selection() -> set[str] | None:
         "2": {"tmp"},
         "3": {"ttf"},
         "4": {"image"},
-        "5": {"text", "tmp", "ttf", "image"},
+        "5": {"object"},
+        "a": {"text", "tmp", "ttf", "image", "object"},
     }
     for code in selected_codes:
         if code not in mapping:
@@ -659,12 +708,35 @@ def print_menu() -> None:
     print("q. 退出")
     print()
     print("说明:")
-    print("  导出: 先解析 catalog 并补齐可自动定位的远程资源，再汇总 aa/Android 与 bin/Data")
+    print("  导出: 自动解析 catalog.json/catalog.bin 并补齐可定位的远程资源，再汇总 aa/Android 与 bin/Data")
     print("        每次重建 workspace/input_sources；split 只在暂存区自动合并，不修改原游戏目录")
     print("        导出成功后会在 workspace\\records\\file_id_map.json 记录各资源文件的 FileID 外部依赖映射")
     print("  导入: 使用导出时的统一资源暂存区，并按记录恢复 aa/Android 与 bin/Data 原始路径")
+    print("        catalog 输出到 FinalResult/Bundle；远程路径改为本地路径时同步覆盖源 catalog/hash")
     print("        修改过的 split 会额外输出到 FinalResult\\SplitBundles，并以蓝色提示必须同步替换")
     print()
+
+
+def prompt_export_profile() -> str | None:
+    print("导出内容:")
+    print("  1. 基础资源：图片、字体、文本、材质及 MonoBehaviour")
+    print("  2. 对象索引：Sprite、GameObject、Transform、RectTransform、SpriteRenderer")
+    print("  3. Mesh 索引：Mesh、MeshFilter、SkinnedMeshRenderer；通常同时选择 2")
+    print("  a. 全部")
+    print("  q. 取消")
+    print("说明: 图集拆分同时需要基础档的 Texture2D 和对象档的 Sprite 数据。")
+    raw = prompt_input("请选择导出内容，支持 1、2、3、1-3 或 a: ").strip().lower()
+    if raw in {"q", "quit", "exit"}:
+        return None
+    if raw == "a":
+        return "all"
+    try:
+        selected = set(parse_number_ranges(raw, {1, 2, 3}))
+    except ValueError as exc:
+        print(f"\033[91m[导出选择] {exc}\033[0m")
+        return ""
+    profile_names = {1: "basic", 2: "objects", 3: "mesh"}
+    return "+".join(profile_names[index] for index in sorted(selected))
 
 
 def main() -> int:
@@ -679,6 +751,12 @@ def main() -> int:
         print_menu()
         choice = prompt_input("请选择: ").strip().lower()
         if choice == "1":
+            export_profile = prompt_export_profile()
+            if export_profile is None:
+                print("已取消导出。")
+                return 0
+            if not export_profile:
+                return 1
             root = workspace_root(cfg)
             if _has_entries(root):
                 confirm = prompt_input(
@@ -696,7 +774,16 @@ def main() -> int:
             if source_root is None:
                 return 1
             prepare_managed_dlls(cfg)
-            result = run_pipeline("export", source_root, input_root, managed_root, log_dir / "一键导出.log")
+            result = run_pipeline(
+                "export",
+                source_root,
+                input_root,
+                managed_root,
+                log_dir / "一键导出.log",
+                export_profile=export_profile,
+                export_workers=cfg.max_export_workers,
+                verbose_export_assets=cfg.verbose_export_assets,
+            )
             if result == 0:
                 build_file_id_map(cfg)
                 print_monobehaviour_export_summary(input_root)
@@ -712,7 +799,7 @@ def main() -> int:
                 print()
                 return 0
             if not selection:
-                print("无效选择，请重新运行并输入 1、2、3、4、5 或 q。")
+                print("无效选择，请重新运行并输入 1、2、3、4、5、a 或 q。")
                 print()
                 return 1
             replacement_root = build_import_overlay(cfg, selection)
@@ -735,6 +822,8 @@ def main() -> int:
                 log_dir / "一键导入.log",
                 replacement_root,
                 import_result_root,
+                import_workers=cfg.max_import_workers,
+                save_samples=cfg.enable_sample_collection,
             )
             if result == 0:
                 restored_paths = restore_imported_resource_paths(cfg, import_result_root)

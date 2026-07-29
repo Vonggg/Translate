@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import sys
 
 from support.config import load_config
+from support.menu_selection import parse_number_ranges
 from pipeline.font_ttf import build_ttf_replacements
 from pipeline.manifest_index import tmp_manifest_index_path
 from pipeline.tmp_pipeline import (
@@ -139,12 +141,12 @@ def _clear_stale_unity_lock(cfg) -> bool:
     return True
 
 
-def _run_sdf_finalize_in_fresh_process(cfg) -> int:
+def _run_unity_tmp_generation(cfg) -> int:
     tmp_chars_path = existing_tmp_chars_path(cfg)
     if tmp_chars_path is None:
         return 1
 
-    print(f"[TMP] 独立进程使用字符文件: {tmp_chars_path}")
+    print(f"[TMP] 使用字符文件: {tmp_chars_path}")
     result = launch_unity_tmp_generator(cfg, tmp_chars_path)
     if result != 0 and _is_unity_startup_crash(cfg, result):
         print(
@@ -155,9 +157,14 @@ def _run_sdf_finalize_in_fresh_process(cfg) -> int:
             return 1
         result = launch_unity_tmp_generator(cfg, tmp_chars_path)
 
+    return result
+
+
+def _run_sdf_finalize_in_fresh_process(cfg) -> int:
+    result = _run_unity_tmp_generation(cfg)
     if result != 0:
         print(f"[TMP][停止] Unity TMP 字体生成失败，返回码={result}；不会继续执行步骤 9。")
-        return 1
+        return result
 
     prepare_generated_tmp_import_replacements(cfg)
     log_step_completed("8-9（Unity TMP 字体与待导入替换）")
@@ -171,51 +178,66 @@ def _run_noninteractive_step(cfg, step: str) -> int:
         return finish_step(step, apply_ai_field_selection_to_records(cfg) or 0)
     if step == "2":
         return finish_step(step, translate_from_scan_records(cfg) or 0)
+    if step == "3":
+        return finish_step(step, rebuild_game_text_outputs(cfg) or 0)
     if step == "4":
         return finish_step(step, export_translated_files(cfg) or 0)
     if step == "5":
-        return finish_step(step, disable_translated_text_effect_components(cfg) or 0)
+        return finish_step(
+            step,
+            disable_translated_text_effect_components(
+                cfg,
+                include_i2_bound_materials=True,
+                write_material_overlays=False,
+            )
+            or 0,
+        )
     if step == "6":
         build_ttf_replacements(cfg)
         return finish_step(step, 0)
     if step == "7":
         build_merged_tmp_chars(cfg)
         return finish_step(step, 0)
+    if step == "8":
+        return finish_step(step, _run_unity_tmp_generation(cfg))
+    if step == "9":
+        prepare_generated_tmp_import_replacements(cfg)
+        return finish_step(step, 0)
     print(f"[全部执行][停止] 不支持的内部步骤: {step}")
     return 1
 
 
-def _run_full_pipeline_in_isolated_processes(cfg) -> int:
+def _run_steps_in_isolated_processes(cfg, steps: list[str], label: str) -> int:
     script_path = Path(__file__).resolve()
-    steps = ["0"]
-    if cfg.enable_ai_field_review:
-        steps.append("1")
-    steps.extend(["2", "4", "5", "6", "7"])
+    child_env = dict(os.environ)
+    child_env["TRANSLATE_SUPPRESS_UNITY_CONFIG_NOTICE"] = "1"
 
     for index, step in enumerate(steps, start=1):
-        print(f"[全部执行] 启动独立步骤 {step}（{index}/{len(steps)}）")
+        print(f"[{label}] 启动独立步骤 {step}（{index}/{len(steps)}）")
         sys.stdout.flush()
         result = subprocess.run(
             [sys.executable, str(script_path), RUN_STEP_ARGUMENT, step],
             cwd=str(cfg.root_dir),
+            env=child_env,
         )
         if result.returncode != 0:
-            print(f"[全部执行][停止] 步骤 {step} 失败，返回码={result.returncode}。")
+            print(f"[{label}][停止] 步骤 {step} 失败，返回码={result.returncode}。")
             return 1
-        print(f"\033[92m[全部执行] 步骤 {step} 已完成（{index}/{len(steps)}）。\033[0m", flush=True)
-
-    print("[全部执行] 步骤 0-7 已完成，启动独立进程执行步骤 8 和步骤 9。")
-    sys.stdout.flush()
-    result = subprocess.run(
-        [sys.executable, str(script_path), SDF_FINALIZE_ARGUMENT],
-        cwd=str(cfg.root_dir),
-    )
-    if result.returncode != 0:
-        print(f"[全部执行][停止] 步骤 8-9 失败，返回码={result.returncode}。")
-        return 1
-    print("\033[92m[全部执行] 步骤 8-9 已完成。\033[0m", flush=True)
-    log_step_completed("10（全部执行）")
+        print(f"\033[92m[{label}] 步骤 {step} 已完成（{index}/{len(steps)}）。\033[0m", flush=True)
     return 0
+
+
+def _run_full_pipeline_in_isolated_processes(cfg) -> int:
+    steps = ["0"]
+    if cfg.enable_ai_field_review:
+        steps.append("1")
+    else:
+        print("\033[94m[全部执行] enable_ai_field_review=false，跳过步骤 1。\033[0m")
+    steps.extend(["2", "3", "4", "5", "6", "7", "8", "9"])
+    result = _run_steps_in_isolated_processes(cfg, steps, "全部执行")
+    if result == 0:
+        log_step_completed("a（全部执行）")
+    return result
 
 
 def print_menu() -> None:
@@ -238,21 +260,24 @@ def print_menu() -> None:
     print("  4: 读取 records.json 和 trans.json；只处理 trans.json 命中的待汉化源 JSON；")
     print("     把翻译写入 workspace/input 的资源副本结构，输出到 workspace/output/Text。")
     print("     同时生成 runtime_text_binding_report.json，记录 I2/Localization 等无法静态关联材质的运行时文本来源。")
-    print("  5: 根据 records.json 的译文 GameObject、ref_map.json 被引用表和 path_id_map.json；")
-    print("     找到同物体上的 Shadow/Outline 组件，输出屏蔽后的 JSON 到 workspace/output/Text。")
-    print("     若脚本 4 报告中存在已翻译的运行时文本来源，会询问是否一并清理全部 TMP 效果材质。")
+    print("  5: 根据 records.json、material_map.json 和译文使用关系定位文本组件；")
+    print("     只清理译文和 I2 文本同 GameObject 上额外挂载的 Shadow/Outline 组件，输出到 workspace/output/Text。")
+    print("     TMP 字体材质阴影/描边参数已合并到步骤 9 的 SDF 导入覆盖层中统一处理。")
     print("  6: 读取导出的 Legacy TTF/OTF 信息和固定模板字体；")
     print("     生成 workspace/output/Font/TTF/ToImport 下的 TTF 待导入替换文件。")
     print("  7: 检查 trans.json 译文字符是否被模板 TTF 和老工具 SDF 模板支持；")
     print("     模板 TTF 缺译文字符会输出 translation_chars_missing_from_ttf.tsv 并停止；")
     print("     老工具 SDF 模板缺译文字符只输出提示文件，不中断后续流程。")
-    print("     再合并原游戏字体字符、译文字符、模板 TTF 非中文字符和老工具 SDF 模板全部字符，")
+    print("     再合并原游戏字体字符、译文字符、模板 TTF 非中文字符；")
+    print("     仅当 include_old_sdf_template_chars=true 时额外合并老工具 SDF 模板全部字符，")
     print("     删除模板 TTF 不支持字符后生成 tmp_chars.txt。")
     print("  8: 读取 tmp_chars.txt；调用 Unity 辅助工程生成 TMP/SDF 字体资源；")
     print("     输出 workspace/output/Font/SDF/generated_templates/generated_tmp_font.*。")
     print("  9: 读取脚本 8 已生成的 generated_tmp_font.json/png 和脚本 0 的字体索引；")
-    print("     生成 workspace/output/Font/SDF/ToImport 下真正准备导入替换的 TMP/SDF 文件。")
-    print("  10: 依次执行 0 -> 1(仅 AI 模式) -> 2 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9。")
+    print("     对索引中的全部候选做 TMP FontAsset 结构校验，不按 font_map 排除运行时字体，")
+    print("     输出 workspace/output/Font/SDF/ToImport 下真正准备导入的 TMP/SDF 文件。")
+    print("  a: 依次执行 0 -> 1(仅 AI 模式) -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9。")
+    print("     支持 1-2、4-7 或 0,2,4-9 等连续/组合输入。")
     print()
     print("菜单:")
     print("0. 扫描导出的 JSON，生成文本、字体、材质、引用索引")
@@ -260,12 +285,12 @@ def print_menu() -> None:
     print("2. 根据扫描记录翻译")
     print("3. 从 trans.json 重建 game.txt 和 game_chars.txt")
     print("4. 导出翻译后的待替换 JSON")
-    print("5. 屏蔽译文文本同物体上的阴影/描边组件")
+    print("5. 清理译文/I2 文本额外挂载的阴影/描边组件")
     print("6. 生成 TTF 替换字体")
     print("7. 合并 TMP 字符并提示新增字符")
     print("8. 生成 Unity TMP 字体")
     print("9. 根据已生成 TMP 字体准备导入替换文件")
-    print("10. 全部执行")
+    print("a. 全部执行")
     print("q. 退出")
     print()
 
@@ -283,40 +308,24 @@ def main() -> int:
         print_menu()
         choice = prompt_input("请选择: ").strip().lower()
 
-        if choice == "0":
-            maybe_clean_scan_records(cfg)
-            return _run_noninteractive_step(cfg, "0")
-        if choice == "1":
-            return _run_noninteractive_step(cfg, "1")
-        if choice == "2":
-            return _run_noninteractive_step(cfg, "2")
-        if choice == "3":
-            return finish_step("3", rebuild_game_text_outputs(cfg) or 0)
-        if choice == "4":
-            return _run_noninteractive_step(cfg, "4")
-        if choice == "5":
-            return _run_noninteractive_step(cfg, "5")
-        if choice == "6":
-            return _run_noninteractive_step(cfg, "6")
-        if choice == "7":
-            return _run_noninteractive_step(cfg, "7")
-        if choice == "8":
-            tmp_chars_path = existing_tmp_chars_path(cfg)
-            if tmp_chars_path is None:
-                return 1
-            print(f"[TMP] 使用已生成字符文件: {tmp_chars_path}")
-            return finish_step("8", launch_unity_tmp_generator(cfg, tmp_chars_path))
-        if choice == "9":
-            prepare_generated_tmp_import_replacements(cfg)
-            return finish_step("9", 0)
-        if choice == "10":
+        if choice == "a":
             maybe_clean_scan_records(cfg)
             return _run_full_pipeline_in_isolated_processes(cfg)
         if choice in {"q", "quit", "exit"}:
             return 0
 
-        print("无效选择，请输入 0、1、2、3、4、5、6、7、8、9、10 或 q。")
-        print()
+        try:
+            steps = parse_number_ranges(choice, set(range(10)))
+        except ValueError as exc:
+            print(f"无效选择: {exc}。请输入 0-9、1-2、逗号组合、a 或 q。")
+            print()
+            continue
+
+        if "0" in steps:
+            maybe_clean_scan_records(cfg)
+        if len(steps) == 1:
+            return _run_noninteractive_step(cfg, steps[0])
+        return _run_steps_in_isolated_processes(cfg, steps, "连续执行")
 
 
 if __name__ == "__main__":

@@ -97,14 +97,16 @@ def _sdf_replacement_summary_path(cfg: PipelineConfig) -> Path:
     return cfg.stage_dir / "Font" / "SDF" / "tmp_font_replacements.json"
 
 
-def _estimate_sdf_atlas_size_for_auto_point_size(visible_char_count: int, padding: int) -> int:
-    # Conservative capacity estimate for pointSize around 30 with fixed padding.
+def _estimate_sdf_atlas_size_for_auto_point_size(visible_char_count: int, padding: int, max_atlas_size: int = 8192) -> int:
+    # Keep enough sampling resolution for dense CJK glyphs with fixed padding.
     # Unity still uses Auto Sizing; this only chooses a reasonable atlas tier.
     if visible_char_count <= 1200:
-        return 2048
-    if visible_char_count <= 4800:
-        return 4096
-    return 8192
+        estimated = 2048
+    elif visible_char_count <= 3000:
+        estimated = 4096
+    else:
+        estimated = 8192
+    return min(estimated, max(1024, int(max_atlas_size or 8192)))
 
 
 def _log_green(message: str) -> None:
@@ -320,7 +322,7 @@ def _report_translation_chars_missing_from_ttf(
     if stop_on_missing:
         _log_red(f"[TMP][停止] 请先修改 trans.json 中对应译文，或更换包含这些字符的{label}，然后重新执行菜单 7。")
         if output_prefix == "translation_chars_missing_from_ttf":
-            print("[TMP][提示] 可运行 工具脚本.py -> 10. 清理 trans.json 中模板 TTF 不支持的字符。", flush=True)
+            print("[TMP][提示] 可运行 工具脚本.py -> 8. 清理 trans.json 中模板 TTF 不支持的字符。", flush=True)
             print(f"[TMP][提示] 命令行: python {cfg.root_dir / '工具脚本.py'} clean-unsupported-ttf-chars", flush=True)
     else:
         print(f"[TMP][提示] 这只影响{label}兼容性，不中断当前菜单 7 后续流程。", flush=True)
@@ -342,6 +344,12 @@ def _filter_merged_chars_by_ttf_support(
     if supported is None:
         return chars, ""
 
+    source_label = (
+        "模板 TTF 非中文字符 + "
+        f"{'老工具 SDF 模板字符 + ' if cfg.include_old_sdf_template_chars else ''}"
+        "原游戏字体字符 + 译文字符"
+    )
+
     kept: list[str] = []
     missing: list[str] = []
     for char in unique_preserve_order(chars):
@@ -360,7 +368,7 @@ def _filter_merged_chars_by_ttf_support(
         ):
             if stale_path.exists():
                 stale_path.unlink()
-        print("[TMP] 模板 TTF 非中文字符 + 老工具 SDF 模板字符 + 原游戏字体字符 + 译文字符均被模板 TTF 覆盖。", flush=True)
+        print(f"[TMP] {source_label}均被模板 TTF 覆盖。", flush=True)
         return "".join(kept), ""
 
     missing_path = cfg.stage_record_dir / "merged_chars_removed_unsupported_by_ttf.txt"
@@ -371,7 +379,7 @@ def _filter_merged_chars_by_ttf_support(
         "\n".join(["code\tchar", *(f"U+{ord(char):04X}\t{char}" for char in missing_text)]),
         encoding="utf-8",
     )
-    print(f"[TMP] 模板 TTF 非中文字符 + 老工具 SDF 模板字符 + 原游戏字体字符 + 译文字符中有 {len(missing_text)} 个字符不被模板 TTF 支持，已从 tmp_chars.txt 候选字符中删除。", flush=True)
+    print(f"[TMP] {source_label}中有 {len(missing_text)} 个字符不被模板 TTF 支持，已从 tmp_chars.txt 候选字符中删除。", flush=True)
     print(f"[TMP] 删除字符清单: {missing_path}", flush=True)
     print(f"[TMP] 删除字符详情: {missing_detail_path}", flush=True)
     return filtered, missing_text
@@ -488,9 +496,17 @@ def build_merged_tmp_chars(cfg: PipelineConfig) -> Path:
     if missing_translation_chars:
         raise SystemExit(1)
     template_non_chinese_chars = _non_chinese_chars_from_supported_ttf(supported_ttf_chars)
-    old_sdf_template_chars = _chars_from_supported_codepoints(supported_old_sdf_chars)
+    all_old_sdf_template_chars = _chars_from_supported_codepoints(supported_old_sdf_chars)
+    old_sdf_template_chars = all_old_sdf_template_chars if cfg.include_old_sdf_template_chars else ""
     print(f"[TMP] 模板 TTF 非中文字符: {len(template_non_chinese_chars)} 个，将参与 tmp_chars.txt 合并。", flush=True)
-    print(f"[TMP] 老工具 SDF 模板字符: {len(old_sdf_template_chars)} 个，将参与 tmp_chars.txt 合并。", flush=True)
+    if cfg.include_old_sdf_template_chars:
+        print(f"[TMP] 老工具 SDF 模板字符: {len(old_sdf_template_chars)} 个，将参与 tmp_chars.txt 合并。", flush=True)
+    else:
+        print(
+            f"[TMP] 老工具 SDF 模板字符: {len(all_old_sdf_template_chars)} 个；"
+            "配置 include_old_sdf_template_chars=false，跳过合并。",
+            flush=True,
+        )
     old_tmp_chars = collect_tmp_chars_from_resource_input(cfg)
     if old_tmp_chars:
         print(f"[TMP] 已从资源导出目录提取原 TMP 字符: {len(old_tmp_chars)} 个", flush=True)
@@ -508,7 +524,10 @@ def build_merged_tmp_chars(cfg: PipelineConfig) -> Path:
     output_path = cfg.stage_record_dir / cfg.output_tmp_chars_txt
     output_path.write_text(merged, encoding="utf-8")
     print(
-        f"[TMP] 模板 TTF 非中文字符 + 老工具 SDF 模板字符 + 原游戏字体字符 + 译文字符: {merged_before_filter_count} 个；写入 tmp_chars.txt: {len(merged)} 个；删除模板 TTF 不支持字符: {len(missing_from_ttf)} 个",
+        f"[TMP] 模板 TTF 非中文字符 + "
+        f"{'老工具 SDF 模板字符 + ' if cfg.include_old_sdf_template_chars else ''}"
+        f"原游戏字体字符 + 译文字符: {merged_before_filter_count} 个；"
+        f"写入 tmp_chars.txt: {len(merged)} 个；删除模板 TTF 不支持字符: {len(missing_from_ttf)} 个",
         flush=True,
     )
     if added_chars:
@@ -558,54 +577,77 @@ def _is_tmp_font_asset(data: Any) -> bool:
     )
 
 
+def _merge_generated_font_data(generated: Any, original: Any) -> Any:
+    """Overlay generated values while retaining fields only the game asset has."""
+    if not isinstance(generated, dict) or not isinstance(original, dict):
+        return copy.deepcopy(generated)
+
+    merged = copy.deepcopy(original)
+    for key, generated_value in generated.items():
+        if key in original:
+            merged[key] = _merge_generated_font_data(generated_value, original[key])
+    return merged
+
+
 def _build_tmp_font_replacement(template: dict[str, Any], old: dict[str, Any]) -> dict[str, Any]:
-    # Match the older SDF import flow more closely: use the generated font as
-    # the body, then restore Unity references that must keep the original
-    # asset's PathID/GUID/material/script identity.
-    new = copy.deepcopy(template)
+    # Keep the original FontAsset as the body and patch only generated glyph
+    # data. This preserves fallback tables, source font references, face metrics,
+    # material identity and other runtime structure from the game asset.
+    new = copy.deepcopy(old)
+
     for key in (
-        "m_GameObject",
-        "m_Enabled",
-        "m_Script",
-        "m_Name",
-        "m_Version",
-        "hashCode",
-        "m_Material",
-        "material",
-        "materialHashCode",
-        "m_SourceFontFileGUID",
-        "m_SourceFontFile",
-        "m_SourceFontFilePath",
-        "m_AtlasTextureIndex",
+        "m_GlyphTable",
+        "m_CharacterTable",
+        "m_UsedGlyphRects",
+        "m_FreeGlyphRects",
+        "m_glyphInfoList",
+        "m_KerningTable",
+        "m_FontFeatureTable",
+        "m_AtlasWidth",
+        "m_AtlasHeight",
+        "m_AtlasPadding",
+        "m_AtlasRenderMode",
+        "m_IsMultiAtlasTexturesEnabled",
+        "m_ClearDynamicDataOnBuild",
     ):
-        if key in old:
-            new[key] = copy.deepcopy(old[key])
+        if key in template:
+            new[key] = _merge_generated_font_data(template[key], old.get(key))
 
-    _sync_alias_group_to_source(new, old, ("m_Material", "material"))
+    if "m_AtlasTextureIndex" in template:
+        new["m_AtlasTextureIndex"] = copy.deepcopy(template["m_AtlasTextureIndex"])
 
-    if isinstance(old.get("m_FaceInfo"), dict) and isinstance(new.get("m_FaceInfo"), dict):
+    if isinstance(template.get("m_FaceInfo"), dict) and isinstance(new.get("m_FaceInfo"), dict):
+        patched_face_info = copy.deepcopy(template["m_FaceInfo"])
         for key in ("m_FamilyName", "m_StyleName", "m_UnitsPerEM"):
             if key in old["m_FaceInfo"]:
-                new["m_FaceInfo"][key] = copy.deepcopy(old["m_FaceInfo"][key])
+                patched_face_info[key] = copy.deepcopy(old["m_FaceInfo"][key])
+        new["m_FaceInfo"] = patched_face_info
 
-    if isinstance(old.get("m_CreationSettings"), dict) and isinstance(new.get("m_CreationSettings"), dict):
-        for key in ("sourceFontFileGUID", "referencedFontAssetGUID", "referencedTextAssetGUID"):
-            if key in old["m_CreationSettings"]:
-                new["m_CreationSettings"][key] = copy.deepcopy(old["m_CreationSettings"][key])
-
-    if isinstance(old.get("atlas"), dict) and isinstance(new.get("atlas"), dict):
-        for key in ("m_FileID", "m_PathID"):
-            if key in old["atlas"]:
-                new["atlas"][key] = copy.deepcopy(old["atlas"][key])
-    elif "atlas" in old:
-        new["atlas"] = copy.deepcopy(old["atlas"])
+    if isinstance(template.get("atlas"), dict) and "atlas" in new:
+        atlas_ref = copy.deepcopy(template["atlas"])
+        if isinstance(old.get("atlas"), dict):
+            for key in ("m_FileID", "m_PathID"):
+                if key in old["atlas"]:
+                    atlas_ref[key] = copy.deepcopy(old["atlas"][key])
+        new["atlas"] = atlas_ref
 
     old_atlases = old.get("m_AtlasTextures", {}).get("Array", [])
-    new_atlases = new.get("m_AtlasTextures", {}).get("Array", [])
-    if isinstance(old_atlases, list) and old_atlases and isinstance(new_atlases, list) and new_atlases:
-        for key in ("m_FileID", "m_PathID"):
-            if isinstance(old_atlases[0], dict) and key in old_atlases[0]:
-                new_atlases[0][key] = copy.deepcopy(old_atlases[0][key])
+    template_atlases = template.get("m_AtlasTextures", {}).get("Array", [])
+    if isinstance(template_atlases, list) and template_atlases:
+        patched_atlases: list[Any] = []
+        for index, atlas in enumerate(template_atlases):
+            patched = copy.deepcopy(atlas)
+            if (
+                isinstance(old_atlases, list)
+                and index < len(old_atlases)
+                and isinstance(old_atlases[index], dict)
+                and isinstance(patched, dict)
+            ):
+                for key in ("m_FileID", "m_PathID"):
+                    if key in old_atlases[index]:
+                        patched[key] = copy.deepcopy(old_atlases[index][key])
+            patched_atlases.append(patched)
+        new["m_AtlasTextures"] = {"Array": patched_atlases}
 
     for glyph in new.get("m_GlyphTable", {}).get("Array", []):
         if isinstance(glyph, dict):
@@ -983,6 +1025,20 @@ def _overlay_path_for_input_path(cfg: PipelineConfig, input_path: Path) -> Path:
     return cfg.import_overlay_dir / input_path.relative_to(cfg.resource_input_root)
 
 
+def _input_path_for_relative(cfg: PipelineConfig, relative: str | Path) -> Path:
+    path = Path(relative)
+    return path if path.is_absolute() else cfg.resource_input_root / path
+
+
+def _bundle_key_for_json_path(cfg: PipelineConfig, json_path: Path) -> str:
+    relative = json_path.relative_to(cfg.resource_input_root)
+    parts = list(relative.parts)
+    for index, part in enumerate(parts):
+        if part in {"MonoBehaviour", "TextAsset", "Texture2D", "Material", "Font"}:
+            return str(Path(*parts[:index]))
+    return str(relative.parent)
+
+
 def _atlas_path_ids(font_json: dict[str, Any]) -> list[int]:
     values: list[int] = []
     atlas_array = font_json.get("m_AtlasTextures", {}).get("Array", [])
@@ -1060,13 +1116,121 @@ def _used_tmp_font_paths_from_font_map(cfg: PipelineConfig) -> set[Path]:
     return paths
 
 
+def _load_path_id_map_for_tmp(cfg: PipelineConfig) -> dict[str, dict[str, str]]:
+    path = cfg.stage_record_dir / cfg.output_path_id_map_json
+    if not path.is_file():
+        return {}
+    try:
+        data = read_json(path)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for asset_key, bucket in data.items():
+        if not isinstance(asset_key, str) or not isinstance(bucket, dict):
+            continue
+        result[asset_key] = {
+            str(path_id): relative
+            for path_id, relative in bucket.items()
+            if isinstance(relative, str)
+        }
+    return result
+
+
+def _load_file_id_map_for_tmp(cfg: PipelineConfig) -> dict[str, dict[str, str]]:
+    path = cfg.stage_record_dir / cfg.output_file_id_map_json
+    if not path.is_file():
+        return {}
+    try:
+        data = read_json(path)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+
+def _i2_tmp_font_and_material_targets(cfg: PipelineConfig) -> tuple[set[Path], set[str]]:
+    report_path = cfg.stage_record_dir / "i2_text_sdf_and_effect_components.json"
+    font_relatives: set[str] = set()
+    material_relatives: set[str] = set()
+    if report_path.is_file():
+        try:
+            report = read_json(report_path)
+        except Exception:
+            report = None
+        items = report.get("items") if isinstance(report, dict) else None
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                font_asset = item.get("font_asset")
+                relative = font_asset.get("file") if isinstance(font_asset, dict) else None
+                if isinstance(relative, str) and relative:
+                    font_relatives.add(relative)
+                materials = item.get("materials")
+                if isinstance(materials, list):
+                    for material in materials:
+                        if not isinstance(material, dict):
+                            continue
+                        material_relative = material.get("material_file")
+                        if isinstance(material_relative, str) and material_relative:
+                            material_relatives.add(material_relative)
+
+    if not font_relatives:
+        runtime_report_path = cfg.stage_record_dir / cfg.output_runtime_text_binding_report_json
+        if runtime_report_path.is_file():
+            try:
+                runtime_report = read_json(runtime_report_path)
+            except Exception:
+                runtime_report = None
+            sources = runtime_report.get("sources") if isinstance(runtime_report, dict) else None
+            path_id_map = _load_path_id_map_for_tmp(cfg)
+            file_id_map = _load_file_id_map_for_tmp(cfg)
+            if isinstance(sources, list) and path_id_map:
+                for source in sources:
+                    if not isinstance(source, dict) or source.get("kind") != "i2_language_table":
+                        continue
+                    component_file = source.get("component_file") or source.get("file")
+                    if not isinstance(component_file, str):
+                        continue
+                    component_path = _input_path_for_relative(cfg, component_file)
+                    if not component_path.is_file():
+                        continue
+                    try:
+                        data = read_json(component_path)
+                    except Exception:
+                        continue
+                    font_ref = data.get("m_fontAsset") if isinstance(data, dict) else None
+                    if not isinstance(font_ref, dict):
+                        continue
+                    file_id = font_ref.get("m_FileID")
+                    path_id = font_ref.get("m_PathID")
+                    if not isinstance(file_id, int) or not isinstance(path_id, int) or path_id <= 0:
+                        continue
+                    asset_key = _bundle_key_for_json_path(cfg, component_path)
+                    target_asset = asset_key if file_id == 0 else file_id_map.get(asset_key, {}).get(str(file_id))
+                    relative = path_id_map.get(target_asset or "", {}).get(str(path_id))
+                    if isinstance(relative, str) and relative:
+                        font_relatives.add(relative)
+
+    font_paths = {
+        _input_path_for_relative(cfg, relative).resolve()
+        for relative in font_relatives
+    }
+    return font_paths, material_relatives
+
+
 def prepare_generated_tmp_import_replacements(
     cfg: PipelineConfig,
     template_json_path: Path | None = None,
     atlas_png_path: Path | None = None,
 ) -> dict[str, int]:
+    from .translation import collect_translated_text_effect_material_sources, disable_tmp_sdf_material_effects
+
     template_json_path = template_json_path or (_sdf_generated_template_dir(cfg) / "generated_tmp_font.json")
     atlas_png_path = atlas_png_path or (_sdf_generated_template_dir(cfg) / "generated_tmp_font.png")
+    generated_asset_path = _sdf_generated_asset_path(cfg)
     if not template_json_path.is_file():
         raise FileNotFoundError(f"Generated TMP JSON template not found: {template_json_path}")
     if not atlas_png_path.is_file():
@@ -1082,43 +1246,93 @@ def prepare_generated_tmp_import_replacements(
         shutil.rmtree(cfg.import_overlay_dir)
     cfg.import_overlay_dir.mkdir(parents=True, exist_ok=True)
 
+    material_work_dir = cfg.root_dir / "workspace" / "temp" / "sdf_material_work"
+    if material_work_dir.exists():
+        shutil.rmtree(material_work_dir)
+    material_work_dir.mkdir(parents=True, exist_ok=True)
+
     template = read_json(template_json_path)
     if not _is_tmp_font_asset(template):
         raise ValueError(f"Generated TMP JSON template is not a TMP FontAsset: {template_json_path}")
 
+    generated_values = _generated_tmp_material_floats(generated_asset_path)
+    if generated_values:
+        print(f"[TMP替换] 已读取生成字体材质参数: {len(generated_values)} 项", flush=True)
+    else:
+        print(f"[TMP替换][提示] 未读取到生成字体材质参数，仅执行材质阴影/描边清理。", flush=True)
+
     used_tmp_font_paths = _used_tmp_font_paths_from_font_map(cfg)
-    all_items = _iter_manifest_items(cfg)
+    all_items = list(_iter_manifest_items(cfg))
     texture_items: dict[tuple[Path, str, int], tuple[Path, dict[str, Any]]] = {}
+    material_items: dict[tuple[Path, str, int], tuple[Path, dict[str, Any]]] = {}
     mono_items: list[tuple[Path, Path, dict[str, Any]]] = []
     for manifest_path, manifest_dir, item in all_items:
         type_name = str(_manifest_item_value(item, "TypeName", "") or "")
         path_id = _item_path_id(item)
         if type_name == "Texture2D" and path_id is not None:
             texture_items[(manifest_path, _item_bundle_entry(item), path_id)] = (manifest_dir, item)
+        elif type_name == "Material" and path_id is not None:
+            material_items[(manifest_path, _item_bundle_entry(item), path_id)] = (manifest_dir, item)
         elif type_name == "MonoBehaviour":
             mono_items.append((manifest_path, manifest_dir, item))
 
+    path_id_map = _load_path_id_map_for_tmp(cfg)
+    material_targets: dict[str, dict[str, Any]] = {}
+
+    def add_material_target(relative: str, reason: str, source: str | None = None) -> None:
+        if not relative:
+            return
+        target = material_targets.setdefault(
+            relative,
+            {"reasons": set(), "sources": [], "disable_effects": False, "sync_sdf_material": True},
+        )
+        target["reasons"].add(reason)
+        if source:
+            target["sources"].append(source)
+        if reason == "translated_text_effect_material":
+            target["disable_effects"] = True
+
+    try:
+        translated_material_sources = collect_translated_text_effect_material_sources(
+            cfg,
+            include_i2_bound_materials=True,
+        )
+    except FileNotFoundError as exc:
+        translated_material_sources = {}
+        print(f"[TMP替换][材质][提示] 缺少扫描记录，跳过译文材质收集: {exc}", flush=True)
+
+    for relative, sources in translated_material_sources.items():
+        for source in sources:
+            source_text = ""
+            if isinstance(source, dict):
+                source_text = str(source.get("text_file") or source.get("file") or "")
+            add_material_target(relative, "translated_text_effect_material", source_text)
+
     if used_tmp_font_paths:
-        filtered_mono_items: list[tuple[Path, Path, dict[str, Any]]] = []
-        for manifest_path, manifest_dir, item in mono_items:
-            old_json_path = _resolve_manifest_item_path(manifest_dir, item)
-            if old_json_path is not None and old_json_path.resolve() in used_tmp_font_paths:
-                filtered_mono_items.append((manifest_path, manifest_dir, item))
         print(
-            f"[TMP替换] 按 font_map 过滤 TMP FontAsset: {len(filtered_mono_items)}/{len(mono_items)}",
+            "[TMP替换] font_map 直接引用仅用于诊断，不再排除其他 TMP FontAsset；"
+            f"候选 MonoBehaviour={len(mono_items)}",
             flush=True,
         )
-        mono_items = filtered_mono_items
 
-    print(f"[TMP替换] manifest 条目: MonoBehaviour={len(mono_items)}, Texture2D={len(texture_items)}", flush=True)
+    print(
+        f"[TMP替换] manifest 条目: MonoBehaviour={len(mono_items)}, "
+        f"Texture2D={len(texture_items)}, Material={len(material_items)}",
+        flush=True,
+    )
 
     font_count = 0
     texture_count = 0
+    material_count = 0
+    material_parameter_updates = 0
+    material_effect_changes = 0
     written_textures: set[Path] = set()
     missing_textures: list[dict[str, Any]] = []
     skipped_textures: list[dict[str, Any]] = []
     skipped_fonts: list[dict[str, Any]] = []
     replacement_records: list[dict[str, Any]] = []
+    material_records: list[dict[str, Any]] = []
+    skipped_materials: list[dict[str, Any]] = []
 
     for index, (manifest_path, manifest_dir, item) in enumerate(mono_items, start=1):
         if index == 1 or index % 200 == 0:
@@ -1135,7 +1349,6 @@ def prepare_generated_tmp_import_replacements(
             continue
 
         target_json_path = _overlay_path_for_input_path(cfg, old_json_path)
-
         texture_outputs: list[str] = []
         for atlas_path_id in _atlas_path_ids(old):
             texture_key = (manifest_path, _item_bundle_entry(item), atlas_path_id)
@@ -1200,6 +1413,22 @@ def prepare_generated_tmp_import_replacements(
         write_json(target_json_path, new)
         font_count += 1
 
+        material_ref = _material_path_id(old)
+        material_relative = ""
+        if material_ref is not None:
+            material_file_id, material_path_id = material_ref
+            if material_file_id == 0 and material_path_id > 0:
+                asset_key = _bundle_key_for_json_path(cfg, old_json_path)
+                material_relative = path_id_map.get(asset_key, {}).get(str(material_path_id), "")
+            if not material_relative:
+                material_entry = material_items.get((manifest_path, _item_bundle_entry(item), material_path_id))
+                if material_entry is not None:
+                    material_path = _resolve_manifest_item_path(material_entry[0], material_entry[1])
+                    if material_path is not None and material_path.is_file():
+                        material_relative = str(material_path.relative_to(cfg.resource_input_root))
+            if material_relative:
+                add_material_target(material_relative, "font_default_material", str(old_json_path))
+
         print(f"[TMP替换] {old_json_path} -> {target_json_path}", flush=True)
         replacement_records.append(
             {
@@ -1209,160 +1438,112 @@ def prepare_generated_tmp_import_replacements(
                 "font_name": old.get("m_Name", ""),
                 "path_id": _item_path_id(item),
                 "bundle_entry": _item_bundle_entry(item),
+                "material": material_relative,
             }
+        )
+
+    for relative, target in sorted(material_targets.items()):
+        source_material_path = _input_path_for_relative(cfg, relative)
+        if not source_material_path.is_file():
+            skipped_materials.append({"material": relative, "reason": "source material json was not exported"})
+            continue
+        try:
+            source_material = read_json(source_material_path)
+        except Exception as exc:
+            skipped_materials.append({"material": relative, "reason": f"failed to read material json: {exc}"})
+            continue
+
+        work_path = material_work_dir / Path(relative)
+        work_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_material_path, work_path)
+
+        replacement = source_material
+        updated: list[str] = []
+        if target.get("sync_sdf_material") and generated_values:
+            replacement, updated = _apply_generated_sdf_material_floats(replacement, generated_values)
+
+        disabled = 0
+        effect_kinds: set[str] = set()
+        disable_reason = ""
+        if target.get("disable_effects"):
+            disabled, effect_kinds, disable_reason = disable_tmp_sdf_material_effects(replacement)
+
+        if not updated and not disabled:
+            skipped_materials.append(
+                {
+                    "material": relative,
+                    "reason": disable_reason or "no material fields changed",
+                    "reasons": sorted(target.get("reasons", [])),
+                }
+            )
+            continue
+
+        write_json(work_path, replacement)
+        target_material_path = _overlay_path_for_input_path(cfg, source_material_path)
+        write_json(target_material_path, replacement)
+        material_count += 1
+        material_parameter_updates += len(updated)
+        material_effect_changes += disabled
+        material_records.append(
+            {
+                "source_json": str(source_material_path),
+                "work_json": str(work_path),
+                "replacement_json": str(target_material_path),
+                "updated_sdf_material_fields": updated,
+                "disabled_effect_fields": disabled,
+                "effect_kinds": sorted(effect_kinds),
+                "reasons": sorted(target.get("reasons", [])),
+                "sources": target.get("sources", []),
+            }
+        )
+        print(
+            f"[TMP替换][材质] {source_material_path} -> {target_material_path} "
+            f"(同步={len(updated)}, 屏蔽={disabled})",
+            flush=True,
         )
 
     summary = {
         "template_json": str(template_json_path),
         "template_png": str(atlas_png_path),
+        "generated_asset": str(generated_asset_path),
         "import_overlay_dir": str(cfg.import_overlay_dir),
+        "material_work_dir": str(material_work_dir),
         "font_replacements": font_count,
         "texture_replacements": texture_count,
+        "material_replacements": material_count,
+        "updated_material_parameters": material_parameter_updates,
+        "disabled_material_effect_fields": material_effect_changes,
         "missing_texture_refs": len(missing_textures),
         "skipped_texture_refs": len(skipped_textures),
         "skipped_font_replacements": len(skipped_fonts),
+        "skipped_material_replacements": len(skipped_materials),
         "items": replacement_records,
+        "materials": material_records,
         "missing_textures": missing_textures,
         "skipped_textures": skipped_textures,
         "skipped_fonts": skipped_fonts,
+        "skipped_materials": skipped_materials,
     }
     summary_path = _sdf_replacement_summary_path(cfg)
     write_json(summary_path, summary)
     print(
-        f"[TMP替换] 完成: TMP字体={font_count}, 图集={texture_count}, "
+        f"[TMP替换] 完成: TMP字体={font_count}, 图集={texture_count}, 材质={material_count}, "
+        f"材质参数同步={material_parameter_updates}, 阴影描边屏蔽字段={material_effect_changes}, "
         f"缺失图集引用={len(missing_textures)}, 跳过无效图集={len(skipped_textures)}, "
-        f"跳过字体={len(skipped_fonts)}",
+        f"跳过字体={len(skipped_fonts)}, 跳过材质={len(skipped_materials)}",
         flush=True,
     )
     print(f"[TMP替换] 替换清单: {summary_path}", flush=True)
     return {
         "font_replacements": font_count,
         "texture_replacements": texture_count,
+        "material_replacements": material_count,
+        "updated_material_parameters": material_parameter_updates,
+        "disabled_material_effect_fields": material_effect_changes,
         "missing_texture_refs": len(missing_textures),
         "skipped_texture_refs": len(skipped_textures),
         "skipped_font_replacements": len(skipped_fonts),
-    }
-
-
-def sync_generated_tmp_material_parameters(cfg: PipelineConfig) -> dict[str, int]:
-    """Optionally copy generated SDF numeric properties into game Material replacements."""
-    generated_asset_path = _sdf_generated_asset_path(cfg)
-    summary_path = _sdf_replacement_summary_path(cfg)
-    if not generated_asset_path.is_file():
-        raise FileNotFoundError(f"Generated TMP asset not found: {generated_asset_path}")
-    if not summary_path.is_file():
-        raise FileNotFoundError(f"TMP replacement summary not found: {summary_path}")
-
-    generated_values = _generated_tmp_material_floats(generated_asset_path)
-    if not generated_values:
-        raise ValueError(f"Generated TMP material floats were not found: {generated_asset_path}")
-
-    summary = read_json(summary_path)
-    summary_items = summary.get("items") if isinstance(summary, dict) else None
-    if not isinstance(summary_items, list):
-        raise ValueError(f"TMP replacement summary has no items: {summary_path}")
-
-    manifest_items = _iter_manifest_items(cfg)
-    font_contexts: dict[Path, tuple[Path, str]] = {}
-    material_items: dict[tuple[Path, str, int], tuple[Path, dict[str, Any]]] = {}
-    for manifest_path, manifest_dir, item in manifest_items:
-        type_name = str(_manifest_item_value(item, "TypeName", "") or "")
-        path_id = _item_path_id(item)
-        if type_name == "Material" and path_id is not None:
-            material_items[(manifest_path, _item_bundle_entry(item), path_id)] = (manifest_dir, item)
-        elif type_name == "MonoBehaviour":
-            item_path = _resolve_manifest_item_path(manifest_dir, item)
-            if item_path is not None:
-                font_contexts[item_path.resolve()] = (manifest_path, _item_bundle_entry(item))
-
-    written: set[Path] = set()
-    changed_count = 0
-    skipped_count = 0
-    updated_parameter_count = 0
-    records: list[dict[str, Any]] = []
-
-    for item in summary_items:
-        source_value = item.get("source_json") if isinstance(item, dict) else None
-        if not isinstance(source_value, str) or not source_value:
-            skipped_count += 1
-            continue
-        source_font_path = Path(source_value)
-        context = font_contexts.get(source_font_path.resolve())
-        if context is None or not source_font_path.is_file():
-            skipped_count += 1
-            continue
-
-        font_json = read_json(source_font_path)
-        material_ref = _material_path_id(font_json)
-        if material_ref is None:
-            skipped_count += 1
-            continue
-        material_file_id, material_path_id = material_ref
-        if material_file_id != 0 or material_path_id == 0:
-            skipped_count += 1
-            continue
-
-        manifest_path, bundle_entry = context
-        material_entry = material_items.get((manifest_path, bundle_entry, material_path_id))
-        if material_entry is None:
-            skipped_count += 1
-            continue
-        material_manifest_dir, material_item = material_entry
-        source_material_path = _resolve_manifest_item_path(material_manifest_dir, material_item)
-        if source_material_path is None or not source_material_path.is_file():
-            skipped_count += 1
-            continue
-
-        target_material_path = _overlay_path_for_input_path(cfg, source_material_path)
-        if target_material_path in written:
-            continue
-
-        source_material = read_json(source_material_path)
-        replacement, updated = _apply_generated_sdf_material_floats(source_material, generated_values)
-        if not updated:
-            skipped_count += 1
-            continue
-
-        write_json(target_material_path, replacement)
-        written.add(target_material_path)
-        changed_count += 1
-        updated_parameter_count += len(updated)
-        records.append(
-            {
-                "source_material": str(source_material_path),
-                "replacement_material": str(target_material_path),
-                "material_path_id": material_path_id,
-                "updated_parameters": updated,
-            }
-        )
-        print(
-            f"[TMP材质] {source_material_path} -> {target_material_path}（同步 {len(updated)} 项）",
-            flush=True,
-        )
-
-    report_path = _sdf_generated_template_dir(cfg).parent / "tmp_material_parameter_sync.json"
-    write_json(
-        report_path,
-        {
-            "generated_asset": str(generated_asset_path),
-            "replacement_summary": str(summary_path),
-            "material_replacements": changed_count,
-            "skipped": skipped_count,
-            "updated_parameter_count": updated_parameter_count,
-            "generated_parameters": generated_values,
-            "items": records,
-        },
-    )
-    print(
-        f"[TMP材质] 完成: 材质={changed_count}, 参数={updated_parameter_count}, "
-        f"跳过={skipped_count}",
-        flush=True,
-    )
-    print(f"[TMP材质] 报告: {report_path}", flush=True)
-    return {
-        "material_replacements": changed_count,
-        "updated_parameter_count": updated_parameter_count,
-        "skipped": skipped_count,
+        "skipped_material_replacements": len(skipped_materials),
     }
 
 
@@ -1423,7 +1604,7 @@ def _count_visible_chars(path: Path) -> int:
 def _atlas_size_for_char_count(char_count: int) -> int:
     if char_count <= 1200:
         return 2048
-    if char_count <= 4500:
+    if char_count <= 3000:
         return 4096
     return 8192
 
@@ -1485,7 +1666,7 @@ def launch_unity_tmp_generator(
     tmp_settings = _tmp_generation_settings_from_template(cfg)
     visible_char_count = _count_visible_chars(characters_file)
     fixed_padding = 9
-    atlas_size = _estimate_sdf_atlas_size_for_auto_point_size(visible_char_count, fixed_padding)
+    atlas_size = _estimate_sdf_atlas_size_for_auto_point_size(visible_char_count, fixed_padding, cfg.tmp_max_atlas_size)
     tmp_settings["point_size_mode"] = "auto"
     tmp_settings.pop("point_size", None)
     tmp_settings["padding"] = fixed_padding
@@ -1499,7 +1680,8 @@ def launch_unity_tmp_generator(
     print(f"[TMP] 可见字符数: {visible_char_count}", flush=True)
     _log_green(
         f"[TMP] 生成参数: pointSize=Auto, atlas={atlas_size}x{atlas_size}, padding={fixed_padding} "
-        f"(估算档位: <=1200 用 2048，<=4800 用 4096，更多用 8192)"
+        f"(质量档位: <=1200 用 2048，<=3000 用 4096，更多用 8192；"
+        f"配置允许上限 {cfg.tmp_max_atlas_size}，Unity 不支持时自动回退)"
     )
     print(f"[TMP] 预期输出目录: {output_asset_path.parent}", flush=True)
     print(f"[TMP] 预期输出文件: {output_asset_path}", flush=True)
@@ -1547,3 +1729,5 @@ def launch_unity_tmp_generator(
         if prepare_import and atlas_paths:
             prepare_generated_tmp_import_replacements(cfg, template_json_path, atlas_paths[0])
     return result.returncode
+
+

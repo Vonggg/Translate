@@ -7,9 +7,11 @@ import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from pipeline.resource_staging import (
     _build_remote_downloads,
+    inspect_and_download_catalog_resources,
     prepare_split_sync_outputs,
     prepare_unified_resource_source,
     print_final_addressables_sync_reminder,
@@ -21,6 +23,53 @@ from support.config import load_config
 
 
 class ResourceStagingTests(unittest.TestCase):
+    def test_actual_download_modifies_source_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tool_root = root / "tool"
+            project_root = root / "projects"
+            game_root = project_root / "demo" / "game-name" / "game"
+            catalog_path = game_root / "assets" / "aa" / "catalog.json"
+            catalog_path.parent.mkdir(parents=True)
+            remote_id = "https://cdn.example/game/Android/downloaded.bundle"
+            catalog_path.write_text(
+                json.dumps({"m_InternalIds": [remote_id]}),
+                encoding="utf-8",
+            )
+            cfg = replace(
+                load_config(),
+                root_dir=tool_root,
+                project_root_dir=project_root,
+                project_name="demo",
+                catalog_source_subpath=Path("game-name/game/assets/aa/catalog.json"),
+                result_dir=tool_root / "workspace" / "output",
+            )
+
+            def fake_download(task, _timeout):
+                task.destination.parent.mkdir(parents=True, exist_ok=True)
+                task.destination.write_bytes(b"downloaded")
+                return True, ""
+
+            with patch(
+                "pipeline.resource_staging._download_remote_file",
+                side_effect=fake_download,
+            ):
+                self.assertTrue(inspect_and_download_catalog_resources(cfg))
+
+            localized_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                localized_catalog["m_InternalIds"],
+                [
+                    "{UnityEngine.AddressableAssets.Addressables.RuntimePath}"
+                    "/Android/downloaded.bundle"
+                ],
+            )
+            report = json.loads(
+                remote_resource_report_path(cfg).read_text(encoding="utf-8")
+            )
+            self.assertEqual(report["success_count"], 1)
+            self.assertTrue(report["source_catalog_modified"])
+
     def test_staging_restore_and_split_sync(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -84,6 +133,8 @@ class ResourceStagingTests(unittest.TestCase):
                 remote_resource_report_path(cfg).read_text(encoding="utf-8")
             )
             self.assertEqual(remote_report["success_count"], 0)
+            self.assertTrue(remote_report["source_catalog_modified"])
+            self.assertEqual(remote_report["localized_internal_id_count"], 1)
             self.assertEqual(len(remote_report["localized_internal_ids"]), 1)
             self.assertEqual(
                 remote_report["localized_internal_ids"][0]["remote_internal_id"],
@@ -127,7 +178,8 @@ class ResourceStagingTests(unittest.TestCase):
             reminder_output = io.StringIO()
             with redirect_stdout(reminder_output):
                 print_final_addressables_sync_reminder(cfg, final_root)
-            self.assertEqual(reminder_output.getvalue(), "")
+            self.assertIn("远程资源文件已存在", reminder_output.getvalue())
+            self.assertIn("1 个 catalog 远程路径", reminder_output.getvalue())
 
             remote_report["success_count"] = 2
             remote_resource_report_path(cfg).write_text(
@@ -137,7 +189,7 @@ class ResourceStagingTests(unittest.TestCase):
             reminder_output = io.StringIO()
             with redirect_stdout(reminder_output):
                 print_final_addressables_sync_reminder(cfg, final_root)
-            self.assertIn("本次已下载并本地化 2 个", reminder_output.getvalue())
+            self.assertIn("本次实际下载 2 个", reminder_output.getvalue())
 
 
 if __name__ == "__main__":

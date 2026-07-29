@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "scripts": {
+    "0": {
+      "name": "扫描导出的 JSON",
+      "notes": [
+        "保留资源导出阶段生成的 file_id_map.json。"
+      ],
+      "outputs": [
+        {"base": "records", "kind": "file", "path": "records.json"},
+        {"base": "records", "kind": "file", "path": "records_unfiltered.json"},
+        {"base": "records", "kind": "file", "path": "ids.json"},
+        {"base": "records", "kind": "file", "path": "font_map.json"},
+        {"base": "records", "kind": "file", "path": "material_map.json"},
+        {"base": "records", "kind": "file", "path": "ref_map.json"},
+        {"base": "records", "kind": "file", "path": "path_id_map.json"},
+        {"base": "records", "kind": "file", "path": "tmp_manifest_index.json"},
+        {"base": "records", "kind": "file", "path": "string_field_stats.json"},
+        {"base": "records", "kind": "file", "path": "string_field_stats.tsv"},
+        {"base": "records", "kind": "file", "path": "string_field_review.txt"},
+        {"base": "records", "kind": "file", "path": "scan_state.json"},
+        {"base": "records", "kind": "directory", "path": "scan_cache"}
+      ]
+    },
+    "1": {
+      "name": "AI 判断字段并过滤 records",
+      "notes": [
+        "脚本 1 从 records_unfiltered.json 重新筛选并改写 records.json。"
+      ],
+      "outputs": [
+        {"base": "records", "kind": "file", "path": "records.json"}
+      ]
+    },
+    "2": {
+      "name": "根据扫描记录翻译",
+      "outputs": [
+        {"base": "records", "kind": "file", "path": "trans.json"},
+        {"base": "records", "kind": "file", "path": "trans_maybe_title.json"},
+        {"base": "records", "kind": "file", "path": "game.txt"},
+        {"base": "records", "kind": "file", "path": "game_chars.txt"},
+        {"base": "records", "kind": "file", "path": "mapping.tsv"},
+        {"base": "records", "kind": "glob", "path": "ai_translation_request*.json"},
+        {"base": "records", "kind": "glob", "path": "ai_translation_response*.json"}
+      ]
+    },
+    "3": {
+      "name": "从 trans 重建文本字符文件",
+      "outputs": [
+        {"base": "records", "kind": "file", "path": "game.txt"},
+        {"base": "records", "kind": "file", "path": "game_chars.txt"}
+      ]
+    },
+    "4": {
+      "name": "导出翻译后的待替换 JSON",
+      "notes": [
+        "output/Text 是脚本 4 的基础输出目录；清理它也会移除脚本 5 写入其中的材质覆盖。"
+      ],
+      "outputs": [
+        {"base": "output", "kind": "directory", "path": "Text"},
+        {"base": "records", "kind": "file", "path": "runtime_text_binding_report.json"}
+      ]
+    },
+    "5": {
+      "name": "清理译文字体材质阴影描边",
+      "notes": [
+        "先读取 disabled_text_effect_components.json，精确删除报告记录的 output_file。"
+      ],
+      "outputs": [
+        {
+          "base": "records",
+          "kind": "report_output_files",
+          "path": "disabled_text_effect_components.json",
+          "target_base": "output",
+          "arrays": ["components", "materials"],
+          "field": "output_file"
+        },
+        {"base": "records", "kind": "file", "path": "disabled_text_effect_components.json"},
+        {"base": "records", "kind": "file", "path": "disabled_text_effect_components.tsv"}
+      ]
+    },
+    "6": {
+      "name": "生成 TTF 替换字体",
+      "outputs": [
+        {"base": "output", "kind": "directory", "path": "Font/TTF"}
+      ]
+    },
+    "7": {
+      "name": "合并 TMP 字符",
+      "outputs": [
+        {"base": "records", "kind": "file", "path": "tmp_chars.txt"},
+        {"base": "records", "kind": "file", "path": "translation_chars_missing_from_ttf.txt"},
+        {"base": "records", "kind": "file", "path": "translation_chars_missing_from_ttf.tsv"},
+        {"base": "records", "kind": "file", "path": "tmp_chars_missing_from_ttf.txt"},
+        {"base": "records", "kind": "file", "path": "tmp_chars_missing_from_ttf.tsv"},
+        {"base": "records", "kind": "file", "path": "merged_chars_removed_unsupported_by_ttf.txt"},
+        {"base": "records", "kind": "file", "path": "merged_chars_removed_unsupported_by_ttf.tsv"}
+      ]
+    },
+    "8": {
+      "name": "生成 Unity TMP 字体",
+      "notes": [
+        "会同时清理辅助 Unity 项目中本次生成的字体资产和任务文件。"
+      ],
+      "outputs": [
+        {"base": "output", "kind": "directory", "path": "Font/SDF/generated_templates"},
+        {"base": "unity_project", "kind": "glob", "path": "Assets/GeneratedFonts/generated_tmp_font.asset*"},
+        {"base": "unity_project", "kind": "file", "path": "Assets/SourceFonts/font-job.json"},
+        {"base": "unity_project", "kind": "glob", "path": "Assets/SourceFonts/{ttf_template_name}*"},
+        {"base": "logs", "kind": "file", "path": "tmp_font_unity.log"}
+      ]
+    },
+    "9": {
+      "name": "准备 TMP/SDF 待导入替换",
+      "outputs": [
+        {"base": "output", "kind": "directory", "path": "Font/SDF/ToImport"},
+        {"base": "output", "kind": "file", "path": "Font/SDF/tmp_font_replacements.json"}
+      ]
+    },
+    "a": {
+      "name": "全部执行",
+      "includes": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+      "notes": [
+        "全部执行会清理脚本 0 至 9 清单中的全部产物。"
+      ],
+      "outputs": []
+    }
+  }
+}

@@ -15,6 +15,11 @@ namespace UnityResourceCLI
         public string DumpFormat { get; init; } = "json";
         public string ImageFormat { get; init; } = "png";
         public int JpegQuality { get; init; } = 90;
+        public int ExportWorkers { get; init; }
+        public int ImportWorkers { get; init; }
+        public bool SaveSamples { get; init; }
+        public bool VerboseExportAssets { get; init; }
+        public string ExportProfile { get; init; } = "all";
         public bool ShowHelp { get; init; }
 
         public static CliOptions Parse(string[] args)
@@ -60,6 +65,27 @@ namespace UnityResourceCLI
             string dumpFormat = GetOptional(dict, "dump-format", "json").ToLowerInvariant();
             string imageFormat = GetOptional(dict, "image-format", "png").ToLowerInvariant();
             int jpegQuality = int.TryParse(GetOptional(dict, "quality", "90"), out int parsedQuality) ? parsedQuality : 90;
+            int exportWorkers = int.TryParse(GetOptional(dict, "export-workers", "0"), out int parsedExportWorkers)
+                ? Math.Max(0, parsedExportWorkers)
+                : 0;
+            int importWorkers = int.TryParse(GetOptional(dict, "import-workers", "0"), out int parsedWorkers)
+                ? Math.Max(0, parsedWorkers)
+                : 0;
+            bool saveSamples = bool.TryParse(GetOptional(dict, "save-samples", "false"), out bool parsedSaveSamples)
+                && parsedSaveSamples;
+            bool verboseExportAssets = bool.TryParse(
+                GetOptional(dict, "verbose-export-assets", "false"),
+                out bool parsedVerboseExportAssets
+            ) && parsedVerboseExportAssets;
+            string exportProfile = GetOptional(dict, "export-profile", "all").ToLowerInvariant();
+            string[] exportProfiles = exportProfile.Split(
+                '+',
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries
+            );
+            if (exportProfiles.Length == 0 || exportProfiles.Any(
+                profile => profile is not ("basic" or "objects" or "mesh" or "all")
+            ))
+                throw new ArgumentException("--export-profile must contain basic, objects, mesh, or all.");
 
             return new CliOptions
             {
@@ -71,7 +97,12 @@ namespace UnityResourceCLI
                 ResultRoot = string.IsNullOrWhiteSpace(resultRoot) ? "" : Path.GetFullPath(resultRoot),
                 DumpFormat = dumpFormat,
                 ImageFormat = imageFormat,
-                JpegQuality = jpegQuality
+                JpegQuality = jpegQuality,
+                ExportWorkers = exportWorkers,
+                ImportWorkers = importWorkers,
+                SaveSamples = saveSamples,
+                VerboseExportAssets = verboseExportAssets,
+                ExportProfile = exportProfile
             };
         }
 
@@ -79,8 +110,8 @@ namespace UnityResourceCLI
         {
             Console.WriteLine("UnityResourceCLI");
             Console.WriteLine("Usage:");
-            Console.WriteLine("  UnityResourceCLI export --source <game_root> --work <work_root> [--managed <managed_dir>] [--dump-format json|txt] [--image-format png|jpg] [--quality 90]");
-            Console.WriteLine("  UnityResourceCLI import --source <game_root> --work <work_root> [--replacement-root <overlay_root>] [--result-root <result_root>] [--managed <managed_dir>] [--dump-format json|txt] [--image-format png|jpg] [--quality 90]");
+            Console.WriteLine("  UnityResourceCLI export --source <game_root> --work <work_root> [--managed <managed_dir>] [--export-profile basic|objects|mesh|all] [--export-workers 0]");
+            Console.WriteLine("  UnityResourceCLI import --source <game_root> --work <work_root> [--replacement-root <overlay_root>] [--result-root <result_root>] [--managed <managed_dir>] [--import-workers 0] [--save-samples false]");
             Console.WriteLine();
             Console.WriteLine("Notes:");
             Console.WriteLine("  - Exports Texture2D as PNG/JPG and keeps the same support on import.");
