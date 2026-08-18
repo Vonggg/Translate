@@ -701,6 +701,34 @@ def _material_path_id(font_json: dict[str, Any]) -> tuple[int, int] | None:
         return None
 
 
+def _material_main_texture_refs(material_json: dict[str, Any]) -> list[tuple[int, int]]:
+    """Return the Texture2D references sampled by a material's ``_MainTex``."""
+    saved_properties = material_json.get("m_SavedProperties")
+    tex_envs = saved_properties.get("m_TexEnvs") if isinstance(saved_properties, dict) else None
+    array = tex_envs.get("Array") if isinstance(tex_envs, dict) else tex_envs
+    if not isinstance(array, list):
+        return []
+
+    refs: list[tuple[int, int]] = []
+    for item in array:
+        if not isinstance(item, dict) or item.get("first") != "_MainTex":
+            continue
+        value = item.get("second")
+        texture = value.get("m_Texture") if isinstance(value, dict) else None
+        if not isinstance(texture, dict):
+            continue
+        try:
+            ref = (
+                int(texture.get("m_FileID", 0) or 0),
+                int(texture.get("m_PathID", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            continue
+        if ref[1] != 0 and ref not in refs:
+            refs.append(ref)
+    return refs
+
+
 def _apply_generated_sdf_material_floats(
     source_material: dict[str, Any],
     generated_values: dict[str, Any],
@@ -1277,6 +1305,7 @@ def prepare_generated_tmp_import_replacements(
             mono_items.append((manifest_path, manifest_dir, item))
 
     path_id_map = _load_path_id_map_for_tmp(cfg)
+    file_id_map = _load_file_id_map_for_tmp(cfg)
     material_targets: dict[str, dict[str, Any]] = {}
 
     def add_material_target(relative: str, reason: str, source: str | None = None) -> None:
@@ -1327,6 +1356,7 @@ def prepare_generated_tmp_import_replacements(
     material_parameter_updates = 0
     material_effect_changes = 0
     written_textures: set[Path] = set()
+    material_main_textures: set[Path] = set()
     missing_textures: list[dict[str, Any]] = []
     skipped_textures: list[dict[str, Any]] = []
     skipped_fonts: list[dict[str, Any]] = []
@@ -1415,19 +1445,91 @@ def prepare_generated_tmp_import_replacements(
 
         material_ref = _material_path_id(old)
         material_relative = ""
+        material_path: Path | None = None
+        material_entry: tuple[Path, dict[str, Any]] | None = None
+        material_texture_outputs: list[str] = []
         if material_ref is not None:
             material_file_id, material_path_id = material_ref
-            if material_file_id == 0 and material_path_id > 0:
+            if material_file_id == 0 and material_path_id != 0:
                 asset_key = _bundle_key_for_json_path(cfg, old_json_path)
                 material_relative = path_id_map.get(asset_key, {}).get(str(material_path_id), "")
-            if not material_relative:
                 material_entry = material_items.get((manifest_path, _item_bundle_entry(item), material_path_id))
+            if not material_relative:
                 if material_entry is not None:
-                    material_path = _resolve_manifest_item_path(material_entry[0], material_entry[1])
-                    if material_path is not None and material_path.is_file():
-                        material_relative = str(material_path.relative_to(cfg.resource_input_root))
+                    resolved_material_path = _resolve_manifest_item_path(material_entry[0], material_entry[1])
+                    if resolved_material_path is not None and resolved_material_path.is_file():
+                        material_path = resolved_material_path
+                        material_relative = str(resolved_material_path.relative_to(cfg.resource_input_root))
             if material_relative:
                 add_material_target(material_relative, "font_default_material", str(old_json_path))
+                if material_path is None:
+                    candidate = _input_path_for_relative(cfg, material_relative)
+                    if candidate.is_file():
+                        material_path = candidate
+
+        if material_path is not None:
+            try:
+                material_json = read_json(material_path)
+            except Exception:
+                material_json = None
+            if isinstance(material_json, dict):
+                material_asset_key = _bundle_key_for_json_path(cfg, material_path)
+                for texture_file_id, texture_path_id in _material_main_texture_refs(material_json):
+                    source_texture_path: Path | None = None
+                    target_asset = (
+                        material_asset_key
+                        if texture_file_id == 0
+                        else file_id_map.get(material_asset_key, {}).get(str(texture_file_id), "")
+                    )
+                    texture_relative = (
+                        path_id_map.get(target_asset, {}).get(str(texture_path_id), "")
+                        if target_asset
+                        else ""
+                    )
+                    if texture_relative:
+                        candidate = _input_path_for_relative(cfg, texture_relative)
+                        if candidate.is_file():
+                            source_texture_path = candidate
+                    if source_texture_path is None and texture_file_id == 0:
+                        texture_entry = texture_items.get(
+                            (manifest_path, _item_bundle_entry(item), texture_path_id)
+                        )
+                        if texture_entry is not None:
+                            candidate = _resolve_manifest_item_path(texture_entry[0], texture_entry[1])
+                            if candidate is not None and candidate.is_file():
+                                source_texture_path = candidate
+
+                    if source_texture_path is None:
+                        missing_textures.append(
+                            {
+                                "font": str(old_json_path),
+                                "material": str(material_path),
+                                "atlas_path_id": texture_path_id,
+                                "file_id": texture_file_id,
+                                "reason": "material _MainTex texture could not be resolved",
+                            }
+                        )
+                        continue
+                    if not _is_valid_existing_texture_png(source_texture_path):
+                        skipped_textures.append(
+                            {
+                                "font": str(old_json_path),
+                                "material": str(material_path),
+                                "atlas_path_id": texture_path_id,
+                                "source_texture": str(source_texture_path),
+                                "reason": "material _MainTex texture is missing a valid non-zero PNG size",
+                            }
+                        )
+                        continue
+
+                    target_texture_path = _overlay_path_for_input_path(cfg, source_texture_path)
+                    if target_texture_path not in written_textures:
+                        target_texture_path.parent.mkdir(parents=True, exist_ok=True)
+                        _copy_atlas_png_for_import(atlas_png_path, target_texture_path)
+                        written_textures.add(target_texture_path)
+                        texture_count += 1
+                    material_main_textures.add(target_texture_path)
+                    material_texture_outputs.append(str(target_texture_path))
 
         print(f"[TMP替换] {old_json_path} -> {target_json_path}", flush=True)
         replacement_records.append(
@@ -1435,6 +1537,7 @@ def prepare_generated_tmp_import_replacements(
                 "source_json": str(old_json_path),
                 "replacement_json": str(target_json_path),
                 "replacement_textures": texture_outputs,
+                "material_main_texture_replacements": material_texture_outputs,
                 "font_name": old.get("m_Name", ""),
                 "path_id": _item_path_id(item),
                 "bundle_entry": _item_bundle_entry(item),
@@ -1510,6 +1613,7 @@ def prepare_generated_tmp_import_replacements(
         "material_work_dir": str(material_work_dir),
         "font_replacements": font_count,
         "texture_replacements": texture_count,
+        "material_main_texture_replacements": len(material_main_textures),
         "material_replacements": material_count,
         "updated_material_parameters": material_parameter_updates,
         "disabled_material_effect_fields": material_effect_changes,
@@ -1528,6 +1632,7 @@ def prepare_generated_tmp_import_replacements(
     write_json(summary_path, summary)
     print(
         f"[TMP替换] 完成: TMP字体={font_count}, 图集={texture_count}, 材质={material_count}, "
+        f"材质主纹理={len(material_main_textures)}, "
         f"材质参数同步={material_parameter_updates}, 阴影描边屏蔽字段={material_effect_changes}, "
         f"缺失图集引用={len(missing_textures)}, 跳过无效图集={len(skipped_textures)}, "
         f"跳过字体={len(skipped_fonts)}, 跳过材质={len(skipped_materials)}",
@@ -1537,6 +1642,7 @@ def prepare_generated_tmp_import_replacements(
     return {
         "font_replacements": font_count,
         "texture_replacements": texture_count,
+        "material_main_texture_replacements": len(material_main_textures),
         "material_replacements": material_count,
         "updated_material_parameters": material_parameter_updates,
         "disabled_material_effect_fields": material_effect_changes,
