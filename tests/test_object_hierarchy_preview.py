@@ -898,6 +898,23 @@ class ObjectHierarchyPreviewLayoutTests(unittest.TestCase):
         self.assertEqual([node["path_id"] for node in displayed], [1, 2, 3])
         self.assertEqual([node["path_id"] for node in image_nodes], [1, 2, 3, 9])
 
+    def test_isolated_level_hides_peer_branches_at_and_below_selected_depth(self) -> None:
+        nodes = {
+            1: {"path_id": 1, "children": [2, 5], "chain": [{"path_id": 1}]},
+            2: {"path_id": 2, "children": [3, 4], "chain": [{"path_id": 1}, {"path_id": 2}]},
+            3: {"path_id": 3, "children": [6], "chain": [{"path_id": 1}, {"path_id": 2}, {"path_id": 3}]},
+            4: {"path_id": 4, "children": [7], "chain": [{"path_id": 1}, {"path_id": 2}, {"path_id": 4}]},
+            5: {"path_id": 5, "children": [8], "chain": [{"path_id": 1}, {"path_id": 5}]},
+            6: {"path_id": 6, "children": [], "chain": [{"path_id": 1}, {"path_id": 2}, {"path_id": 3}, {"path_id": 6}]},
+            7: {"path_id": 7, "children": [], "chain": [{"path_id": 1}, {"path_id": 2}, {"path_id": 4}, {"path_id": 7}]},
+            8: {"path_id": 8, "children": [], "chain": [{"path_id": 1}, {"path_id": 5}, {"path_id": 8}]},
+        }
+        image_nodes = TOOLS._preview_subtree_nodes(nodes, 1)
+
+        isolated = TOOLS._preview_image_nodes_for_isolated_level(nodes, image_nodes, 3)
+
+        self.assertEqual([node["path_id"] for node in isolated], [1, 2, 3, 6, 5])
+
     def test_unresolved_component_data_does_not_crash_image_preview_check(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             scope = {

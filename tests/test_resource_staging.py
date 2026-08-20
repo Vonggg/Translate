@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pipeline.resource_staging import (
+    _write_split_parts_next_to_merged,
     _build_remote_downloads,
     inspect_and_download_catalog_resources,
     prepare_split_sync_outputs,
@@ -23,6 +24,56 @@ from support.config import load_config
 
 
 class ResourceStagingTests(unittest.TestCase):
+    def test_split_output_preserves_fixed_boundaries_and_verifies_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            merged = root / "large.bundle"
+            merged.write_bytes(b"ABCDEFGHI")
+            rows = [
+                {"name": "large.bundle.split0", "size": 4},
+                {"name": "large.bundle.split1", "size": 4},
+                {"name": "large.bundle.split2", "size": 2},
+            ]
+
+            outputs = _write_split_parts_next_to_merged(merged, rows)
+
+            self.assertEqual(len(outputs), 3)
+            self.assertEqual([path.stat().st_size for path in outputs], [4, 4, 1])
+            self.assertEqual(b"".join(path.read_bytes() for path in outputs), merged.read_bytes())
+
+    def test_split_output_rejects_shrink_across_original_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            merged = root / "large.bundle"
+            merged.write_bytes(b"ABCDEFGH")
+            rows = [
+                {"name": "large.bundle.split0", "size": 4},
+                {"name": "large.bundle.split1", "size": 4},
+                {"name": "large.bundle.split2", "size": 2},
+            ]
+
+            with self.assertRaisesRegex(RuntimeError, "跨越原分卷边界"):
+                _write_split_parts_next_to_merged(merged, rows)
+            self.assertFalse(any(root.glob("*.split_tmp")))
+
+    def test_split_output_adds_minimum_required_part_without_exceeding_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            merged = root / "large.bundle"
+            merged.write_bytes(b"ABCDEFGHIJKLM")
+            rows = [
+                {"name": "large.bundle.split0", "size": 4},
+                {"name": "large.bundle.split1", "size": 4},
+                {"name": "large.bundle.split2", "size": 2},
+            ]
+
+            outputs = _write_split_parts_next_to_merged(merged, rows)
+
+            self.assertFalse(any(root.glob("*.split_tmp")))
+            self.assertEqual(len(outputs), 4)
+            self.assertEqual([path.stat().st_size for path in outputs], [4, 4, 4, 1])
+            self.assertEqual(b"".join(path.read_bytes() for path in outputs), merged.read_bytes())
+
     def test_actual_download_modifies_source_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -142,25 +193,56 @@ class ResourceStagingTests(unittest.TestCase):
             )
 
             state = json.loads(resource_source_map_path(cfg).read_text(encoding="utf-8"))
+            self.assertEqual(state["state_version"], 2)
+            self.assertIn("source_fingerprint", state)
             split_entries = [entry for entry in state["entries"] if entry.get("split_parts")]
             self.assertEqual(len(split_entries), 1)
+
+            with (
+                patch("pipeline.resource_staging.backup_game_addressables") as backup_mock,
+                patch("pipeline.resource_staging.inspect_and_download_catalog_resources") as inspect_mock,
+            ):
+                reused_root = prepare_unified_resource_source(cfg)
+            self.assertEqual(reused_root, staging_root)
+            backup_mock.assert_not_called()
+            inspect_mock.assert_not_called()
+
+            (data_root / "globalgamemanagers").write_bytes(b"changed-source")
+            with (
+                patch("pipeline.resource_staging.backup_game_addressables") as backup_mock,
+                patch(
+                    "pipeline.resource_staging.inspect_and_download_catalog_resources",
+                    return_value=True,
+                ) as inspect_mock,
+            ):
+                rebuilt_root = prepare_unified_resource_source(cfg)
+            self.assertEqual(rebuilt_root, staging_root)
+            backup_mock.assert_called_once()
+            inspect_mock.assert_called_once()
+            self.assertEqual(
+                (staging_root / "bin" / "Data" / "globalgamemanagers").read_bytes(),
+                b"changed-source",
+            )
 
             final_root = tool_root / "workspace" / "FinalResult"
             staged_bundle_result = final_root / "Bundle" / "Android" / "aa" / "Android" / "remote.bundle"
             staged_data_result = final_root / "bin" / "Data" / "globalgamemanagers"
             staged_bundle_result.parent.mkdir(parents=True)
             staged_data_result.parent.mkdir(parents=True)
-            staged_bundle_result.write_bytes(b"WXYZ12")
+            staged_bundle_result.write_bytes(b"WXYZ")
             staged_data_result.write_bytes(b"changed-data")
 
             restored = restore_imported_resource_paths(cfg, final_root)
-            self.assertEqual((final_root / "Bundle" / "Android" / "remote.bundle").read_bytes(), b"WXYZ12")
+            self.assertEqual((final_root / "Bundle" / "Android" / "remote.bundle").read_bytes(), b"WXYZ")
             self.assertEqual((final_root / "Data" / "globalgamemanagers").read_bytes(), b"changed-data")
 
             self.assertEqual(prepare_split_sync_outputs(cfg, final_root, restored), 1)
-            split_root = final_root / "SplitBundles" / "Parts" / "assets" / "aa" / "Android"
+            split_root = final_root / "Bundle" / "Android"
             self.assertEqual((split_root / "remote.bundle.split0").read_bytes(), b"WX")
-            self.assertEqual((split_root / "remote.bundle.split1").read_bytes(), b"YZ12")
+            self.assertEqual((split_root / "remote.bundle.split1").read_bytes(), b"YZ")
+            self.assertFalse((split_root / "remote.bundle.split2").exists())
+            self.assertFalse((split_root / "remote.bundle").exists())
+            self.assertFalse((final_root / "SplitBundles").exists())
 
             relative_catalog = {"m_InternalIds": ["http/missing.bundle"]}
             downloads, unresolved = _build_remote_downloads(cfg, relative_catalog)

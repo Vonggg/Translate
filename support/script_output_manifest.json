@@ -15,6 +15,8 @@
         {"base": "records", "kind": "file", "path": "ref_map.json"},
         {"base": "records", "kind": "file", "path": "path_id_map.json"},
         {"base": "records", "kind": "file", "path": "tmp_manifest_index.json"},
+        {"base": "records", "kind": "file", "path": "bitmap_font_detection.json"},
+        {"base": "records", "kind": "file", "path": "localization_binding_detection.json"},
         {"base": "records", "kind": "file", "path": "string_field_stats.json"},
         {"base": "records", "kind": "file", "path": "string_field_stats.tsv"},
         {"base": "records", "kind": "file", "path": "string_field_review.txt"},
@@ -51,7 +53,7 @@
       ]
     },
     "4": {
-      "name": "导出翻译后的待替换 JSON",
+      "name": "导出并实际翻译 Text 资源",
       "notes": [
         "output/Text 是脚本 4 的基础输出目录；清理它也会移除脚本 5 写入其中的材质覆盖。"
       ],
@@ -97,12 +99,15 @@
       ]
     },
     "8": {
-      "name": "生成 Unity TMP 字体",
+      "name": "生成字体（支持 TMP、NGUI）",
       "notes": [
         "会同时清理辅助 Unity 项目中本次生成的字体资产和任务文件。"
       ],
       "outputs": [
         {"base": "output", "kind": "directory", "path": "Font/SDF/generated_templates"},
+        {"base": "output", "kind": "directory", "path": "Font/NGUI/generated"},
+        {"base": "records", "kind": "file", "path": "ngui_source_chars_removed_unsupported_by_ttf.txt"},
+        {"base": "records", "kind": "file", "path": "ngui_source_chars_removed_unsupported_by_ttf.tsv"},
         {"base": "unity_project", "kind": "glob", "path": "Assets/GeneratedFonts/generated_tmp_font.asset*"},
         {"base": "unity_project", "kind": "file", "path": "Assets/SourceFonts/font-job.json"},
         {"base": "unity_project", "kind": "glob", "path": "Assets/SourceFonts/{ttf_template_name}*"},
@@ -110,10 +115,12 @@
       ]
     },
     "9": {
-      "name": "准备 TMP/SDF 待导入替换",
+      "name": "准备字体待导入替换（支持 TMP、NGUI）",
       "outputs": [
         {"base": "output", "kind": "directory", "path": "Font/SDF/ToImport"},
-        {"base": "output", "kind": "file", "path": "Font/SDF/tmp_font_replacements.json"}
+        {"base": "output", "kind": "file", "path": "Font/SDF/tmp_font_replacements.json"},
+        {"base": "output", "kind": "directory", "path": "Font/NGUI/ToImport"},
+        {"base": "output", "kind": "file", "path": "Font/NGUI/ngui_font_replacements.json"}
       ]
     },
     "a": {

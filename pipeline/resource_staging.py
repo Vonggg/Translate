@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import re
 import shutil
 import urllib.parse
@@ -17,6 +19,7 @@ from tools.catalog_bin_tool import repack_binary_catalog_from_legacy_output
 
 
 REMOTE_PLACEHOLDER_RE = re.compile(r"\{[^}]*RemoteLoadPath[^}]*\}", re.IGNORECASE)
+RESOURCE_STAGING_STATE_VERSION = 2
 
 
 def _log_blue(message: str) -> None:
@@ -49,6 +52,95 @@ def remote_resource_report_path(cfg: PipelineConfig) -> Path:
 
 def split_merge_report_path(cfg: PipelineConfig) -> Path:
     return resource_state_root(cfg) / "split_bundle_merges.json"
+
+
+def _resource_source_fingerprint(cfg: PipelineConfig) -> dict[str, Any]:
+    """Cheap metadata fingerprint used to safely reuse the unified source tree."""
+    digest = hashlib.sha256()
+    file_count = 0
+    total_size = 0
+    latest_mtime_ns = 0
+
+    def add_file(label: str, path: Path) -> None:
+        nonlocal file_count, total_size, latest_mtime_ns
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        file_count += 1
+        total_size += stat.st_size
+        latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+        digest.update(label.replace("\\", "/").lower().encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update(b"\n")
+
+    roots = (
+        ("data", cfg.resource_source_root, True),
+        ("android", _addressables_android_root(cfg), False),
+    )
+    for label, root, skip_managed in roots:
+        if not root.is_dir():
+            continue
+        for current_root, dir_names, file_names in os.walk(root, topdown=True):
+            dir_names.sort()
+            if skip_managed:
+                dir_names[:] = [name for name in dir_names if name.lower() != "managed"]
+            current_path = Path(current_root)
+            for file_name in sorted(file_names):
+                path = current_path / file_name
+                try:
+                    relative = path.relative_to(root).as_posix()
+                except ValueError:
+                    relative = path.name
+                add_file(f"{label}/{relative}", path)
+
+    catalog_path = cfg.catalog_source_path
+    add_file(f"catalog/{catalog_path.name}", catalog_path)
+    catalog_hash_path = catalog_path.with_suffix(".hash")
+    if catalog_hash_path != catalog_path:
+        add_file(f"catalog/{catalog_hash_path.name}", catalog_hash_path)
+    return {
+        "file_count": file_count,
+        "total_size": total_size,
+        "latest_mtime_ns": latest_mtime_ns,
+        "fingerprint": digest.hexdigest(),
+    }
+
+
+def _reusable_staging_root(
+    cfg: PipelineConfig,
+    source_fingerprint: dict[str, Any],
+) -> Path | None:
+    state_path = resource_source_map_path(cfg)
+    if not state_path.is_file():
+        return None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return None
+    if not isinstance(state, dict):
+        return None
+    if state.get("state_version") != RESOURCE_STAGING_STATE_VERSION:
+        return None
+    if state.get("source_fingerprint") != source_fingerprint:
+        return None
+    staging_value = state.get("staging_root")
+    staging_root = Path(staging_value) if isinstance(staging_value, str) else cfg.resource_staging_root
+    if not staging_root.is_dir():
+        return None
+    entries = state.get("entries")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return None
+        staged_path = entry.get("staged_path")
+        if not isinstance(staged_path, str) or not Path(staged_path).is_file():
+            return None
+    return staging_root
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -522,6 +614,15 @@ def _source_info_for_staged_path(
 
 
 def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
+    source_fingerprint = _resource_source_fingerprint(cfg)
+    reusable_root = _reusable_staging_root(cfg, source_fingerprint)
+    if reusable_root is not None:
+        print(
+            f"[资源暂存] 源资源未变化，复用统一资源目录: {reusable_root} "
+            f"（文件={source_fingerprint['file_count']}）"
+        )
+        return reusable_root
+
     try:
         backup_game_addressables(cfg)
     except Exception as exc:
@@ -602,6 +703,8 @@ def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
         entries.append(entry)
 
     state = {
+        "state_version": RESOURCE_STAGING_STATE_VERSION,
+        "source_fingerprint": _resource_source_fingerprint(cfg),
         "staging_root": str(staging_root),
         "data_source_root": str(cfg.resource_source_root),
         "addressables_android_root": str(android_root),
@@ -694,28 +797,117 @@ def restore_imported_resource_paths(cfg: PipelineConfig, final_root: Path) -> di
     return restored
 
 
-def _write_split_parts(merged_path: Path, part_rows: list[dict[str, Any]], output_root: Path) -> list[Path]:
-    outputs: list[Path] = []
+def _write_split_parts_next_to_merged(
+    merged_path: Path,
+    part_rows: list[dict[str, Any]],
+) -> list[Path]:
+    first_part_name = Path(str(part_rows[0].get("name", ""))).name if part_rows else ""
+    match = re.fullmatch(r"(.+\.split)\d+", first_part_name)
+    if match is None:
+        raise RuntimeError(f"无法识别原分卷文件名: {first_part_name or '<空>'}")
+    part_prefix = match.group(1)
+    original_sizes = [int(row.get("size", 0) or 0) for row in part_rows]
+    if any(size <= 0 for size in original_sizes):
+        raise RuntimeError(f"原分卷大小无效: {merged_path}")
+    original_count = len(original_sizes)
+    merged_size = merged_path.stat().st_size
+    if merged_size < original_count:
+        raise RuntimeError(
+            f"修改后资源过小，无法在不生成空切片的情况下保持原分卷数量: "
+            f"file={merged_path}, size={merged_size}, parts={original_count}"
+        )
+
+    # Unity split files are a logical stream divided at a fixed chunk boundary.
+    # Every part except the final remainder must retain that boundary size;
+    # redistributing the bytes evenly changes offset -> splitN mapping and can
+    # leave Unity's Loading.AsyncRead thread spinning forever.
+    fixed_size_rows = original_sizes[:-1] or original_sizes
+    safe_part_limit = fixed_size_rows[0]
+    if any(size != safe_part_limit for size in fixed_size_rows):
+        raise RuntimeError(
+            f"原分卷的非尾片大小不一致，无法安全推导 Unity 固定切片边界: "
+            f"file={merged_path}, sizes={original_sizes}"
+        )
+    required_count = (merged_size + safe_part_limit - 1) // safe_part_limit
+    output_count = max(original_count, required_count)
+
+    final_size = merged_size - safe_part_limit * (output_count - 1)
+    if final_size <= 0:
+        # A large shrink can cross a split boundary. Keeping the old count would
+        # require an empty tail, while reducing it may leave stale high-numbered
+        # files in an overlay install. Stop instead of silently producing either
+        # unsafe layout.
+        raise RuntimeError(
+            f"修改后资源已跨越原分卷边界，无法安全保持原分卷数量: "
+            f"file={merged_path}, size={merged_size}, parts={original_count}, "
+            f"chunk={safe_part_limit}"
+        )
+    if final_size > safe_part_limit:
+        raise RuntimeError(
+            f"尾分卷超过 Unity 固定切片大小: {final_size} > {safe_part_limit}"
+        )
+    target_sizes = [safe_part_limit] * (output_count - 1) + [final_size]
+
+    available_space = shutil.disk_usage(merged_path.parent).free
+    required_space = merged_size + 16 * 1024 * 1024
+    if available_space < required_space:
+        raise RuntimeError(
+            f"安全切片临时空间不足: required={required_space}, available={available_space}, "
+            f"path={merged_path.parent}"
+        )
+
+    source_hash = hashlib.sha256()
     with merged_path.open("rb") as source:
-        for index, row in enumerate(part_rows):
-            relative_value = row.get("source_relative_game")
-            if not isinstance(relative_value, str) or not relative_value:
-                continue
-            destination = output_root / Path(relative_value)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            requested_size = int(row.get("size", 0) or 0)
-            remaining_for_part = requested_size if index < len(part_rows) - 1 else None
-            with destination.open("wb") as output:
-                while remaining_for_part is None or remaining_for_part > 0:
-                    chunk_size = 1024 * 1024 if remaining_for_part is None else min(1024 * 1024, remaining_for_part)
-                    chunk = source.read(chunk_size)
-                    if not chunk:
-                        break
-                    output.write(chunk)
-                    if remaining_for_part is not None:
-                        remaining_for_part -= len(chunk)
-            outputs.append(destination)
-    return outputs
+        while chunk := source.read(1024 * 1024):
+            source_hash.update(chunk)
+
+    temp_outputs: list[Path] = []
+    outputs: list[Path] = []
+    try:
+        with merged_path.open("rb") as source:
+            for index, target_size in enumerate(target_sizes):
+                destination = merged_path.with_name(f"{part_prefix}{index}")
+                temporary = destination.with_name(destination.name + ".split_tmp")
+                temporary.unlink(missing_ok=True)
+                remaining = target_size
+                with temporary.open("wb") as output:
+                    while remaining:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise RuntimeError(f"切片时提前到达文件结尾: {merged_path}")
+                        output.write(chunk)
+                        remaining -= len(chunk)
+                temp_outputs.append(temporary)
+                outputs.append(destination)
+            if source.read(1):
+                raise RuntimeError(f"切片完成后仍有未写入数据: {merged_path}")
+
+        merged_hash = hashlib.sha256()
+        for temporary in temp_outputs:
+            with temporary.open("rb") as part:
+                while chunk := part.read(1024 * 1024):
+                    merged_hash.update(chunk)
+        if merged_hash.digest() != source_hash.digest():
+            raise RuntimeError(f"切片重新合并 SHA-256 校验失败: {merged_path}")
+
+        for temporary, destination in zip(temp_outputs, outputs):
+            temporary.replace(destination)
+        for stale_part in merged_path.parent.glob(f"{part_prefix}*"):
+            suffix = stale_part.name[len(part_prefix):]
+            if stale_part.is_file() and suffix.isdigit() and int(suffix) >= output_count:
+                stale_part.unlink()
+        return outputs
+    finally:
+        for temporary in temp_outputs:
+            temporary.unlink(missing_ok=True)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def prepare_split_sync_outputs(
@@ -729,7 +921,6 @@ def prepare_split_sync_outputs(
     if not isinstance(entries, list):
         return 0
 
-    split_root = final_root / "SplitBundles"
     records: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -740,28 +931,49 @@ def prepare_split_sync_outputs(
         if not isinstance(part_rows, list) or not part_rows or modified_path is None or not modified_path.is_file():
             continue
 
-        source_relative_game = Path(str(entry.get("source_relative_game", staged_relative)))
-        merged_destination = split_root / "Merged" / source_relative_game
-        merged_destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(modified_path, merged_destination)
-        part_outputs = _write_split_parts(modified_path, part_rows, split_root / "Parts")
+        merged_sha256 = _sha256_file(modified_path)
+        part_outputs = _write_split_parts_next_to_merged(modified_path, part_rows)
+        if (
+            not part_outputs
+            or sum(path.stat().st_size for path in part_outputs)
+            != modified_path.stat().st_size
+        ):
+            for part_output in part_outputs:
+                part_output.unlink(missing_ok=True)
+            raise RuntimeError(f"分卷输出大小校验失败，已保留合并资源: {modified_path}")
+        modified_path.unlink()
+        original_part_count = len(part_rows)
+        added_outputs = part_outputs[original_part_count:]
+        if added_outputs:
+            _log_blue(
+                f"[分卷][新增] 修改后资源超过原分卷容量，已新增 {len(added_outputs)} 个切片；"
+                "重打包 APK 时必须把这些新文件一并加入，不能只替换已有条目。"
+            )
+            for added_output in added_outputs:
+                _log_blue(f"[分卷][新增] {added_output}")
         records.append(
             {
-                "modified_resource": str(modified_path),
-                "merged_output": str(merged_destination),
+                "removed_merged_resource": str(modified_path),
                 "split_outputs": [str(path) for path in part_outputs],
+                "original_part_count": original_part_count,
+                "output_part_count": len(part_outputs),
+                "added_split_outputs": [str(path) for path in added_outputs],
+                "original_part_sizes": [int(row.get("size", 0) or 0) for row in part_rows],
+                "output_part_sizes": [path.stat().st_size for path in part_outputs],
+                "remerged_sha256": merged_sha256,
             }
         )
 
+    legacy_split_root = final_root / "SplitBundles"
+    if legacy_split_root.exists():
+        shutil.rmtree(legacy_split_root)
     if not records:
         return 0
-    report_path = split_root / "split_sync_report.json"
+    report_path = resource_state_root(cfg) / "final_split_outputs.json"
     _write_json(report_path, records)
-    _log_blue(f"[分卷][需要同步] 已生成修改后分卷资源: {len(records)} 组")
-    _log_blue(f"[分卷][需要同步] 合并文件: {split_root / 'Merged'}")
-    _log_blue(f"[分卷][需要同步] 可直接替换的 split 文件: {split_root / 'Parts'}")
-    _log_blue("[分卷][需要同步] 必须同步替换原 .splitN；否则程序会继续读取 split 缓存，而不是修改后的合并资源。")
-    _log_blue(f"[分卷][需要同步] 报告: {report_path}")
+    _log_blue(f"[分卷][完成] 已将 FinalResult 中 {len(records)} 个合并资源替换为原布局 split 文件")
+    _log_blue("[分卷][完成] FinalResult 可直接按目录覆盖，不再保留 SplitBundles 和合并版资源")
+    _log_blue(f"[分卷][完成] 输出记录: {report_path}")
     return len(records)
 
 

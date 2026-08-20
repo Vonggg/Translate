@@ -10,9 +10,11 @@ Unity 游戏资源汉化工具链。主要流程是：导出资源到 `workspace
 python .\快速配置.py --from-template
 ```
 
-脚本以 `config.json.记得备份` 为通用模板，自动探测游戏的 `assets/bin/Data`、Managed、Addressables catalog、IL2CPP stringliteral 和当前 Python，并询问 Unity 与可选翻译方式。仓库自带的 `templates/fzkt.ttf` 会直接使用，无需配置。写入前会显示检查结果；已有 `config.json` 会按时间生成备份。
+脚本以 `config.json.记得备份` 为通用模板，设置 adbuybox 根目录和当前 Python，并询问 Unity 与可选翻译方式。资源、Managed、Addressables catalog 和 IL2CPP stringliteral 使用固定的项目相对路径，不会扫描或选择资源目录。仓库自带的 `templates/fzkt.ttf` 会直接使用，无需配置。写入前会显示检查结果；已有 `config.json` 会按时间生成备份。
 
-也可通过统一启动器选择 `0. 首次使用快速配置`。该入口固定使用启动器当前的 Python，因此旧 `config.json` 中失效的 `python_executable` 不会阻止配置。配置时会依次优先使用命令行指定的 Python、已有且有效的配置、项目或上级目录中的 `.venv/venv`，最后才使用启动器当前的 Python；写入前会实际检查 Python 版本及 `requirements.txt` 对应依赖，避免把只能运行配置脚本、却不能运行主程序的解释器写入配置。
+快速配置不会检查这些固定资源相对路径当前是否存在；具体资源流程运行时再按需检查。
+
+也可通过统一启动器选择 `0. 首次使用快速配置`。该入口固定使用启动器当前的 Python，因此旧 `config.json` 中失效的 `python_executable` 不会阻止配置。`python_executable` 是可选的虚拟 Python 环境配置：快速配置接受环境目录或具体 Python 可执行文件，留空时 `run_with_config_python.py` 使用启动器自身的当前 Python；填写时会检查 Python 版本及 `requirements.txt` 对应依赖。
 
 分享工具时请分享不含凭据的 `config.json.记得备份`，不要直接分享个人 `config.json`。可用以下命令检查当前配置：
 
@@ -27,9 +29,9 @@ python .\快速配置.py --check
 ### 游戏路径
 
 - `project_root_dir`
-  - 游戏项目所在的总目录。
+  - 完整 `adbuybox` 目录，通常是 `game-name` 的上一级目录；快速配置只检查目录是否存在。
 - `project_name`
-  - 当前要处理的游戏项目目录名。
+  - 可留空；快速配置默认留空。旧配置仍可填写项目目录名，并与 `project_root_dir` 拼接。
 - `resource_source_subpath`
   - 游戏资源目录相对路径，一般是 `game-name/game/assets/bin/Data`。
 - `resource_managed_subpath`
@@ -47,13 +49,13 @@ python .\快速配置.py --check
 `bin/Data` 资源路径由：
 
 ```text
-project_root_dir + project_name + resource_source_subpath
+project_root_dir + （可选的 project_name） + resource_source_subpath
 ```
 
 拼出来。导出前如果 Managed 目录缺 DLL，脚本会尝试从：
 
 ```text
-project_root_dir/project_name/game-name/bak/64/DummyDll
+project_root_dir/[project_name/]game-name/bak/64/DummyDll
 ```
 
 补到 Managed 目录。

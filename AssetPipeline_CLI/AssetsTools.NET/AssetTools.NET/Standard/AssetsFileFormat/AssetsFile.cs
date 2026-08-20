@@ -142,6 +142,7 @@ namespace AssetsTools.NET
             }
 
             long newFirstFileOffset = writer.Position;
+            int assetDataAlignment = DetectOriginalAssetDataAlignment();
 
             // write all asset data
             for (int i = 0; i < newAssetInfos.Count; i++)
@@ -165,7 +166,16 @@ namespace AssetsTools.NET
                 assetInfo.ByteSize = (uint)(writer.Position - startPosition);
 
                 if (i != newAssetInfos.Count - 1)
-                    writer.Align8();
+                {
+                    // Preserve the alignment observed in the source SerializedFile.
+                    // Some files use 16-byte object starts while legacy files use 8.
+                    // Replacing the original layout with a hard-coded alignment can
+                    // produce a file that third-party tools reopen but Unity rejects.
+                    if (assetDataAlignment == 16)
+                        writer.Align16();
+                    else
+                        writer.Align8();
+                }
             }
 
             long newFileSize = writer.Position - writeStart;
@@ -189,6 +199,20 @@ namespace AssetsTools.NET
 
             // Set writer position back to end of file
             writer.Position = writeStart + newFileSize;
+        }
+
+        private int DetectOriginalAssetDataAlignment()
+        {
+            if (Metadata.AssetInfos.Count == 0)
+                return 8;
+
+            foreach (AssetFileInfo assetInfo in Metadata.AssetInfos)
+            {
+                long absoluteOffset = assetInfo.GetAbsoluteByteOffset(this);
+                if (absoluteOffset % 16 != 0)
+                    return 8;
+            }
+            return 16;
         }
 
         /// <summary>

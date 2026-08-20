@@ -23,11 +23,12 @@ namespace UnityResourceCLI
             RecurseTextDump(baseField, 0);
         }
 
-        public void DumpJsonAsset(StreamWriter sw, AssetTypeValueField baseField)
+        public JToken DumpJsonAsset(StreamWriter sw, AssetTypeValueField baseField)
         {
             this.sw = sw;
             JToken token = RecurseJsonDump(baseField);
             sw.Write(token.ToString());
+            return token;
         }
 
         public byte[]? ImportTextAsset(StreamReader sr, out string? exceptionMessage)

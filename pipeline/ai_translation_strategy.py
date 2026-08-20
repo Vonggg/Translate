@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 from typing import Any
 
 
 DEFAULT_BATCH_MAX_CHARS = 1200000
 DEFAULT_MAX_OUTPUT_CHARS = 384000
+DEFAULT_OUTPUT_SAFETY_DIVISOR = 12
+
+_TRANSLATION_JSON_DELIMITER_TYPO = re.compile(
+    r'("(?:items|id|translation|text)")\s*[=>]\s*(?=[\[\{"\-0-9tfn])'
+)
 
 
 def get_strategy(cfg: Any) -> Any:
@@ -41,7 +47,32 @@ class DefaultAITranslationStrategy:
     @property
     def batch_output_budget_chars(self) -> int:
         max_output = int(getattr(self.cfg, "ai_translation_max_output_chars", DEFAULT_MAX_OUTPUT_CHARS) or DEFAULT_MAX_OUTPUT_CHARS)
-        return max(10000, max_output // 6)
+        divisor = max(
+            1,
+            int(
+                getattr(
+                    self.cfg,
+                    "ai_translation_output_safety_divisor",
+                    DEFAULT_OUTPUT_SAFETY_DIVISOR,
+                )
+                or DEFAULT_OUTPUT_SAFETY_DIVISOR
+            ),
+        )
+        return max(10000, max_output // divisor)
+
+    @property
+    def output_safety_divisor(self) -> int:
+        return max(
+            1,
+            int(
+                getattr(
+                    self.cfg,
+                    "ai_translation_output_safety_divisor",
+                    DEFAULT_OUTPUT_SAFETY_DIVISOR,
+                )
+                or DEFAULT_OUTPUT_SAFETY_DIVISOR
+            ),
+        )
 
     def estimate_output_chars(self, source_text: str) -> int:
         return len(source_text) + 64
@@ -82,6 +113,8 @@ class DefaultAITranslationStrategy:
             "保留 id，不要新增、删除、合并、重排项目。"
             "保留换行、占位符、数字、货币符号、格式控制符和富文本标签。"
             "只返回严格 JSON，格式为 {\"items\":[{\"id\":数字,\"translation\":\"译文\"}]}。"
+            "必须严格使用 JSON 属性分隔符：每个 id、translation、items 键后都必须是英文冒号 :，"
+            "绝不能误写成 >、=，也不能漏掉冒号；相邻对象之间必须使用英文逗号分隔。"
             "译文需要引号时优先使用中文引号“”或‘’，例如 <color=blue>“服务”</color>；"
             "如果必须使用英文双引号，必须按 JSON 规则转义为 \\\"，绝不能在 translation 字符串中输出未转义的英文双引号。"
             "返回前必须检查整个响应可以被标准 JSON 解析器直接解析。"
@@ -124,12 +157,26 @@ def _extract_json_object(content: str) -> dict[str, Any]:
         content = "\n".join(lines).strip()
     try:
         data = json.loads(content)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as original_error:
+        repaired = _TRANSLATION_JSON_DELIMITER_TYPO.sub(r"\1:", content)
+        if repaired != content:
+            try:
+                data = json.loads(repaired)
+            except json.JSONDecodeError:
+                data = None
+            else:
+                if isinstance(data, dict):
+                    return data
         start = content.find("{")
         end = content.rfind("}")
         if start < 0 or end <= start:
-            raise
-        data = json.loads(content[start:end + 1])
+            raise original_error
+        fragment = content[start:end + 1]
+        try:
+            data = json.loads(fragment)
+        except json.JSONDecodeError:
+            repaired_fragment = _TRANSLATION_JSON_DELIMITER_TYPO.sub(r"\1:", fragment)
+            data = json.loads(repaired_fragment)
     if not isinstance(data, dict):
         raise ValueError("AI translation response is not a JSON object.")
     return data

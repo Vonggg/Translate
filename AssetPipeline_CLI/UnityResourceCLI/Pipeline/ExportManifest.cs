@@ -4,10 +4,19 @@ namespace UnityResourceCLI
 {
     internal sealed class ExportManifest
     {
+        public int ExporterSchemaVersion { get; set; }
+        public string ExporterBuildFingerprint { get; set; } = "";
+        public string ManagedStateFingerprint { get; set; } = "";
+        public string DumpFormat { get; set; } = "";
+        public string ImageFormat { get; set; } = "";
+        public int ImageQuality { get; set; }
         public string SourceRelativePath { get; set; } = "";
         public string SourceKind { get; set; } = "";
         public string SourceFileName { get; set; } = "";
+        public long SourceLength { get; set; }
+        public long SourceLastWriteTimeUtcTicks { get; set; }
         public string UnityVersion { get; set; } = "";
+        public List<string> ExportedProfiles { get; set; } = new();
         public List<ExportManifestAssetsFile> AssetsFiles { get; set; } = new();
         public List<ExportManifestMonoBehaviourSummary> MonoBehaviourSummaries { get; set; } = new();
         public List<ExportManifestItem> Items { get; set; } = new();
@@ -52,5 +61,8 @@ namespace UnityResourceCLI
         public string ReferenceUnityVersion { get; set; } = "";
         public string TypeTreeFingerprint { get; set; } = "";
         public string JsonSchemaFingerprint { get; set; } = "";
+        public bool OutputFileExists { get; set; }
+        public long OutputFileLength { get; set; }
+        public long OutputFileLastWriteTimeUtcTicks { get; set; }
     }
 }

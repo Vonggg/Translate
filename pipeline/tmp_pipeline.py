@@ -322,7 +322,7 @@ def _report_translation_chars_missing_from_ttf(
     if stop_on_missing:
         _log_red(f"[TMP][停止] 请先修改 trans.json 中对应译文，或更换包含这些字符的{label}，然后重新执行菜单 7。")
         if output_prefix == "translation_chars_missing_from_ttf":
-            print("[TMP][提示] 可运行 工具脚本.py -> 8. 清理 trans.json 中模板 TTF 不支持的字符。", flush=True)
+            print("[TMP][提示] 可运行 工具脚本.py -> 主菜单 4. 清理 trans.json 中模板 TTF 不支持的字符。", flush=True)
             print(f"[TMP][提示] 命令行: python {cfg.root_dir / '工具脚本.py'} clean-unsupported-ttf-chars", flush=True)
     else:
         print(f"[TMP][提示] 这只影响{label}兼容性，不中断当前菜单 7 后续流程。", flush=True)
@@ -580,6 +580,23 @@ def _is_tmp_font_asset(data: Any) -> bool:
 def _merge_generated_font_data(generated: Any, original: Any) -> Any:
     """Overlay generated values while retaining fields only the game asset has."""
     if not isinstance(generated, dict) or not isinstance(original, dict):
+        # Unity's YAML parser emits whole-number float fields as Python ints
+        # (for example ``m_Scale: 1``).  Preserve the scalar kind from the
+        # exported game JSON so schema checks still see Float rather than
+        # Integer while retaining the newly generated metric value.
+        if (
+            isinstance(original, float)
+            and isinstance(generated, (int, float))
+            and not isinstance(generated, bool)
+        ):
+            return float(generated)
+        if (
+            isinstance(original, int)
+            and not isinstance(original, bool)
+            and isinstance(generated, float)
+            and generated.is_integer()
+        ):
+            return int(generated)
         return copy.deepcopy(generated)
 
     merged = copy.deepcopy(original)
@@ -617,7 +634,7 @@ def _build_tmp_font_replacement(template: dict[str, Any], old: dict[str, Any]) -
         new["m_AtlasTextureIndex"] = copy.deepcopy(template["m_AtlasTextureIndex"])
 
     if isinstance(template.get("m_FaceInfo"), dict) and isinstance(new.get("m_FaceInfo"), dict):
-        patched_face_info = copy.deepcopy(template["m_FaceInfo"])
+        patched_face_info = _merge_generated_font_data(template["m_FaceInfo"], old["m_FaceInfo"])
         for key in ("m_FamilyName", "m_StyleName", "m_UnitsPerEM"):
             if key in old["m_FaceInfo"]:
                 patched_face_info[key] = copy.deepcopy(old["m_FaceInfo"][key])

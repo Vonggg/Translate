@@ -219,14 +219,23 @@ def parse_catalog_to_output(cfg: PipelineConfig, source_path: Path | None = None
             f"Locations: {summary['unique_location_count']}",
             f"AssetBundle locations: {summary['asset_bundle_location_count']}",
             f"Catalog hash recorded: {hash_info['recorded']}",
+            f"Catalog hash algorithm: {hash_info['algorithm']}",
             f"Catalog hash calculated: {hash_info['calculated']}",
+            f"Catalog hash candidates: {hash_info['calculated_by_algorithm']}",
             f"Catalog hash matches: {hash_info['matches']}",
         ]
         report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         if hash_info["matches"] is False:
+            candidates = hash_info["calculated_by_algorithm"]
             raise RuntimeError(
                 "catalog.hash 校验失败: "
-                f"记录={hash_info['recorded']} 计算={hash_info['calculated']}"
+                f"记录={hash_info['recorded']} "
+                f"MD5={candidates['md5']} "
+                f"SpookyHash128={candidates['spookyhash128']}"
+            )
+        if hash_info["matches"] is True:
+            _log_green(
+                f"[catalog.bin] catalog.hash 算法: {hash_info['algorithm']}"
             )
         _log_green(
             f"[catalog.bin] 已生成统一 Output.json: {expanded_path}，"
@@ -676,6 +685,7 @@ def validate_catalog_crc_algorithm(
         })
 
     option_by_crc_size: dict[tuple[int, int], list[dict]] = {}
+    option_by_name_size: dict[tuple[str, int], list[dict]] = {}
     for row in options:
         if not isinstance(row, dict):
             continue
@@ -683,6 +693,18 @@ def validate_catalog_crc_algorithm(
         row_size = row.get("m_BundleSize")
         if isinstance(row_crc, int) and row_crc != 0 and isinstance(row_size, int):
             option_by_crc_size.setdefault((row_crc, row_size), []).append(row)
+        # m_Crc=0 is a valid Addressables setting (CRC checking disabled).
+        # Keep those rows indexed by their actual bundle name and size so the
+        # preflight can still identify them without requiring a CRC value.
+        if isinstance(row_size, int):
+            primary_key = row.get("PrimaryKey")
+            internal_id = row.get("InternalId")
+            names: set[str] = set()
+            for value in (primary_key, internal_id):
+                if isinstance(value, str) and value:
+                    names.add(Path(value.replace("\\", "/")).name)
+            for bundle_name in names:
+                option_by_name_size.setdefault((bundle_name.lower(), row_size), []).append(row)
 
     source_bundles_by_name: dict[str, list[Path]] = {}
     if source_bundle_root.is_dir():
@@ -726,6 +748,14 @@ def validate_catalog_crc_algorithm(
         if len(candidates) == 1:
             passed += 1
             continue
+        if not candidates:
+            # A zero m_Crc means the catalog intentionally disables CRC
+            # validation.  Require an unambiguous filename + source-size match
+            # instead of treating the missing non-zero CRC as corruption.
+            name_candidates = option_by_name_size.get((matched_final.name.lower(), source_size), [])
+            if len(name_candidates) == 1 and int(name_candidates[0].get("m_Crc", 0) or 0) == 0:
+                passed += 1
+                continue
         failures.append({
             "reason": "catalog_crc_size_not_found" if not candidates else "catalog_crc_size_ambiguous",
             "bundle_name": matched_final.name,
@@ -750,7 +780,13 @@ def validate_catalog_crc_algorithm(
         for failure in failures[:10]:
             print(f"[catalog][停止] {failure}")
         if cfg.enable_sample_collection:
-            save_catalog_crc_sample(cfg, output_dir, source_bundle_root, final_bundle_root, failures)
+            save_catalog_crc_sample(
+                cfg,
+                output_dir,
+                source_bundle_root,
+                final_bundle_root,
+                failures,
+            )
         else:
             print("[catalog][样本] 自动保存已关闭，可通过 enable_sample_collection 启用。")
         return False

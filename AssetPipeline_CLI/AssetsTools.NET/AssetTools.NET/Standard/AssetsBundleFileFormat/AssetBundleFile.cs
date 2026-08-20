@@ -456,12 +456,14 @@ namespace AssetsTools.NET
             Stream bundleDataStream = DataReader.BaseStream;
             bundleDataStream.Position = 0;
 
-            int fileDataLength = (int)bundleDataStream.Length;
+            long fileDataLength = bundleDataStream.Length;
 
             switch (compType)
             {
                 case AssetBundleCompressionType.LZMA:
                 {
+                    if (fileDataLength > uint.MaxValue)
+                        throw new NotSupportedException("LZMA UnityFS blocks larger than 4 GiB are not supported; use an LZ4 source bundle.");
                     // write to one large lzma block
                     Stream writeStream;
                     if (blockDirAtEnd)
@@ -566,16 +568,20 @@ namespace AssetsTools.NET
                 }
                 case AssetBundleCompressionType.None:
                 {
-                    AssetBundleBlockInfo blockInfo = new AssetBundleBlockInfo()
+                    long remaining = fileDataLength;
+                    while (remaining > 0)
                     {
-                        CompressedSize = (uint)fileDataLength,
-                        DecompressedSize = (uint)fileDataLength,
-                        Flags = 0x00
-                    };
-
-                    totalCompressedSize += blockInfo.CompressedSize;
-
-                    newBlocks.Add(blockInfo);
+                        uint blockSize = (uint)Math.Min(0x20000, remaining);
+                        AssetBundleBlockInfo blockInfo = new AssetBundleBlockInfo()
+                        {
+                            CompressedSize = blockSize,
+                            DecompressedSize = blockSize,
+                            Flags = 0x00
+                        };
+                        totalCompressedSize += blockInfo.CompressedSize;
+                        newBlocks.Add(blockInfo);
+                        remaining -= blockSize;
+                    }
 
                     if (blockDirAtEnd)
                         bundleDataStream.CopyToCompat(writer.BaseStream);

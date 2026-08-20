@@ -67,6 +67,7 @@ OBJECT_INDEX_JSON_DIRS = {
     "Transform",
     "RectTransform",
     "Sprite",
+    "SpriteAtlas",
     "SpriteRenderer",
     "Mesh",
     "MeshFilter",
@@ -101,3 +102,4 @@ class ScanRecord:
     translated_text: str = ""
     path_id: int | None = None
     font_path_id: int | None = None
+    embedded_locator: dict[str, Any] | None = None

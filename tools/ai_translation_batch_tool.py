@@ -14,7 +14,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from support.config import load_config
 from pipeline.ai_translation_strategy import get_strategy
+from pipeline.codex_cli_provider import request_structured_output, translation_schema
 from pipeline.shared import atomic_write_json, read_json, write_json
+
+_REQUEST_JSON_DELIMITER_TYPO = re.compile(
+    r'("(?:items|id|translation|text)")\s*[=>]\s*(?=[\[\{"\-0-9tfn])'
+)
+MAX_MISSING_RETRY_ROUNDS = 3
 
 
 def log(message: str) -> None:
@@ -36,7 +42,11 @@ def default_response_path(request_path: Path) -> Path:
 
 
 def load_request_items(request_path: Path) -> dict[int, str]:
-    payload = read_json(request_path)
+    try:
+        payload = read_json(request_path)
+    except (OSError, json.JSONDecodeError):
+        raw = request_path.read_text(encoding="utf-8-sig")
+        payload = _extract_request_file_payload(raw, request_path)
     messages = payload.get("messages")
     if not isinstance(messages, list):
         raise ValueError(f"request JSON 缺少 messages: {request_path}")
@@ -47,7 +57,7 @@ def load_request_items(request_path: Path) -> dict[int, str]:
             break
     if not user_content:
         raise ValueError(f"request JSON 没有 user content: {request_path}")
-    data = json.loads(user_content)
+    data = _extract_request_payload_json(user_content, request_path)
     items = data.get("items")
     if not isinstance(items, list):
         raise ValueError(f"user content 缺少 items 数组: {request_path}")
@@ -62,6 +72,75 @@ def load_request_items(request_path: Path) -> dict[int, str]:
     if not result:
         raise ValueError(f"request JSON 没有可用翻译条目: {request_path}")
     return result
+
+
+def _extract_request_file_payload(raw_content: str, request_path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(raw_content)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError as original_error:
+        start = raw_content.find("{")
+        end = raw_content.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError(f"request JSON 无法解析: {request_path}") from original_error
+
+        fragment = raw_content[start : end + 1]
+        try:
+            data = json.loads(fragment)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            repaired = _REQUEST_JSON_DELIMITER_TYPO.sub(r"\1:", fragment)
+            data = json.loads(repaired)
+            if isinstance(data, dict):
+                return data
+
+    raise ValueError(f"request JSON 无法解析: {request_path}")
+
+
+def _extract_request_payload_json(content: str, request_path: Path) -> dict[str, Any]:
+    """Extract the inner request payload object from message content, tolerating minor corruption."""
+    raw = content.strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError as original_error:
+        repaired = _REQUEST_JSON_DELIMITER_TYPO.sub(r"\1:", raw)
+        if repaired != raw:
+            try:
+                data = json.loads(repaired)
+            except json.JSONDecodeError:
+                data = None
+            else:
+                if isinstance(data, dict):
+                    return data
+
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError(f"request JSON 无法提取对象: {request_path}") from original_error
+
+        fragment = raw[start:end + 1]
+        try:
+            data = json.loads(fragment)
+        except json.JSONDecodeError:
+            repaired_fragment = _REQUEST_JSON_DELIMITER_TYPO.sub(r"\1:", fragment)
+            data = json.loads(repaired_fragment)
+
+        if isinstance(data, dict):
+            return data
+
+    raise ValueError(f"request JSON 解析失败: {request_path}")
 
 
 def response_content(response_path: Path) -> str:
@@ -141,16 +220,51 @@ def make_combined_response(model: str, translations: dict[int, str], usage_items
     }
 
 
+def _archive_raw_response(response_path: Path, data: dict[str, Any]) -> Path:
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    for sequence in range(1, 1000):
+        raw_path = response_path.with_name(
+            f"{response_path.stem}_raw_{stamp}_{sequence:03d}.json"
+        )
+        if not raw_path.exists():
+            write_json(raw_path, data)
+            log(f"[AI补批] 原始响应已保存: {raw_path}")
+            return raw_path
+    raise RuntimeError(f"无法为原始响应分配存档文件名: {response_path.parent}")
+
+
+def _response_message_content(data: dict[str, Any], label: str) -> tuple[str, str]:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        error = data.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            raise RuntimeError(f"{label} AI 服务返回错误: {error['message']}")
+        raise RuntimeError(f"{label} response 缺少 choices")
+    choice = choices[0]
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise RuntimeError(f"{label} response 缺少 choices[0].message")
+    return str(message.get("content", "")), str(choice.get("finish_reason", ""))
+
+
 def resend_batch(request_path: Path, response_path: Path) -> None:
     cfg = load_config(quiet=True)
     strategy = get_strategy(cfg)
+    transport = str(getattr(cfg, "ai_translation_transport", "http") or "http").strip().lower()
     base_url = cfg.ai_translation_base_url.strip().rstrip("/")
     api_key = cfg.ai_translation_api_key.strip()
-    if not (base_url and api_key):
+    if transport == "http" and not (base_url and api_key):
         raise RuntimeError("AI 翻译接口未配置 base_url/api_key，无法重发批次。")
+    if transport not in {"http", "codex_cli"}:
+        raise RuntimeError(f"不支持的 AI translation transport: {transport}")
 
     original_payload = read_json(request_path)
-    model = str(original_payload.get("model") or cfg.ai_translation_model).strip()
+    if transport == "codex_cli":
+        model = str(
+            getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark")
+        ).strip()
+    else:
+        model = str(original_payload.get("model") or cfg.ai_translation_model).strip()
     if not model:
         raise RuntimeError("request JSON 和 config.json 都没有配置 model。")
 
@@ -165,7 +279,11 @@ def resend_batch(request_path: Path, response_path: Path) -> None:
 
     log(f"[AI补批] 请求文件: {request_path}")
     log(f"[AI补批] 输出文件: {response_path}")
-    log(f"[AI补批] model={model}, base_url={base_url}, strategy={getattr(strategy, 'name', 'custom')}")
+    endpoint = base_url if transport == "http" else "Codex CLI"
+    log(
+        f"[AI补批] transport={transport}, model={model}, endpoint={endpoint}, "
+        f"strategy={getattr(strategy, 'name', 'custom')}"
+    )
 
     id_to_source = load_request_items(request_path)
     pending_items = list(id_to_source.items())
@@ -177,39 +295,131 @@ def resend_batch(request_path: Path, response_path: Path) -> None:
 
     all_translations: dict[int, str] = {}
     usage_items: list[dict[str, Any]] = []
-    for sub_index, sub_batch in enumerate(sub_batches, start=1):
+
+    def request_sub_batch(
+        sub_batch: list[tuple[int, str]],
+        label: str,
+        sub_index: int,
+        sub_count: int,
+    ) -> dict[int, str]:
         estimated_output = sum(strategy.estimate_output_chars(text) for _item_id, text in sub_batch)
-        user_content_size = len(strategy.user_content(sub_batch, sub_index, len(sub_batches)))
+        user_content_size = len(strategy.user_content(sub_batch, sub_index, sub_count))
         log_green(
-            f"[AI补批] 开始子批 {sub_index}/{len(sub_batches)}，"
+            f"[AI补批] 开始{label}，"
             f"条目={len(sub_batch)}，输入字符={user_content_size}，预计输出={estimated_output}"
         )
-        payload = make_batch_payload(cfg, strategy, model, sub_batch, sub_index, len(sub_batches))
-        data = post_ai_payload(payload, base_url, api_key, proxies, cfg.ai_translation_timeout, f"子批 {sub_index}/{len(sub_batches)}")
-        finish_reason = ""
-        try:
-            finish_reason = str(data["choices"][0].get("finish_reason", ""))
-        except Exception:
-            pass
+        payload = make_batch_payload(cfg, strategy, model, sub_batch, sub_index, sub_count)
+        if transport == "codex_cli":
+            started_at = time.monotonic()
+            structured, usage = request_structured_output(
+                model=model,
+                reasoning_effort=str(getattr(cfg, "ai_translation_codex_reasoning_effort", "low")),
+                system_prompt=strategy.system_prompt(),
+                user_content=payload["messages"][1]["content"],
+                output_schema=translation_schema(),
+                timeout=cfg.ai_translation_timeout,
+                working_directory=cfg.root_dir,
+            )
+            data = {
+                "object": "codex.cli.response",
+                "model": model,
+                "provider": "codex_cli",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(structured, ensure_ascii=False),
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": usage,
+            }
+            elapsed = int(time.monotonic() - started_at)
+            log_green(f"[AI补批] {label} Codex CLI 已响应，耗时={elapsed} 秒")
+        else:
+            data = post_ai_payload(
+                payload,
+                base_url,
+                api_key,
+                proxies,
+                cfg.ai_translation_timeout,
+                label,
+            )
+        _archive_raw_response(response_path, data)
+        content, finish_reason = _response_message_content(data, label)
         if finish_reason == "stop":
-            log_green(f"[AI补批] 子批 {sub_index}/{len(sub_batches)} 正常结束: finish_reason=stop")
+            log_green(f"[AI补批] {label} 正常结束: finish_reason=stop")
         elif finish_reason:
-            log(f"[AI补批] 子批 {sub_index}/{len(sub_batches)} finish_reason={finish_reason}")
+            log(f"[AI补批] {label} finish_reason={finish_reason}")
         if finish_reason == "length":
-            raise RuntimeError(f"子批 {sub_index}/{len(sub_batches)} 仍被长度截断，请继续降低 ai_translation_max_output_chars 或拆得更小。")
+            raise RuntimeError(f"{label} 仍被长度截断，请继续降低 ai_translation_max_output_chars 或拆得更小。")
         usage = data.get("usage")
         if isinstance(usage, dict):
             usage_items.append(usage)
-        content = str(data["choices"][0]["message"]["content"])
         parsed = strategy.parse_response(content)
+        expected_ids = {item_id for item_id, _text in sub_batch}
+        accepted = {
+            item_id: translation
+            for item_id, translation in parsed.items()
+            if item_id in expected_ids and translation
+        }
+        unexpected_count = len(parsed) - len(accepted)
+        if unexpected_count:
+            log(f"[AI补批][提示] {label} 忽略了 {unexpected_count} 个非本批或无效 id")
+        return accepted
+
+    for sub_index, sub_batch in enumerate(sub_batches, start=1):
+        label = f"子批 {sub_index}/{len(sub_batches)}"
+        parsed = request_sub_batch(sub_batch, label, sub_index, len(sub_batches))
         all_translations.update(parsed)
-        log(f"[AI补批] 子批 {sub_index}/{len(sub_batches)} 完成，返回={len(parsed)}，累计={len(all_translations)}")
+        missing_in_sub_batch = [item_id for item_id, _text in sub_batch if item_id not in parsed]
+        log(
+            f"[AI补批] {label} 完成，返回={len(parsed)}，"
+            f"缺少={len(missing_in_sub_batch)}，累计={len(all_translations)}"
+        )
+
+    for retry_round in range(1, MAX_MISSING_RETRY_ROUNDS + 1):
+        missing_items = [
+            (item_id, source_text)
+            for item_id, source_text in pending_items
+            if item_id not in all_translations
+        ]
+        if not missing_items:
+            break
+        retry_batches = strategy.build_batches(missing_items)
+        preview = ",".join(str(item_id) for item_id, _text in missing_items[:30])
+        suffix = "..." if len(missing_items) > 30 else ""
+        log(
+            f"[AI补批][缺失重试] 第 {retry_round}/{MAX_MISSING_RETRY_ROUNDS} 轮，"
+            f"仅重发 {len(missing_items)} 个 id: {preview}{suffix}"
+        )
+        before_count = len(all_translations)
+        for retry_index, retry_batch in enumerate(retry_batches, start=1):
+            label = (
+                f"缺失重试 {retry_round}/{MAX_MISSING_RETRY_ROUNDS} "
+                f"子批 {retry_index}/{len(retry_batches)}"
+            )
+            parsed = request_sub_batch(
+                retry_batch,
+                label,
+                retry_index,
+                len(retry_batches),
+            )
+            all_translations.update(parsed)
+            log(
+                f"[AI补批] {label} 完成，返回={len(parsed)}，累计={len(all_translations)}"
+            )
+        if len(all_translations) == before_count:
+            log(f"[AI补批][缺失重试] 第 {retry_round} 轮没有补回任何条目")
 
     missing_ids = [item_id for item_id, _text in pending_items if item_id not in all_translations]
     if missing_ids:
         preview = ",".join(str(item_id) for item_id in missing_ids[:30])
         suffix = "..." if len(missing_ids) > 30 else ""
-        raise RuntimeError(f"补批后仍缺少 {len(missing_ids)} 个 id: {preview}{suffix}")
+        raise RuntimeError(
+            f"经过 {MAX_MISSING_RETRY_ROUNDS} 轮缺失重试后仍缺少 "
+            f"{len(missing_ids)} 个 id: {preview}{suffix}；原始响应已单独留档。"
+        )
 
     combined = make_combined_response(model, all_translations, usage_items)
     write_json(response_path, combined)

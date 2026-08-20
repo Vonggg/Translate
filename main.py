@@ -10,12 +10,25 @@ from support.config import load_config
 from support.menu_selection import parse_number_ranges
 from pipeline.font_ttf import build_ttf_replacements
 from pipeline.manifest_index import tmp_manifest_index_path
+from pipeline.ngui_font import (
+    generate_ngui_fonts,
+    prepare_generated_ngui_import_replacements,
+)
+from pipeline.bitmap_font_detection import (
+    REPORT_FILENAME as BITMAP_FONT_REPORT_FILENAME,
+    UnsupportedBitmapFontError,
+    load_font_pipeline_modes,
+)
+from pipeline.localization_binding_detection import (
+    REPORT_FILENAME as LOCALIZATION_BINDING_REPORT_FILENAME,
+)
 from pipeline.tmp_pipeline import (
     build_merged_tmp_chars,
     launch_unity_tmp_generator,
     prepare_generated_tmp_import_replacements,
 )
 from pipeline.translation import (
+    UNFILTERED_RECORDS_FILENAME,
     apply_ai_field_selection_to_records,
     disable_translated_text_effect_components,
     export_translated_files,
@@ -57,6 +70,8 @@ def scan_generated_artifact_paths(cfg) -> list[Path]:
         cfg.scan_state_path,
         cfg.scan_cache_path,
         tmp_manifest_index_path(cfg),
+        cfg.stage_record_dir / BITMAP_FONT_REPORT_FILENAME,
+        cfg.stage_record_dir / LOCALIZATION_BINDING_REPORT_FILENAME,
     ]
     if cfg.enable_ai_field_review:
         paths.extend(
@@ -64,6 +79,7 @@ def scan_generated_artifact_paths(cfg) -> list[Path]:
                 cfg.stage_record_dir / cfg.output_string_field_stats_json,
                 cfg.stage_record_dir / cfg.output_string_field_stats_tsv,
                 cfg.stage_record_dir / cfg.output_string_field_review_txt,
+                cfg.stage_record_dir / UNFILTERED_RECORDS_FILENAME,
             ]
         )
     return paths
@@ -160,18 +176,65 @@ def _run_unity_tmp_generation(cfg) -> int:
     return result
 
 
-def _run_sdf_finalize_in_fresh_process(cfg) -> int:
-    result = _run_unity_tmp_generation(cfg)
-    if result != 0:
-        print(f"[TMP][停止] Unity TMP 字体生成失败，返回码={result}；不会继续执行步骤 9。")
-        return result
+def _run_font_generation(cfg) -> int:
+    modes = load_font_pipeline_modes(cfg)
+    tmp_sdf_count = modes["tmp_sdf"]
+    ngui_count = modes["ngui"]
+    print(
+        f"[字体生成] 按脚本 0 检测结果选择流程：TMP/SDF={tmp_sdf_count}，NGUI位图={ngui_count}。",
+        flush=True,
+    )
 
-    prepare_generated_tmp_import_replacements(cfg)
-    log_step_completed("8-9（Unity TMP 字体与待导入替换）")
+    if tmp_sdf_count:
+        result = _run_unity_tmp_generation(cfg)
+        if result != 0:
+            print(f"[字体生成][停止] Unity TMP 字体生成失败，返回码={result}；不会继续当前步骤。")
+            return result
+    else:
+        print("[字体生成] 未检测到 TMP/SDF FontAsset，跳过 Unity 字体生成。", flush=True)
+
+    if ngui_count:
+        generate_ngui_fonts(cfg)
+    else:
+        print("[字体生成] 未检测到 NGUI 位图 UIFont，跳过 NGUI 位图字体生成。", flush=True)
+
+    if not tmp_sdf_count and not ngui_count:
+        print("[字体生成] 当前资源未检测到 TMP/SDF 或 NGUI 位图字体，无需生成。", flush=True)
     return 0
 
 
-def _run_noninteractive_step(cfg, step: str) -> int:
+def _prepare_generated_font_import_replacements(cfg) -> None:
+    modes = load_font_pipeline_modes(cfg)
+    tmp_sdf_count = modes["tmp_sdf"]
+    ngui_count = modes["ngui"]
+    print(
+        f"[字体替换] 按脚本 0 检测结果选择流程：TMP/SDF={tmp_sdf_count}，NGUI位图={ngui_count}。",
+        flush=True,
+    )
+    if tmp_sdf_count:
+        prepare_generated_tmp_import_replacements(cfg)
+    else:
+        print("[字体替换] 未检测到 TMP/SDF FontAsset，跳过 TMP/SDF 替换。", flush=True)
+    if ngui_count:
+        prepare_generated_ngui_import_replacements(cfg)
+    else:
+        print("[字体替换] 未检测到 NGUI 位图 UIFont，跳过 NGUI 位图替换。", flush=True)
+    if not tmp_sdf_count and not ngui_count:
+        print("[字体替换] 当前资源没有需要准备的 TMP/SDF 或 NGUI 位图字体。", flush=True)
+
+
+def _run_sdf_finalize_in_fresh_process(cfg) -> int:
+    result = _run_font_generation(cfg)
+    if result != 0:
+        print(f"[字体生成][停止] 字体生成失败，返回码={result}；不会继续执行步骤 9。")
+        return result
+
+    _prepare_generated_font_import_replacements(cfg)
+    log_step_completed("8-9（TMP/NGUI 字体生成与待导入替换）")
+    return 0
+
+
+def _execute_noninteractive_step(cfg, step: str) -> int:
     if step == "0":
         return finish_step(step, scan_and_record(cfg) or 0)
     if step == "1":
@@ -199,29 +262,61 @@ def _run_noninteractive_step(cfg, step: str) -> int:
         build_merged_tmp_chars(cfg)
         return finish_step(step, 0)
     if step == "8":
-        return finish_step(step, _run_unity_tmp_generation(cfg))
+        return finish_step(step, _run_font_generation(cfg))
     if step == "9":
-        prepare_generated_tmp_import_replacements(cfg)
+        _prepare_generated_font_import_replacements(cfg)
         return finish_step(step, 0)
     print(f"[全部执行][停止] 不支持的内部步骤: {step}")
     return 1
+
+
+def _run_noninteractive_step(cfg, step: str) -> int:
+    try:
+        result = _execute_noninteractive_step(cfg, step)
+    except UnsupportedBitmapFontError as exc:
+        print(f"[步骤 {step}][失败] {exc}", flush=True)
+        print("[步骤执行][停止] 检测到不兼容位图字体，不会启动任何后续步骤。", flush=True)
+        return 1
+    except KeyboardInterrupt:
+        print(f"[步骤 {step}][中断] 收到人工中断，不会启动任何后续步骤。", flush=True)
+        return 130
+    except Exception as exc:
+        print(f"[步骤 {step}][失败] {type(exc).__name__}: {exc}", flush=True)
+        print("[步骤执行][停止] 当前步骤未完成，不会启动任何后续步骤。", flush=True)
+        return 1
+
+    if result != 0:
+        print(f"[步骤 {step}][失败] 返回码={result}；不会启动任何后续步骤。", flush=True)
+    return result
 
 
 def _run_steps_in_isolated_processes(cfg, steps: list[str], label: str) -> int:
     script_path = Path(__file__).resolve()
     child_env = dict(os.environ)
     child_env["TRANSLATE_SUPPRESS_UNITY_CONFIG_NOTICE"] = "1"
+    child_env["TRANSLATE_NONINTERACTIVE_STEP"] = "1"
 
     for index, step in enumerate(steps, start=1):
         print(f"[{label}] 启动独立步骤 {step}（{index}/{len(steps)}）")
         sys.stdout.flush()
-        result = subprocess.run(
-            [sys.executable, str(script_path), RUN_STEP_ARGUMENT, step],
-            cwd=str(cfg.root_dir),
-            env=child_env,
-        )
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script_path), RUN_STEP_ARGUMENT, step],
+                cwd=str(cfg.root_dir),
+                env=child_env,
+            )
+        except KeyboardInterrupt:
+            print(f"[{label}][中断] 步骤 {step} 收到人工中断；不会启动任何后续步骤。", flush=True)
+            return 130
+        except OSError as exc:
+            print(f"[{label}][停止] 无法启动步骤 {step}: {exc}；不会启动任何后续步骤。", flush=True)
+            return 1
         if result.returncode != 0:
-            print(f"[{label}][停止] 步骤 {step} 失败，返回码={result.returncode}。")
+            print(
+                f"[{label}][停止] 步骤 {step} 未完成，返回码={result.returncode}；"
+                "不会启动任何后续步骤。",
+                flush=True,
+            )
             return 1
         print(f"\033[92m[{label}] 步骤 {step} 已完成（{index}/{len(steps)}）。\033[0m", flush=True)
     return 0
@@ -246,13 +341,13 @@ def print_menu() -> None:
     print("  0: 读取 workspace/input 下导出的 JSON；生成文本、字体、材质、引用索引；")
     print("     若 enable_ai_field_review=false，按 text_keys 白名单生成 records.json。")
     print("     若 enable_ai_field_review=true，按 string_field_blacklist 黑名单排除后记录所有字符串，")
-    print("     同时生成完整 string_field_stats.json/tsv，以及发送给 AI 的 string_field_review.txt/json。")
+    print("     同时生成完整 string_field_stats.json/tsv，以及发送给 AI 的 string_field_review.txt。")
     print("     输出 workspace/records/records.json、ids.json、font_map.json、material_map.json、ref_map.json，")
     print("     如果资源导出阶段已生成 file_id_map.json，会用它解析外部 file_id 材质引用。")
     print("     另生成 tmp_manifest_index.json，供后续文本、TMP、TTF 替换定位资源。")
     print("  1: 仅在 enable_ai_field_review=true 时执行；读取 AI 返回字段，")
     print("     若配置了 AI 接口则自动判断；未配置或访问失败则提示人工使用 string_field_review.txt 询问 AI。")
-    print("     最后按字段名过滤 records.json，删除无关字段记录。")
+    print("     最后按字段及自动识别的脚本/同级结构上下文过滤 records.json，删除无关字段记录。")
     print("  2: 读取过滤后的 records.json；对其中原文去重并翻译；")
     print("     输出 trans.json、game.txt、game_chars.txt、mapping.tsv 等文本记录文件。")
     print("  3: 只读取已有 trans.json；重新生成 game.txt 和 game_chars.txt；")
@@ -271,11 +366,13 @@ def print_menu() -> None:
     print("     再合并原游戏字体字符、译文字符、模板 TTF 非中文字符；")
     print("     仅当 include_old_sdf_template_chars=true 时额外合并老工具 SDF 模板全部字符，")
     print("     删除模板 TTF 不支持字符后生成 tmp_chars.txt。")
-    print("  8: 读取 tmp_chars.txt；调用 Unity 辅助工程生成 TMP/SDF 字体资源；")
-    print("     输出 workspace/output/Font/SDF/generated_templates/generated_tmp_font.*。")
-    print("  9: 读取脚本 8 已生成的 generated_tmp_font.json/png 和脚本 0 的字体索引；")
+    print("  8: 生成字体（支持 TMP、NGUI）；按脚本 0 的字体检测结果选择所需流程；")
+    print("     检测到 TMP/SDF 时读取 tmp_chars.txt 调用 Unity，检测到 NGUI 时读取")
+    print("     trans.json、NGUI UIFont/UIAtlas 和模板 TTF，生成扩展图集及静态字形表；")
+    print("     NGUI 保留原图集左上区域，逐字打包到扩展后的 L 形可用空间。")
+    print("  9: 按脚本 0 的检测结果读取脚本 8 已生成的 TMP/NGUI 字体产物和字体索引；")
     print("     对索引中的全部候选做 TMP FontAsset 结构校验，不按 font_map 排除运行时字体，")
-    print("     输出 workspace/output/Font/SDF/ToImport 下真正准备导入的 TMP/SDF 文件。")
+    print("     输出 TMP/SDF 与 NGUI 的待导入字体、UIFont、UIAtlas 和 Texture2D 文件。")
     print("  a: 依次执行 0 -> 1(仅 AI 模式) -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9。")
     print("     支持 1-2、4-7 或 0,2,4-9 等连续/组合输入。")
     print()
@@ -284,12 +381,12 @@ def print_menu() -> None:
     print("1. AI 判断字段后过滤 records.json")
     print("2. 根据扫描记录翻译")
     print("3. 从 trans.json 重建 game.txt 和 game_chars.txt")
-    print("4. 导出翻译后的待替换 JSON")
+    print("4. 导出并实际翻译 Text 资源")
     print("5. 清理译文/I2 文本额外挂载的阴影/描边组件")
     print("6. 生成 TTF 替换字体")
     print("7. 合并 TMP 字符并提示新增字符")
-    print("8. 生成 Unity TMP 字体")
-    print("9. 根据已生成 TMP 字体准备导入替换文件")
+    print("8. 生成字体（支持 TMP、NGUI）")
+    print("9. 根据已生成字体准备导入替换（支持 TMP、NGUI）")
     print("a. 全部执行")
     print("q. 退出")
     print()

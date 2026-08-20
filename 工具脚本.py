@@ -3823,6 +3823,52 @@ def _preview_image_nodes_for_display(
     return _preview_subtree_nodes(tree_by_id, chain_root_path_id)
 
 
+def _preview_image_nodes_for_isolated_level(
+    tree_by_id: dict[int, dict],
+    image_nodes: list[dict],
+    selected_path_id: int,
+) -> list[dict]:
+    """Keep the selected branch while hiding peer branches at/below its depth."""
+    selected = next(
+        (
+            node
+            for node in image_nodes
+            if int(node.get("path_id", 0) or 0) == selected_path_id
+        ),
+        tree_by_id.get(selected_path_id),
+    )
+    if not isinstance(selected, dict):
+        return image_nodes
+    selected_depth = int(
+        selected.get(
+            "display_depth",
+            max(0, len(selected.get("chain", [])) - 1)
+            if isinstance(selected.get("chain"), list)
+            else 0,
+        )
+        or 0
+    )
+    selected_subtree_ids = {
+        int(node.get("path_id", 0) or 0)
+        for node in _preview_subtree_nodes(tree_by_id, selected_path_id)
+    }
+    result: list[dict] = []
+    for node in image_nodes:
+        path_id = int(node.get("path_id", 0) or 0)
+        depth = int(
+            node.get(
+                "display_depth",
+                max(0, len(node.get("chain", [])) - 1)
+                if isinstance(node.get("chain"), list)
+                else 0,
+            )
+            or 0
+        )
+        if depth < selected_depth or path_id in selected_subtree_ids:
+            result.append(node)
+    return result
+
+
 def _normalized_preview_scope_value(value: object) -> str:
     return str(value or "").replace("/", "\\").strip().lower()
 
@@ -4038,7 +4084,12 @@ def _show_interactive_object_preview(target: Path) -> dict:
     image_layers = metadata.get("image_layers")
     if not isinstance(image_layers, list):
         image_layers = []
-    current_display: dict[str, object] = {"nodes": [], "mode": "subtree"}
+    current_display: dict[str, object] = {
+        "nodes": [],
+        "image_nodes": [],
+        "mode": "subtree",
+        "isolated_image_path_id": 0,
+    }
     visible_tree_nodes: dict[str, list[dict]] = {"value": []}
     collapsed_tree_path_ids: set[int] = set()
     hidden_overlay_path_ids: set[int] = set()
@@ -4080,7 +4131,9 @@ def _show_interactive_object_preview(target: Path) -> dict:
     preview_panel.columnconfigure(0, weight=1)
     image_item = canvas.create_image(0, 0, anchor="nw")
 
-    status = tk.StringVar(value="左侧选择层级；图片右键可仅显示、仅隐藏或恢复重叠层级标注")
+    status = tk.StringVar(
+        value="左侧选择层级；右键仅显示层级时会同时隐藏其它同级分支及其下级图片"
+    )
     ttk.Label(window, textvariable=status, anchor="w").pack(fill="x")
     selected_region: dict[str, dict | None] = {"value": None}
     action_result = {"blocked": False, "path_id": 0, "name": ""}
@@ -4415,7 +4468,12 @@ def _show_interactive_object_preview(target: Path) -> dict:
     def only_show_overlay(region: dict) -> None:
         path_id = int(region.get("path_id", 0) or 0)
         displayed_nodes = current_display.get("nodes")
-        if not path_id or not isinstance(displayed_nodes, list):
+        image_nodes = current_display.get("image_nodes")
+        if (
+            not path_id
+            or not isinstance(displayed_nodes, list)
+            or not isinstance(image_nodes, list)
+        ):
             return
         hidden_overlay_path_ids.clear()
         hidden_overlay_path_ids.update(
@@ -4423,8 +4481,16 @@ def _show_interactive_object_preview(target: Path) -> dict:
             for node in displayed_nodes
             if int(node.get("path_id", 0) or 0) != path_id
         )
+        isolated_image_nodes = _preview_image_nodes_for_isolated_level(
+            tree_by_id,
+            image_nodes,
+            path_id,
+        )
+        current_display["isolated_image_path_id"] = path_id
+        reload_image_for_nodes(displayed_nodes, isolated_image_nodes)
         refresh_overlay_visibility_ui(
-            f"仅显示层级标注：{region.get('name', '')} (PathID={path_id})"
+            f"仅显示层级：{region.get('name', '')} (PathID={path_id})；"
+            "已隐藏其它同级分支及其下级图片"
         )
 
     def hide_only_overlay(region: dict) -> None:
@@ -4450,7 +4516,12 @@ def _show_interactive_object_preview(target: Path) -> dict:
 
     def restore_all_overlays() -> None:
         hidden_overlay_path_ids.clear()
-        refresh_overlay_visibility_ui("已恢复全部层级标注")
+        displayed_nodes = current_display.get("nodes")
+        image_nodes = current_display.get("image_nodes")
+        if isinstance(displayed_nodes, list) and isinstance(image_nodes, list):
+            reload_image_for_nodes(displayed_nodes, image_nodes)
+        current_display["isolated_image_path_id"] = 0
+        refresh_overlay_visibility_ui("已恢复全部层级标注和图片")
 
     def show_resource_names(region: dict) -> None:
         detail = _preview_resource_name_text(region)
@@ -4640,7 +4711,7 @@ def _show_interactive_object_preview(target: Path) -> dict:
     ).pack(side="left", fill="x", expand=True, padx=(0, 3))
     ttk.Button(
         overlay_restore_panel,
-        text="恢复全部标注",
+        text="恢复全部标注和图片",
         command=restore_all_overlays,
     ).pack(side="left", fill="x", expand=True, padx=(3, 0))
 
@@ -4653,7 +4724,9 @@ def _show_interactive_object_preview(target: Path) -> dict:
         nodes, mode = display_nodes_for(path_id)
         image_nodes = _preview_image_nodes_for_display(tree_by_id, nodes, mode)
         current_display["nodes"] = nodes
+        current_display["image_nodes"] = image_nodes
         current_display["mode"] = mode
+        current_display["isolated_image_path_id"] = 0
         selected_copy = next(
             (node for node in nodes if int(node.get("path_id", 0) or 0) == path_id),
             {**region, "display_depth": 0},
@@ -4782,7 +4855,10 @@ def _show_interactive_object_preview(target: Path) -> dict:
             state="normal" if blocked else "disabled",
         )
         menu.add_separator()
-        menu.add_command(label="仅显示此层级标注", command=lambda: only_show_overlay(region))
+        menu.add_command(
+            label="仅显示此层级（隐藏其它同级分支及其下级图片）",
+            command=lambda: only_show_overlay(region),
+        )
         menu.add_command(label="仅隐藏此层级标注", command=lambda: hide_only_overlay(region))
         menu.add_command(label="恢复此层级标注", command=lambda: restore_overlay(region))
         menu.add_separator()
@@ -4832,7 +4908,7 @@ def _show_interactive_object_preview(target: Path) -> dict:
             )
             submenu.add_separator()
             submenu.add_command(
-                label="仅显示此层级标注",
+                label="仅显示此层级（隐藏其它同级分支及其下级图片）",
                 command=lambda item=region: only_show_overlay(item),
             )
             submenu.add_command(
@@ -5122,7 +5198,10 @@ def _open_object_hierarchy_preview(match: dict, root_level: int, scopes: dict) -
         print(f"[层级预览][错误] {exc}")
         return False
     print(f"[层级预览][完成] {target}")
-    print("[层级预览] 左侧可选择/折叠层级；树和图片右键可屏蔽对象或管理标注。")
+    print(
+        "[层级预览] 左侧可选择/折叠层级；树和图片右键可屏蔽对象、"
+        "管理标注或隔离层级图片。"
+    )
     try:
         result = _show_interactive_object_preview(target)
         if result.get("completed") or result.get("blocked"):

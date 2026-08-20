@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import struct
@@ -503,7 +504,23 @@ def write_legacy_output_view(
     return legacy
 
 
-def calculate_catalog_hash(data: bytes) -> str:
+CATALOG_HASH_MD5 = "md5"
+CATALOG_HASH_SPOOKY128 = "spookyhash128"
+DEFAULT_CATALOG_HASH_ALGORITHM = CATALOG_HASH_SPOOKY128
+CATALOG_HASH_ALGORITHM_NAMES = {
+    CATALOG_HASH_MD5: "MD5",
+    CATALOG_HASH_SPOOKY128: "Unity Scriptable Build Pipeline SpookyHash128",
+}
+
+
+def calculate_catalog_hash(
+    data: bytes,
+    algorithm: str = DEFAULT_CATALOG_HASH_ALGORITHM,
+) -> str:
+    if algorithm == CATALOG_HASH_MD5:
+        return hashlib.md5(data).hexdigest()
+    if algorithm != CATALOG_HASH_SPOOKY128:
+        raise ValueError(f"不支持的 catalog.hash 算法: {algorithm}")
     try:
         import spookyhash
     except ImportError as exc:
@@ -516,24 +533,42 @@ def calculate_catalog_hash(data: bytes) -> str:
 
 def inspect_catalog_hash(source: Path, data: bytes) -> dict[str, Any]:
     hash_path = source.with_suffix(".hash")
-    calculated = calculate_catalog_hash(data)
+    calculated_by_algorithm = {
+        algorithm: calculate_catalog_hash(data, algorithm)
+        for algorithm in CATALOG_HASH_ALGORITHM_NAMES
+    }
     recorded = (
         hash_path.read_text(encoding="ascii", errors="ignore").strip().lower()
         if hash_path.is_file()
         else None
     )
+    detected_algorithm = next(
+        (
+            algorithm
+            for algorithm, calculated in calculated_by_algorithm.items()
+            if recorded == calculated
+        ),
+        None,
+    )
+    display_algorithm = detected_algorithm or DEFAULT_CATALOG_HASH_ALGORITHM
     return {
-        "algorithm": "Unity Scriptable Build Pipeline SpookyHash128",
+        "algorithm": CATALOG_HASH_ALGORITHM_NAMES.get(detected_algorithm),
+        "algorithm_id": detected_algorithm,
         "hash_file": str(hash_path),
         "recorded": recorded,
-        "calculated": calculated,
-        "matches": recorded == calculated if recorded is not None else None,
+        "calculated": calculated_by_algorithm[display_algorithm],
+        "calculated_by_algorithm": calculated_by_algorithm,
+        "matches": detected_algorithm is not None if recorded is not None else None,
     }
 
 
-def write_catalog_hash(catalog_path: Path, hash_path: Path | None = None) -> Path:
+def write_catalog_hash(
+    catalog_path: Path,
+    hash_path: Path | None = None,
+    algorithm: str = DEFAULT_CATALOG_HASH_ALGORITHM,
+) -> Path:
     target = hash_path or catalog_path.with_suffix(".hash")
-    value = calculate_catalog_hash(catalog_path.read_bytes())
+    value = calculate_catalog_hash(catalog_path.read_bytes(), algorithm)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(value, encoding="ascii")
     return target
@@ -573,6 +608,18 @@ def repack_binary_catalog_from_legacy_output(
         raise CatalogFormatError("Output.json 不是 binary catalog 兼容视图")
 
     source_data = source_catalog.read_bytes()
+    source_hash_info = inspect_catalog_hash(source_catalog, source_data)
+    if source_hash_info["matches"] is False:
+        candidates = source_hash_info["calculated_by_algorithm"]
+        raise CatalogFormatError(
+            "源 catalog.hash 与 catalog.bin 不匹配: "
+            f"记录={source_hash_info['recorded']} "
+            f"MD5={candidates[CATALOG_HASH_MD5]} "
+            f"SpookyHash128={candidates[CATALOG_HASH_SPOOKY128]}"
+        )
+    hash_algorithm = (
+        source_hash_info["algorithm_id"] or DEFAULT_CATALOG_HASH_ALGORITHM
+    )
     source_reader = BinaryCatalogReader(source_data)
     buffer = bytearray(source_data)
     internal_id_updates = 0
@@ -640,6 +687,7 @@ def repack_binary_catalog_from_legacy_output(
     hash_path = write_catalog_hash(
         destination_catalog,
         destination_hash or destination_catalog.with_suffix(".hash"),
+        hash_algorithm,
     )
     return {
         "source": str(source_catalog),
@@ -650,6 +698,7 @@ def repack_binary_catalog_from_legacy_output(
         "source_size": len(source_data),
         "destination_size": len(buffer),
         "catalog_hash": hash_path.read_text(encoding="ascii").strip(),
+        "catalog_hash_algorithm": hash_algorithm,
     }
 
 
@@ -705,12 +754,16 @@ def main() -> int:
     hash_info = result["catalog_hash"]
     if hash_info["matches"] is True:
         print(
-            f"[catalog.bin] catalog.hash 校验通过: {hash_info['calculated']}"
+            f"[catalog.bin] catalog.hash 校验通过 "
+            f"({hash_info['algorithm']}): {hash_info['calculated']}"
         )
     elif hash_info["matches"] is False:
+        candidates = hash_info["calculated_by_algorithm"]
         print(
             "[catalog.bin] catalog.hash 校验失败: "
-            f"记录={hash_info['recorded']}，计算={hash_info['calculated']}"
+            f"记录={hash_info['recorded']}，"
+            f"MD5={candidates[CATALOG_HASH_MD5]}，"
+            f"SpookyHash128={candidates[CATALOG_HASH_SPOOKY128]}"
         )
     else:
         print(

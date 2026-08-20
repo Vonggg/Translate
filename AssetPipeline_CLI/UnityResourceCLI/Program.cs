@@ -21,6 +21,9 @@ namespace UnityResourceCLI
                     return 0;
                 }
 
+                if (options.Command == "verify")
+                    return new ResourceVerifier(options).Run();
+
                 return new ResourcePipeline(options).Run();
             }
             catch (Exception ex)

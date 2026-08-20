@@ -18,7 +18,11 @@ namespace UnityResourceCLI
 {
     internal sealed class ResourcePipeline
     {
+        private const int ExportManifestSchemaVersion = 4;
+        private const long ExportProgressInterval = 10_000;
+        private const int LargeReplacementSpoolThreshold = 8 * 1024 * 1024;
         private bool legacyManifestReferenceWarningShown;
+        private readonly List<(FileStream Stream, string Path)> temporaryAssetReplacements = new();
 
         private static readonly AssetClassID[] BasicTypes =
         {
@@ -35,6 +39,7 @@ namespace UnityResourceCLI
             AssetClassID.Transform,
             AssetClassID.RectTransform,
             AssetClassID.Sprite,
+            AssetClassID.SpriteAtlas,
             AssetClassID.SpriteRenderer
         };
 
@@ -47,10 +52,19 @@ namespace UnityResourceCLI
 
         private readonly CliOptions options;
         private readonly AssetsManager am;
+        private readonly ExportProgress? exportProgress;
+        private string? cachedExporterBuildFingerprint;
+        private string? cachedManagedStateFingerprint;
+        private bool playerDataDependenciesLoaded;
 
-        public ResourcePipeline(CliOptions options)
+        public ResourcePipeline(CliOptions options) : this(options, null)
+        {
+        }
+
+        private ResourcePipeline(CliOptions options, ExportProgress? exportProgress)
         {
             this.options = options;
+            this.exportProgress = exportProgress;
             am = new AssetsManager
             {
                 UseTemplateFieldCache = true,
@@ -110,22 +124,27 @@ namespace UnityResourceCLI
             workerCount = Math.Min(workerCount, Math.Max(1, sourceFiles.Count));
             Log($"Export workers: {workerCount}.");
 
+            Log($"Single-pass export enabled. Progress heartbeat: every {ExportProgressInterval:N0} item(s).");
+            var progress = new ExportProgress(ExportProgressInterval);
+
             if (workerCount == 1)
             {
+                var worker = new ResourcePipeline(options, progress);
                 int serialProcessed = 0;
                 foreach (string sourcePath in sourceFiles)
                 {
                     serialProcessed++;
                     Log($"[{serialProcessed}/{sourceFiles.Count}] Exporting {Path.GetFileName(sourcePath)}");
-                    ExportFile(sourcePath);
+                    worker.ExportFile(sourcePath);
                 }
+                progress.LogFinal();
                 Log($"Export finished. Processed {serialProcessed} file(s).");
                 return 0;
             }
 
             int processed = 0;
             var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = workerCount };
-            using var workers = new ThreadLocal<ResourcePipeline>(() => new ResourcePipeline(options), true);
+            using var workers = new ThreadLocal<ResourcePipeline>(() => new ResourcePipeline(options, progress), true);
             Parallel.ForEach(sourceFiles, parallelOptions, sourcePath =>
             {
                 ResourcePipeline worker = workers.Value!;
@@ -134,8 +153,63 @@ namespace UnityResourceCLI
                 Log($"[{completed}/{sourceFiles.Count}] Exported {Path.GetFileName(sourcePath)}");
             });
 
+            progress.LogFinal();
             Log($"Export finished. Processed {processed} file(s).");
             return 0;
+        }
+
+        private long CountExportItems(IReadOnlyCollection<string> sourceFiles, int workerCount)
+        {
+            long total = 0;
+            var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = workerCount };
+            using var workers = new ThreadLocal<ResourcePipeline>(() => new ResourcePipeline(options), true);
+            Parallel.ForEach(sourceFiles, parallelOptions, sourcePath =>
+            {
+                ResourcePipeline worker = workers.Value!;
+                long fileTotal = worker.CountExportFileItems(sourcePath);
+                Interlocked.Add(ref total, fileTotal);
+            });
+            return total;
+        }
+
+        private long CountExportFileItems(string sourcePath)
+        {
+            try
+            {
+                DetectedFileType fileType = FileTypeDetector.DetectFileType(sourcePath);
+                if (fileType == DetectedFileType.AssetsFile)
+                {
+                    AssetsFileInstance inst = am.LoadAssetsFile(sourcePath, true);
+                    return CountExportAssetsFileItems(inst);
+                }
+                if (fileType != DetectedFileType.BundleFile)
+                    return 0;
+
+                long total = 0;
+                BundleFileInstance bunInst = am.LoadBundleFile(sourcePath, true);
+                int entryCount = bunInst.file.BlockAndDirInfo.DirectoryInfos.Count;
+                for (int i = 0; i < entryCount; i++)
+                {
+                    string entryName = bunInst.file.BlockAndDirInfo.DirectoryInfos[i].Name;
+                    AssetsFileInstance? inst = TryLoadBundleEntry(bunInst, i, entryName);
+                    if (inst != null)
+                        total += CountExportAssetsFileItems(inst);
+                }
+                return total;
+            }
+            finally
+            {
+                am.UnloadAllAssetsFiles(true);
+                am.UnloadAllBundleFiles();
+            }
+        }
+
+        private long CountExportAssetsFileItems(AssetsFileInstance inst)
+        {
+            long total = 0;
+            foreach (AssetClassID type in GetExportTypes())
+                total += inst.file.GetAssetsOfType(type).Count;
+            return total;
         }
 
         private int Import()
@@ -201,12 +275,76 @@ namespace UnityResourceCLI
             string sourceDir = Path.Combine(options.WorkRoot, sourceStem);
             Directory.CreateDirectory(sourceDir);
 
+            string manifestFilePath = Path.Combine(sourceDir, "manifest.json");
+            FileInfo sourceInfo = new FileInfo(sourcePath);
+            HashSet<string> currentTypeNames = GetExportTypes()
+                .Select(type => type.ToString())
+                .ToHashSet(StringComparer.Ordinal);
+            ExportManifest? previousManifest = ReadManifest(manifestFilePath);
+            string exporterBuildFingerprint = GetExporterBuildFingerprint();
+            string managedStateFingerprint = GetManagedStateFingerprint();
+            bool sourceMatches = previousManifest != null
+                && previousManifest.SourceRelativePath == relativeSource
+                && previousManifest.SourceLength == sourceInfo.Length
+                && previousManifest.SourceLastWriteTimeUtcTicks == sourceInfo.LastWriteTimeUtc.Ticks;
+            bool exportContractMatches = previousManifest != null
+                && previousManifest.ExporterSchemaVersion == ExportManifestSchemaVersion
+                && previousManifest.ExporterBuildFingerprint == exporterBuildFingerprint
+                && previousManifest.ManagedStateFingerprint == managedStateFingerprint
+                && previousManifest.DumpFormat == options.DumpFormat
+                && previousManifest.ImageFormat == options.ImageFormat
+                && previousManifest.ImageQuality == options.JpegQuality;
+            bool canMerge = sourceMatches && exportContractMatches;
+
+            HashSet<string> requestedProfiles = GetRequestedProfiles();
+            bool requestedProfilesAlreadyExported = canMerge
+                && requestedProfiles.All(profile => previousManifest!.ExportedProfiles.Contains(profile, StringComparer.OrdinalIgnoreCase));
+            if (requestedProfilesAlreadyExported)
+            {
+                if (AreProfileOutputsReusable(sourceDir, previousManifest!, currentTypeNames, out string reuseReason))
+                {
+                    Log(
+                        $"  Reusing unchanged export profile(s): {string.Join(", ", requestedProfiles.OrderBy(value => value))}; " +
+                        $"validated {previousManifest!.Items.Count(item => currentTypeNames.Contains(item.TypeName)):N0} item(s)."
+                    );
+                    return;
+                }
+                Log($"  Cached profile cannot be reused: {reuseReason}");
+            }
+
+            if (previousManifest != null)
+            {
+                IEnumerable<ExportManifestItem> obsoleteItems = canMerge
+                    ? previousManifest.Items.Where(item => currentTypeNames.Contains(item.TypeName))
+                    : previousManifest.Items;
+                DeleteExportedItems(sourceDir, obsoleteItems);
+            }
+
             ExportManifest manifest = new ExportManifest
             {
+                ExporterSchemaVersion = ExportManifestSchemaVersion,
+                ExporterBuildFingerprint = exporterBuildFingerprint,
+                ManagedStateFingerprint = managedStateFingerprint,
+                DumpFormat = options.DumpFormat,
+                ImageFormat = options.ImageFormat,
+                ImageQuality = options.JpegQuality,
                 SourceRelativePath = relativeSource,
                 SourceKind = fileType == DetectedFileType.BundleFile ? "bundle" : "assets",
-                SourceFileName = Path.GetFileName(sourcePath)
+                SourceFileName = Path.GetFileName(sourcePath),
+                SourceLength = sourceInfo.Length,
+                SourceLastWriteTimeUtcTicks = sourceInfo.LastWriteTimeUtc.Ticks,
+                ExportedProfiles = MergeExportedProfiles(canMerge ? previousManifest : null),
+                Items = canMerge
+                    ? previousManifest!.Items.Where(item => !currentTypeNames.Contains(item.TypeName)).ToList()
+                    : new List<ExportManifestItem>(),
+                MonoBehaviourSummaries = canMerge && !currentTypeNames.Contains(nameof(AssetClassID.MonoBehaviour))
+                    ? previousManifest!.MonoBehaviourSummaries
+                    : new List<ExportManifestMonoBehaviourSummary>()
             };
+            if (canMerge)
+                Log($"  Incremental manifest: retained {manifest.Items.Count:N0} item(s), replacing {string.Join(", ", currentTypeNames.OrderBy(value => value))}.");
+            else if (previousManifest != null)
+                Log("  Source changed or legacy manifest detected; starting a fresh manifest.");
 
             if (fileType == DetectedFileType.AssetsFile)
             {
@@ -220,9 +358,194 @@ namespace UnityResourceCLI
                 ExportBundle(bunInst, sourceStem, sourceDir, manifest);
             }
 
-            string manifestFilePath = Path.Combine(sourceDir, "manifest.json");
             WriteManifest(manifestFilePath, manifest);
             Log($"  Wrote manifest: {manifestFilePath}");
+        }
+
+        private ExportManifest? ReadManifest(string path)
+        {
+            if (!File.Exists(path))
+                return null;
+            try
+            {
+                return JsonSerializer.Deserialize<ExportManifest>(File.ReadAllText(path, Encoding.UTF8));
+            }
+            catch (Exception ex)
+            {
+                Log($"  WARNING: Existing manifest could not be read and will be replaced: {ex.Message}");
+                return null;
+            }
+        }
+
+        private List<string> MergeExportedProfiles(ExportManifest? previousManifest)
+        {
+            HashSet<string> profiles = previousManifest == null
+                ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                : previousManifest.ExportedProfiles.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (string profile in GetRequestedProfiles())
+                profiles.Add(profile);
+            return profiles.OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private HashSet<string> GetRequestedProfiles()
+        {
+            var profiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string profile in options.ExportProfile.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (profile.Equals("all", StringComparison.OrdinalIgnoreCase))
+                {
+                    profiles.Add("basic");
+                    profiles.Add("objects");
+                    profiles.Add("mesh");
+                }
+                else
+                {
+                    profiles.Add(profile);
+                }
+            }
+            return profiles;
+        }
+
+        private static bool AreProfileOutputsReusable(
+            string sourceDir,
+            ExportManifest manifest,
+            HashSet<string> currentTypeNames,
+            out string reason)
+        {
+            string sourceRoot = Path.GetFullPath(sourceDir)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                + Path.DirectorySeparatorChar;
+            foreach (ExportManifestItem item in manifest.Items.Where(item => currentTypeNames.Contains(item.TypeName)))
+            {
+                if (!item.OutputFileExists)
+                    continue;
+
+                string outputPath = Path.GetFullPath(Path.Combine(sourceDir, item.RelativePath));
+                if (!outputPath.StartsWith(sourceRoot, StringComparison.OrdinalIgnoreCase))
+                {
+                    reason = $"manifest path escaped export root: {item.RelativePath}";
+                    return false;
+                }
+                if (!File.Exists(outputPath))
+                {
+                    reason = $"exported file is missing: {item.RelativePath}";
+                    return false;
+                }
+                FileInfo outputInfo = new FileInfo(outputPath);
+                if (outputInfo.Length != item.OutputFileLength)
+                {
+                    reason = $"exported file length changed: {item.RelativePath}";
+                    return false;
+                }
+                if (outputInfo.LastWriteTimeUtc.Ticks != item.OutputFileLastWriteTimeUtcTicks)
+                {
+                    reason = $"exported file timestamp changed: {item.RelativePath}";
+                    return false;
+                }
+            }
+            reason = "all exported files are present and unchanged";
+            return true;
+        }
+
+        private string GetExporterBuildFingerprint()
+        {
+            if (cachedExporterBuildFingerprint != null)
+                return cachedExporterBuildFingerprint;
+
+            string assemblyPath = typeof(ResourcePipeline).Assembly.Location;
+            if (string.IsNullOrWhiteSpace(assemblyPath) || !File.Exists(assemblyPath))
+                return cachedExporterBuildFingerprint = $"schema:{ExportManifestSchemaVersion}";
+
+            string? buildRoot = Path.GetDirectoryName(assemblyPath);
+            if (string.IsNullOrWhiteSpace(buildRoot) || !Directory.Exists(buildRoot))
+            {
+                FileInfo assemblyInfo = new FileInfo(assemblyPath);
+                return cachedExporterBuildFingerprint = ComputeSha256(
+                    $"{assemblyInfo.FullName}|{assemblyInfo.Length}|{assemblyInfo.LastWriteTimeUtc.Ticks}|{ExportManifestSchemaVersion}");
+            }
+
+            var signature = new StringBuilder()
+                .Append("schema:").Append(ExportManifestSchemaVersion).Append(';');
+            try
+            {
+                foreach (string path in Directory.EnumerateFiles(buildRoot, "*", SearchOption.AllDirectories)
+                    .Where(path =>
+                    {
+                        string extension = Path.GetExtension(path);
+                        return extension.Equals(".dll", StringComparison.OrdinalIgnoreCase)
+                            || extension.Equals(".exe", StringComparison.OrdinalIgnoreCase)
+                            || extension.Equals(".tpk", StringComparison.OrdinalIgnoreCase)
+                            || extension.Equals(".json", StringComparison.OrdinalIgnoreCase);
+                    })
+                    .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+                {
+                    FileInfo info = new FileInfo(path);
+                    signature
+                        .Append(Path.GetRelativePath(buildRoot, path).Replace('\\', '/'))
+                        .Append('|').Append(info.Length)
+                        .Append('|').Append(info.LastWriteTimeUtc.Ticks)
+                        .Append(';');
+                }
+            }
+            catch (Exception ex)
+            {
+                return cachedExporterBuildFingerprint = ComputeSha256(
+                    $"exporter:error:{ex.GetType().Name}:{ex.Message}:{ExportManifestSchemaVersion}");
+            }
+            return cachedExporterBuildFingerprint = ComputeSha256(signature.ToString());
+        }
+
+        private string GetManagedStateFingerprint()
+        {
+            if (cachedManagedStateFingerprint != null)
+                return cachedManagedStateFingerprint;
+            if (!Directory.Exists(options.ManagedRoot))
+                return cachedManagedStateFingerprint = "managed:missing";
+            var signature = new StringBuilder();
+            try
+            {
+                foreach (string path in Directory.EnumerateFiles(options.ManagedRoot, "*.dll", SearchOption.AllDirectories)
+                    .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+                {
+                    FileInfo info = new FileInfo(path);
+                    signature
+                        .Append(Path.GetRelativePath(options.ManagedRoot, path).Replace('\\', '/'))
+                        .Append('|').Append(info.Length)
+                        .Append('|').Append(info.LastWriteTimeUtc.Ticks)
+                        .Append(';');
+                }
+            }
+            catch (Exception ex)
+            {
+                return cachedManagedStateFingerprint = ComputeSha256($"managed:error:{ex.GetType().Name}:{ex.Message}");
+            }
+            return cachedManagedStateFingerprint = ComputeSha256(signature.ToString());
+        }
+
+        private static void DeleteExportedItems(string sourceDir, IEnumerable<ExportManifestItem> items)
+        {
+            string sourceRoot = Path.GetFullPath(sourceDir)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                + Path.DirectorySeparatorChar;
+            foreach (ExportManifestItem item in items)
+            {
+                string targetPath = Path.GetFullPath(Path.Combine(sourceDir, item.RelativePath));
+                if (!targetPath.StartsWith(sourceRoot, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                try
+                {
+                    if (File.Exists(targetPath))
+                        File.Delete(targetPath);
+                }
+                catch (IOException ex)
+                {
+                    Log($"  WARNING: Could not remove stale export {targetPath}: {ex.Message}");
+                }
+                catch (UnauthorizedAccessException ex)
+                {
+                    Log($"  WARNING: Could not remove stale export {targetPath}: {ex.Message}");
+                }
+            }
         }
 
         private void ExportBundle(BundleFileInstance bunInst, string sourceStem, string sourceDir, ExportManifest manifest)
@@ -261,6 +584,7 @@ namespace UnityResourceCLI
         private void ExportAssetsFile(AssetsFileInstance inst, string sourceStem, string outputDir, string manifestRelativeBase, string? bundleEntryName, ExportManifest manifest)
         {
             AddAssetsFileDependencyManifest(inst, manifestRelativeBase, bundleEntryName, manifest);
+            var typeTreeFingerprintCache = new Dictionary<(int TypeIdOrIndex, ushort ScriptIndex), string>();
             string referenceUnityVersion = inst.file.Metadata.UnityVersion ?? "";
             if (string.IsNullOrWhiteSpace(manifest.UnityVersion) && !string.IsNullOrWhiteSpace(referenceUnityVersion))
                 manifest.UnityVersion = referenceUnityVersion;
@@ -276,6 +600,10 @@ namespace UnityResourceCLI
                 if (infos.Count == 0)
                     continue;
 
+                string typeName = type.ToString();
+                string typeDir = Path.Combine(outputDir, typeName);
+                Directory.CreateDirectory(typeDir);
+
                 foreach (AssetFileInfo info in infos)
                 {
                     AssetTypeValueField? baseField = SafeGetBaseField(inst, info);
@@ -286,6 +614,7 @@ namespace UnityResourceCLI
                             monoSummary.Total++;
                             monoSummary.Failed++;
                         }
+                        exportProgress?.ReportItem();
                         continue;
                     }
 
@@ -299,14 +628,12 @@ namespace UnityResourceCLI
                     }
 
                     string assetName = GetAssetName(baseField, info);
-                    string typeName = type.ToString();
-                    string typeDir = Path.Combine(outputDir, typeName);
-                    Directory.CreateDirectory(typeDir);
 
                     string exportKind;
                     string outputRelativePath;
                     string manifestRelativePath;
                     string exportedFilePath;
+                    JToken? exportedJson = null;
 
                     if (type == AssetClassID.Texture2D)
                     {
@@ -343,26 +670,40 @@ namespace UnityResourceCLI
                         exportedFilePath = Path.Combine(outputDir, outputRelativePath);
                         if (options.VerboseExportAssets)
                             Log($"    {typeName}: {assetName} -> {manifestRelativePath}");
-                        ExportDump(inst, info, baseField, exportedFilePath);
+                        exportedJson = ExportDump(inst, info, baseField, exportedFilePath);
                     }
 
+                    ushort scriptIndex = info.GetScriptIndex(inst.file);
+                    var typeTreeKey = (info.TypeIdOrIndex, scriptIndex);
+                    if (!typeTreeFingerprintCache.TryGetValue(typeTreeKey, out string? typeTreeFingerprint))
+                    {
+                        typeTreeFingerprint = ComputeTypeTreeFingerprint(baseField.TemplateField);
+                        typeTreeFingerprintCache[typeTreeKey] = typeTreeFingerprint;
+                    }
+
+                    FileInfo? exportedFileInfo = File.Exists(exportedFilePath)
+                        ? new FileInfo(exportedFilePath)
+                        : null;
                     manifest.Items.Add(new ExportManifestItem
                     {
                         PathId = info.PathId,
                         TypeId = info.TypeId,
-                        ScriptIndex = info.GetScriptIndex(inst.file),
+                        ScriptIndex = scriptIndex,
                         TypeName = typeName,
                         AssetName = assetName,
                         ExportKind = exportKind,
                         RelativePath = manifestRelativePath.Replace('\\', '/'),
                         BundleEntryName = bundleEntryName ?? "",
                         ReferenceUnityVersion = referenceUnityVersion,
-                        TypeTreeFingerprint = ComputeTypeTreeFingerprint(baseField.TemplateField),
-                        JsonSchemaFingerprint = exportKind.Equals("json", StringComparison.OrdinalIgnoreCase)
-                            && File.Exists(exportedFilePath)
-                            ? ComputeJsonSchemaFingerprint(File.ReadAllText(exportedFilePath, Encoding.UTF8))
-                            : ""
+                        TypeTreeFingerprint = typeTreeFingerprint,
+                        JsonSchemaFingerprint = exportedJson != null
+                            ? ComputeJsonSchemaFingerprint(exportedJson)
+                            : "",
+                        OutputFileExists = exportedFileInfo != null,
+                        OutputFileLength = exportedFileInfo?.Length ?? 0,
+                        OutputFileLastWriteTimeUtcTicks = exportedFileInfo?.LastWriteTimeUtc.Ticks ?? 0
                     });
+                    exportProgress?.ReportItem();
                 }
             }
 
@@ -443,7 +784,7 @@ namespace UnityResourceCLI
             });
         }
 
-        private void ExportDump(AssetsFileInstance inst, AssetFileInfo info, AssetTypeValueField baseField, string outputPath)
+        private JToken? ExportDump(AssetsFileInstance inst, AssetFileInfo info, AssetTypeValueField baseField, string outputPath)
         {
             EnsureDirectoryForFile(outputPath);
             using FileStream fs = File.Open(outputPath, FileMode.Create, FileAccess.Write);
@@ -451,9 +792,10 @@ namespace UnityResourceCLI
 
             AssetDumpHelper dumper = new AssetDumpHelper();
             if (options.DumpFormat == "json")
-                dumper.DumpJsonAsset(sw, baseField);
+                return dumper.DumpJsonAsset(sw, baseField);
             else
                 dumper.DumpTextAsset(sw, baseField);
+            return null;
         }
 
         private void ExportTexture(AssetsFileInstance inst, AssetTypeValueField baseField, string outputPath)
@@ -504,6 +846,13 @@ namespace UnityResourceCLI
             DetectedFileType fileType = FileTypeDetector.DetectFileType(sourcePath);
             if (fileType == DetectedFileType.Unknown)
                 return;
+
+            if (manifest.Items.Any(item =>
+                item.TypeName.Equals(nameof(AssetClassID.MonoBehaviour), StringComparison.Ordinal)
+                && item.ExportKind.Equals("json", StringComparison.OrdinalIgnoreCase)))
+            {
+                EnsurePlayerDataDependenciesLoaded();
+            }
             string resultPath = fileType == DetectedFileType.BundleFile && IsBundleExtension(manifest.SourceRelativePath)
                 ? Path.Combine(resultRoot, "Bundle", "Android", manifest.SourceRelativePath)
                 : Path.Combine(resultRoot, manifest.SourceRelativePath);
@@ -513,14 +862,21 @@ namespace UnityResourceCLI
                 AssetsFileInstance inst = am.LoadAssetsFile(sourcePath, true);
                 EnsureClassDatabase(inst);
                 EnsureMonoTemplateGenerator(inst);
-                bool changed = ApplyManifestToAssetsFile(inst, manifest, manifestDir);
-                if (changed)
+                try
                 {
-                    WriteAssetsFile(inst, resultPath);
+                    bool changed = ApplyManifestToAssetsFile(inst, manifest, manifestDir);
+                    if (changed)
+                    {
+                        WriteAssetsFile(inst, resultPath);
+                    }
+                    else
+                    {
+                        Log("  No matching replacements found. Skipping output.");
+                    }
                 }
-                else
+                finally
                 {
-                    Log("  No matching replacements found. Skipping output.");
+                    CleanupTemporaryAssetReplacements();
                 }
             }
             else
@@ -540,38 +896,110 @@ namespace UnityResourceCLI
                 .GroupBy(i => i.BundleEntryName, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            Dictionary<int, byte[]> changedEntries = new Dictionary<int, byte[]>();
-            foreach (var group in grouped)
+            Dictionary<int, string> changedEntries = new Dictionary<int, string>();
+            try
             {
-                string entryName = group.Key;
-                int entryIndex = bunInst.file.GetFileIndex(entryName);
-                if (entryIndex < 0)
-                    continue;
-
-                AssetsFileInstance? inst = TryLoadBundleEntry(bunInst, entryIndex, entryName);
-                if (inst == null)
-                    continue;
-
-                EnsureClassDatabase(inst);
-                EnsureMonoTemplateGenerator(inst);
-                Log($"  Bundle entry: {entryName}");
-                bool changed = ApplyManifestToAssetsFile(inst, group.ToList(), manifestDir);
-                if (changed)
+                foreach (var group in grouped)
                 {
-                    changedEntries[entryIndex] = WriteAssetsFileToByteArray(inst);
-                }
-            }
+                    string entryName = group.Key;
+                    int entryIndex = bunInst.file.GetFileIndex(entryName);
+                    if (entryIndex < 0)
+                        continue;
 
-            if (changedEntries.Count > 0)
-            {
-                WriteBundleFilePreservingUnityFsShell(bunInst, changedEntries, resultPath);
+                    AssetsFileInstance? inst = TryLoadBundleEntry(bunInst, entryIndex, entryName);
+                    if (inst == null)
+                        continue;
+
+                    EnsureClassDatabase(inst);
+                    EnsureMonoTemplateGenerator(inst);
+                    Log($"  Bundle entry: {entryName}");
+                    try
+                    {
+                        bool changed = ApplyManifestToAssetsFile(inst, group.ToList(), manifestDir);
+                        if (changed)
+                        {
+                            EnsureDirectoryForFile(resultPath);
+                            string temporaryEntry = resultPath + $".entry_{entryIndex}_{Guid.NewGuid():N}.tmp";
+                            try
+                            {
+                                WriteAssetsFile(inst, temporaryEntry);
+                                changedEntries[entryIndex] = temporaryEntry;
+                            }
+                            catch
+                            {
+                                File.Delete(temporaryEntry);
+                                throw;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        CleanupTemporaryAssetReplacements();
+                    }
+                }
+
+                if (changedEntries.Count > 0)
+                    WriteBundleFilePreservingUnityFsShell(bunInst, changedEntries, resultPath);
+                return changedEntries.Count > 0;
             }
-            return changedEntries.Count > 0;
+            finally
+            {
+                foreach (string temporaryEntry in changedEntries.Values)
+                    File.Delete(temporaryEntry);
+            }
         }
 
         private static bool IsBundleExtension(string path)
         {
             return string.Equals(Path.GetExtension(path), ".bundle", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void EnsurePlayerDataDependenciesLoaded()
+        {
+            if (playerDataDependenciesLoaded)
+                return;
+            playerDataDependenciesLoaded = true;
+
+            // Player-data bundles such as datapack.unity3d commonly keep their
+            // MonoScript objects in data.unity3d/globalgamemanagers.assets. The
+            // exporter naturally had data.unity3d loaded first, but a filtered or
+            // parallel import can start directly at datapack and fail to resolve
+            // m_Script, silently falling back to the four-field MonoBehaviour shell.
+            // Preload the small player-data dependency bundle so script templates are
+            // deterministic regardless of manifest selection and worker order.
+            string dataBundlePath = Path.Combine(options.SourceRoot, "bin", "Data", "data.unity3d");
+            if (File.Exists(dataBundlePath)
+                && FileTypeDetector.DetectFileType(dataBundlePath) == DetectedFileType.BundleFile)
+            {
+                BundleFileInstance dependencyBundle = am.LoadBundleFile(dataBundlePath, true);
+                int loadedEntries = 0;
+                for (int i = 0; i < dependencyBundle.file.BlockAndDirInfo.DirectoryInfos.Count; i++)
+                {
+                    AssetBundleDirectoryInfo entry = dependencyBundle.file.BlockAndDirInfo.DirectoryInfos[i];
+                    if ((entry.Flags & 4) == 0)
+                        continue;
+                    try
+                    {
+                        am.LoadAssetsFileFromBundle(dependencyBundle, i, true);
+                        loadedEntries++;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"  WARNING: Player-data dependency entry could not be loaded: {entry.Name}: {ex.Message}");
+                    }
+                }
+                Log($"  Preloaded MonoBehaviour dependencies from data.unity3d: {loadedEntries} SerializedFile(s).");
+            }
+
+            string builtinPath = Path.Combine(
+                options.SourceRoot,
+                "bin", "Data", "Resources", "unity default resources"
+            );
+            if (File.Exists(builtinPath)
+                && FileTypeDetector.DetectFileType(builtinPath) == DetectedFileType.AssetsFile)
+            {
+                am.LoadAssetsFile(builtinPath, true);
+            }
         }
 
         private bool ApplyManifestToAssetsFile(AssetsFileInstance inst, ExportManifest manifest, string manifestDir)
@@ -598,7 +1026,7 @@ namespace UnityResourceCLI
                     byte[]? bytes = ApplyTextureReplacement(inst, info, replacementPath);
                     if (bytes != null)
                     {
-                        info.SetNewData(bytes);
+                        SetAssetReplacement(info, bytes);
                         changed = true;
                     }
                 }
@@ -608,7 +1036,7 @@ namespace UnityResourceCLI
                     byte[]? bytes = ApplyFontReplacement(inst, info, replacementPath);
                     if (bytes != null)
                     {
-                        info.SetNewData(bytes);
+                        SetAssetReplacement(info, bytes);
                         changed = true;
                     }
                 }
@@ -618,12 +1046,42 @@ namespace UnityResourceCLI
                     byte[]? bytes = ApplyDumpReplacement(inst, info, replacementPath, item.ExportKind, manifestDir, item);
                     if (bytes != null)
                     {
-                        info.SetNewData(bytes);
+                        SetAssetReplacement(info, bytes);
                         changed = true;
                     }
                 }
             }
             return changed;
+        }
+
+        private void SetAssetReplacement(AssetFileInfo info, byte[] bytes)
+        {
+            if (bytes.Length < LargeReplacementSpoolThreshold)
+            {
+                info.SetNewData(bytes);
+                return;
+            }
+
+            string temporaryPath = Path.Combine(
+                options.WorkRoot,
+                $".asset_replacement_{Guid.NewGuid():N}.tmp"
+            );
+            Directory.CreateDirectory(options.WorkRoot);
+            File.WriteAllBytes(temporaryPath, bytes);
+            FileStream stream = File.Open(temporaryPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            temporaryAssetReplacements.Add((stream, temporaryPath));
+            info.Replacer = new ContentReplacerFromStream(stream);
+            Log($"      大型对象替换已转为磁盘流式缓存: {bytes.LongLength:N0} 字节");
+        }
+
+        private void CleanupTemporaryAssetReplacements()
+        {
+            foreach ((FileStream stream, string path) in temporaryAssetReplacements)
+            {
+                stream.Dispose();
+                File.Delete(path);
+            }
+            temporaryAssetReplacements.Clear();
         }
 
         private string? ResolveReplacementPath(string manifestDir, ExportManifestItem item)
@@ -707,12 +1165,71 @@ namespace UnityResourceCLI
 
         private static void EncodeTextureImageFromReplacement(TextureFile tex, string replacementPath, int jpegQuality)
         {
+            if ((TextureFormat)tex.m_TextureFormat == TextureFormat.Alpha8)
+            {
+                EncodeAlpha8Replacement(tex, replacementPath);
+                return;
+            }
+
+            // RGB24's native image path applies a different row/channel
+            // convention from the other encoders. Encode it explicitly so the
+            // resulting Unity rows and RGB order are deterministic.
+            if ((TextureFormat)tex.m_TextureFormat == TextureFormat.RGB24)
+            {
+                EncodeRgb24Replacement(tex, replacementPath);
+                return;
+            }
+
             using MemoryStream imageStream = LoadReplacementImageFlippedVertically(replacementPath, jpegQuality);
             tex.EncodeTextureImage(imageStream, 1, jpegQuality);
         }
 
+        private static void EncodeRgb24Replacement(TextureFile tex, string replacementPath)
+        {
+            using FileStream fs = File.OpenRead(replacementPath);
+            ImageResult image = ImageResult.FromStream(fs, ColorComponents.RedGreenBlueAlpha);
+            byte[] unityRows = TextureOperations.FlipRGBA32Vertically(image.Data, image.Width, image.Height);
+            byte[] rgb24 = new byte[checked(image.Width * image.Height * 3)];
+            for (int source = 0, target = 0; target < rgb24.Length; source += 4, target += 3)
+            {
+                rgb24[target] = unityRows[source];
+                rgb24[target + 1] = unityRows[source + 1];
+                rgb24[target + 2] = unityRows[source + 2];
+            }
+            tex.SetPictureData(rgb24, image.Width, image.Height, TextureFormat.RGB24, 1);
+        }
+
+        private static void EncodeAlpha8Replacement(TextureFile tex, string replacementPath)
+        {
+            using FileStream fs = File.OpenRead(replacementPath);
+            ImageResult image = ImageResult.FromStream(fs, ColorComponents.RedGreenBlueAlpha);
+            byte[] unityRows = TextureOperations.FlipRGBA32Vertically(image.Data, image.Width, image.Height);
+            byte[] alpha8 = new byte[checked(image.Width * image.Height)];
+            for (int source = 3, target = 0; target < alpha8.Length; source += 4, target++)
+                alpha8[target] = unityRows[source];
+
+            // TextureOperations.GetPaddedTextureSize currently does not implement
+            // Alpha8, so TextureFile.SetPictureData throws before assigning the raw
+            // bytes. Alpha8 has no block padding requirement; update the same public
+            // fields directly and preserve the original one-byte-per-pixel format.
+            tex.m_TextureFormat = (int)TextureFormat.Alpha8;
+            tex.m_Width = image.Width;
+            tex.m_Height = image.Height;
+            tex.m_StreamData.path = "";
+            tex.m_StreamData.offset = 0;
+            tex.m_StreamData.size = 0;
+            tex.pictureData = alpha8;
+            tex.m_CompleteImageSize = alpha8.Length;
+            tex.m_MipCount = 1;
+            tex.m_MipMap = false;
+        }
+
         private static void EncodeTextureImageFromReplacement(TextureFile tex, string replacementPath, TextureFormat format, int jpegQuality)
         {
+            // This overload is used after the original format encoder rejects
+            // the texture. The RGBA32 fallback follows the existing pre-flipped
+            // memory-stream contract, which is intentionally separate from the
+            // successful original-format path above.
             using MemoryStream imageStream = LoadReplacementImageFlippedVertically(replacementPath, jpegQuality);
             tex.EncodeTextureImage(imageStream, format, 1, jpegQuality);
         }
@@ -741,12 +1258,18 @@ namespace UnityResourceCLI
 
         private byte[]? ApplyDumpReplacement(AssetsFileInstance inst, AssetFileInfo info, string replacementPath, string exportKind, string manifestDir, ExportManifestItem item)
         {
-            AssetTypeTemplateField? tempField = SafeGetTemplateField(inst, info);
-            if (tempField == null)
-                return null;
             AssetTypeValueField? baseField = SafeGetBaseField(inst, info);
             if (baseField == null)
                 return null;
+
+            // GetTemplateBaseField only returns the built-in MonoBehaviour shell for
+            // script-backed objects. GetBaseField expands that shell with the managed
+            // script fields and exposes the exact template that was used to deserialize
+            // the object. Serializing JSON with the shell template truncates every
+            // MonoBehaviour after m_EditorClassIdentifier; Unity then reads the missing
+            // custom fields past the object boundary and aborts with
+            // "Position out of bounds". Always import through the expanded template.
+            AssetTypeTemplateField tempField = baseField.TemplateField;
 
             ReportImportReferenceCompatibility(
                 inst,
@@ -845,8 +1368,8 @@ namespace UnityResourceCLI
                 && !string.IsNullOrWhiteSpace(currentUnityVersion)
                 && !string.Equals(item.ReferenceUnityVersion, currentUnityVersion, StringComparison.Ordinal))
             {
-                LogRed(
-                    $"      导出/导入 Unity 版本不一致: " +
+                throw new InvalidOperationException(
+                    $"拒绝导入 Unity 版本不一致的资源: " +
                     $"export={item.ReferenceUnityVersion}, import={currentUnityVersion}, asset={item.RelativePath}"
                 );
             }
@@ -855,8 +1378,8 @@ namespace UnityResourceCLI
             if (!string.IsNullOrWhiteSpace(item.TypeTreeFingerprint)
                 && !string.Equals(item.TypeTreeFingerprint, currentTypeTreeFingerprint, StringComparison.OrdinalIgnoreCase))
             {
-                LogRed(
-                    $"      导出/导入类型树不一致: " +
+                throw new InvalidOperationException(
+                    $"拒绝使用不一致的类型树重写资源: " +
                     $"export={item.TypeTreeFingerprint}, import={currentTypeTreeFingerprint}, asset={item.RelativePath}"
                 );
             }
@@ -910,7 +1433,13 @@ namespace UnityResourceCLI
             string json,
             bool normalizeArrayWrappers = false)
         {
-            JToken token = JToken.Parse(json);
+            return ComputeJsonSchemaFingerprint(JToken.Parse(json), normalizeArrayWrappers);
+        }
+
+        private static string ComputeJsonSchemaFingerprint(
+            JToken token,
+            bool normalizeArrayWrappers = false)
+        {
             StringBuilder signature = new StringBuilder();
             AppendJsonSchemaSignature(token, signature, normalizeArrayWrappers);
             return ComputeSha256(signature.ToString());
@@ -1142,57 +1671,86 @@ namespace UnityResourceCLI
             inst.file.Write(writer);
         }
 
-        private static byte[] WriteAssetsFileToByteArray(AssetsFileInstance inst)
-        {
-            using MemoryStream ms = new MemoryStream();
-            using AssetsFileWriter writer = new AssetsFileWriter(ms);
-            inst.file.Write(writer);
-            return ms.ToArray();
-        }
-
         private void WriteBundleFile(BundleFileInstance bunInst, string destinationPath)
         {
             EnsureDirectoryForFile(destinationPath);
-            using FileStream fs = File.Open(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None);
-            using AssetsFileWriter writer = new AssetsFileWriter(fs);
+            long expectedDataSize = bunInst.file.BlockAndDirInfo.DirectoryInfos.Sum(
+                info => info.Replacer?.GetSize() ?? info.DecompressedSize
+            );
+            EnsureRepackDiskSpace(destinationPath, expectedDataSize);
+            string temporaryOutput = destinationPath + ".repack_tmp";
+            File.Delete(temporaryOutput);
             bool blockDirAtEnd = (bunInst.originalFileStreamFlags & AssetBundleFSHeaderFlags.BlockAndDirAtEnd) != 0;
-            if (bunInst.originalCompression != AssetBundleCompressionType.None)
+            string temporaryUnpacked = destinationPath + ".unpacked_tmp";
+            File.Delete(temporaryUnpacked);
+            try
             {
-                byte[] unpackedBytes;
-                using (MemoryStream unpackedStream = new MemoryStream())
+                using FileStream fs = File.Open(temporaryOutput, FileMode.Create, FileAccess.Write, FileShare.None);
+                using AssetsFileWriter writer = new AssetsFileWriter(fs);
+                using (FileStream unpackedStream = File.Open(temporaryUnpacked, FileMode.Create, FileAccess.Write, FileShare.None))
+                using (AssetsFileWriter unpackedWriter = new AssetsFileWriter(unpackedStream))
                 {
-                    using (AssetsFileWriter unpackedWriter = new AssetsFileWriter(unpackedStream))
-                    {
-                        bunInst.file.Write(unpackedWriter);
-                    }
-                    unpackedBytes = unpackedStream.ToArray();
+                    bunInst.file.Write(unpackedWriter);
                 }
 
-                using MemoryStream replacedStream = new MemoryStream(unpackedBytes);
+                using FileStream replacedStream = File.Open(temporaryUnpacked, FileMode.Open, FileAccess.Read, FileShare.Read);
                 AssetBundleFile replacedBundle = new AssetBundleFile();
                 replacedBundle.Read(new AssetsFileReader(replacedStream));
                 replacedBundle.Pack(writer, bunInst.originalCompression, blockDirAtEnd, null, bunInst.originalFileStreamFlags);
+                writer.Dispose();
+                fs.Dispose();
+                File.Move(temporaryOutput, destinationPath, true);
             }
-            else
+            finally
             {
-                bunInst.file.Pack(writer, AssetBundleCompressionType.None, blockDirAtEnd, null, bunInst.originalFileStreamFlags);
+                File.Delete(temporaryUnpacked);
+                File.Delete(temporaryOutput);
             }
         }
 
-        private void WriteBundleFilePreservingUnityFsShell(BundleFileInstance bunInst, Dictionary<int, byte[]> changedEntries, string destinationPath)
+        private static void EnsureRepackDiskSpace(string destinationPath, long expectedDataSize)
         {
+            string fullPath = Path.GetFullPath(destinationPath);
+            string root = Path.GetPathRoot(fullPath) ?? throw new InvalidOperationException($"无法确定输出磁盘: {fullPath}");
+            long safetyMargin = 64L * 1024 * 1024;
+            long required = expectedDataSize > (long.MaxValue - safetyMargin) / 2
+                ? long.MaxValue
+                : expectedDataSize * 2 + safetyMargin;
+            long available = new DriveInfo(root).AvailableFreeSpace;
+            if (available < required)
+            {
+                throw new IOException(
+                    $"UnityFS 流式重打临时空间不足: required={required:N0}, available={available:N0}, " +
+                    $"drive={root}, output={destinationPath}"
+                );
+            }
+        }
+
+        private void WriteBundleFilePreservingUnityFsShell(BundleFileInstance bunInst, Dictionary<int, string> changedEntries, string destinationPath)
+        {
+            long expectedDecompressedSize = 0;
+            for (int index = 0; index < bunInst.file.BlockAndDirInfo.DirectoryInfos.Count; index++)
+            {
+                AssetBundleDirectoryInfo dirInfo = bunInst.file.BlockAndDirInfo.DirectoryInfos[index];
+                expectedDecompressedSize += changedEntries.TryGetValue(index, out string? replacementPath)
+                    ? new FileInfo(replacementPath).Length
+                    : dirInfo.DecompressedSize;
+            }
+            Log($"    UnityFS 流式重打预计解压数据: {expectedDecompressedSize:N0} 字节。");
+
             bool canPatchInPlace = bunInst.originalCompression == AssetBundleCompressionType.None;
             if (canPatchInPlace)
             {
-                foreach (KeyValuePair<int, byte[]> pair in changedEntries)
+                foreach (KeyValuePair<int, string> pair in changedEntries)
                 {
                     AssetBundleDirectoryInfo dirInfo = bunInst.file.BlockAndDirInfo.DirectoryInfos[pair.Key];
-                    if (pair.Value.LongLength != dirInfo.DecompressedSize)
+                    long replacementSize = new FileInfo(pair.Value).Length;
+                    if (replacementSize != dirInfo.DecompressedSize)
                     {
                         canPatchInPlace = false;
                         Log(
                             $"    Entry size changed, rebuilding UnityFS directory/data: {dirInfo.Name}, " +
-                            $"old={dirInfo.DecompressedSize}, new={pair.Value.LongLength}"
+                            $"old={dirInfo.DecompressedSize}, new={replacementSize}"
                         );
                         break;
                     }
@@ -1210,26 +1768,52 @@ namespace UnityResourceCLI
             if (canPatchInPlace)
             {
                 EnsureDirectoryForFile(destinationPath);
-                File.Copy(bunInst.path, destinationPath, true);
+                string temporaryOutput = destinationPath + ".repack_tmp";
+                File.Delete(temporaryOutput);
+                File.Copy(bunInst.path, temporaryOutput, true);
 
                 long dataOffset = bunInst.file.Header.GetFileDataOffset();
-                using FileStream fs = File.Open(destinationPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
-                foreach (KeyValuePair<int, byte[]> pair in changedEntries)
+                try
                 {
-                    AssetBundleDirectoryInfo dirInfo = bunInst.file.BlockAndDirInfo.DirectoryInfos[pair.Key];
-                    fs.Position = dataOffset + dirInfo.Offset;
-                    fs.Write(pair.Value, 0, pair.Value.Length);
-                    Log($"    In-place UnityFS entry patch: {dirInfo.Name}, size={pair.Value.Length}");
+                    using (FileStream fs = File.Open(temporaryOutput, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                    {
+                        foreach (KeyValuePair<int, string> pair in changedEntries)
+                        {
+                            AssetBundleDirectoryInfo dirInfo = bunInst.file.BlockAndDirInfo.DirectoryInfos[pair.Key];
+                            fs.Position = dataOffset + dirInfo.Offset;
+                            using FileStream replacement = File.OpenRead(pair.Value);
+                            replacement.CopyTo(fs);
+                            Log($"    In-place UnityFS entry patch: {dirInfo.Name}, size={replacement.Length}");
+                        }
+                    }
+                    File.Move(temporaryOutput, destinationPath, true);
+                }
+                finally
+                {
+                    File.Delete(temporaryOutput);
                 }
                 return;
             }
 
-            foreach (KeyValuePair<int, byte[]> pair in changedEntries)
+            List<FileStream> replacementStreams = new List<FileStream>();
+            try
             {
-                bunInst.file.BlockAndDirInfo.DirectoryInfos[pair.Key].SetNewData(pair.Value);
+                foreach (KeyValuePair<int, string> pair in changedEntries)
+                {
+                    FileStream replacement = File.Open(pair.Value, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    replacementStreams.Add(replacement);
+                    bunInst.file.BlockAndDirInfo.DirectoryInfos[pair.Key].Replacer =
+                        new ContentReplacerFromStream(replacement);
+                }
+                WriteBundleFile(bunInst, destinationPath);
             }
-            WriteBundleFile(bunInst, destinationPath);
+            finally
+            {
+                foreach (FileStream replacement in replacementStreams)
+                    replacement.Dispose();
+            }
         }
+
 
         private void EnsureClassDatabase(AssetsFileInstance inst)
         {
@@ -1259,8 +1843,46 @@ namespace UnityResourceCLI
             {
                 return am.GetBaseField(inst, info);
             }
-            catch
+            catch (Exception ex)
             {
+                ushort scriptIndex;
+                try
+                {
+                    scriptIndex = info.GetScriptIndex(inst.file);
+                }
+                catch
+                {
+                    scriptIndex = ushort.MaxValue;
+                }
+
+                string monoDetails = "";
+                if (info.TypeId == (int)AssetClassID.MonoBehaviour)
+                {
+                    try
+                    {
+                        AssetTypeValueField baseOnly = am.GetBaseField(
+                            inst,
+                            info,
+                            AssetReadFlags.SkipMonoBehaviourFields
+                        );
+                        AssetPPtr script = AssetPPtr.FromField(baseOnly["m_Script"]);
+                        monoDetails =
+                            $", Name={baseOnly["m_Name"].AsString}, " +
+                            $"ScriptFileId={script.FileId}, ScriptPathId={script.PathId}";
+                    }
+                    catch (Exception fallbackEx)
+                    {
+                        monoDetails =
+                            $", BaseOnlyDiagnosticFailed={fallbackEx.GetType().Name}: {fallbackEx.Message}";
+                    }
+                }
+
+                Log(
+                    "  ERROR: Asset deserialization failed. " +
+                    $"File={inst.path}, PathId={info.PathId}, TypeId={info.TypeId}, " +
+                    $"TypeIdOrIndex={info.TypeIdOrIndex}, ScriptIndex={scriptIndex}{monoDetails}"
+                );
+                Log($"  ERROR DETAIL: {ex}");
                 return null;
             }
         }
@@ -1393,6 +2015,41 @@ namespace UnityResourceCLI
         private static void Log(string message)
         {
             Console.WriteLine($"[UnityResourceCLI] {message}");
+        }
+
+        private sealed class ExportProgress
+        {
+            private readonly long interval;
+            private long processed;
+            private long nextHeartbeat;
+
+            public ExportProgress(long interval)
+            {
+                this.interval = interval;
+                nextHeartbeat = interval;
+            }
+
+            public void ReportItem()
+            {
+                long current = Interlocked.Increment(ref processed);
+                while (true)
+                {
+                    long next = Volatile.Read(ref nextHeartbeat);
+                    if (current < next)
+                        return;
+                    if (Interlocked.CompareExchange(ref nextHeartbeat, next + interval, next) == next)
+                    {
+                        Log($"[导出进度] 已处理 {current:N0} 条资源");
+                        return;
+                    }
+                }
+            }
+
+            public void LogFinal()
+            {
+                long current = Volatile.Read(ref processed);
+                Log($"[导出进度] 已处理 {current:N0} 条资源（完成）");
+            }
         }
     }
 }

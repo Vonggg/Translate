@@ -35,6 +35,52 @@ class TmpFontReplacementTests(unittest.TestCase):
         )
         self.assertTrue(replacement["m_GlyphTable"]["Array"][0]["generated"])
 
+    def test_face_info_keeps_original_schema_types_with_generated_values(self) -> None:
+        original = {
+            "m_GlyphTable": {"Array": []},
+            "m_CharacterTable": {"Array": []},
+            "m_FaceInfo": {
+                "m_FamilyName": "Game Font",
+                "m_StyleName": "Regular",
+                "m_UnitsPerEM": 1000,
+                "m_PointSize": 90,
+                "m_Scale": 1.0,
+                "m_CapLine": 66.0,
+                "m_Baseline": 0.0,
+                "m_OriginalOnly": 12.5,
+            },
+        }
+        generated = {
+            "m_GlyphTable": {"Array": []},
+            "m_CharacterTable": {"Array": []},
+            "m_FaceInfo": {
+                "m_FamilyName": "Generated Font",
+                "m_StyleName": "Generated Style",
+                "m_UnitsPerEM": 2048,
+                "m_PointSize": 43,
+                "m_Scale": 1,
+                "m_CapLine": 30,
+                "m_Baseline": 0,
+                "m_GeneratedOnly": 99,
+            },
+        }
+
+        replacement = _build_tmp_font_replacement(generated, original)
+        face_info = replacement["m_FaceInfo"]
+
+        self.assertEqual(face_info["m_FamilyName"], "Game Font")
+        self.assertEqual(face_info["m_StyleName"], "Regular")
+        self.assertEqual(face_info["m_UnitsPerEM"], 1000)
+        self.assertEqual(face_info["m_PointSize"], 43)
+        self.assertEqual(face_info["m_Scale"], 1.0)
+        self.assertEqual(face_info["m_CapLine"], 30.0)
+        self.assertEqual(face_info["m_Baseline"], 0.0)
+        self.assertIs(type(face_info["m_Scale"]), float)
+        self.assertIs(type(face_info["m_CapLine"]), float)
+        self.assertIs(type(face_info["m_Baseline"]), float)
+        self.assertEqual(face_info["m_OriginalOnly"], 12.5)
+        self.assertNotIn("m_GeneratedOnly", face_info)
+
 
 if __name__ == "__main__":
     unittest.main()

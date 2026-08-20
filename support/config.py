@@ -110,6 +110,8 @@ DEFAULT_STRING_FIELD_BLACKLIST = [
     "m_TargetAssemblyTypeName",
     "m_ObjectArgumentAssemblyTypeName",
     "triggerName",
+    "m_ActionMaps.Array*.m_Bindings.Array*.m_Action",
+    "m_ActionMaps.Array*.m_Actions.Array*.m_ExpectedControlType",
     "m_Entries.Array*.m_Key",
     "mTerm",
     "mTermSecondary",
@@ -286,6 +288,9 @@ class PipelineConfig:
     google_proxy_http: str = "http://127.0.0.1:10808"
     google_proxy_https: str = "http://127.0.0.1:10809"
     enable_ai_translation: bool = False
+    ai_translation_transport: str = "http"
+    ai_translation_codex_model: str = "gpt-5.3-codex-spark"
+    ai_translation_codex_reasoning_effort: str = "low"
     ai_translation_base_url: str = ""
     ai_translation_api_key: str = ""
     ai_translation_model: str = ""
@@ -294,9 +299,13 @@ class PipelineConfig:
     ai_translation_proxy_https: str = ""
     ai_translation_batch_max_chars: int = 1200000
     ai_translation_max_output_chars: int = 384000
+    ai_translation_output_safety_divisor: int = 12
     ai_translation_strategy: str = "default"
     text_keys: list[str] = field(default_factory=lambda: list(DEFAULT_TEXT_KEYS))
     enable_ai_field_review: bool = False
+    ai_field_review_transport: str = "http"
+    ai_field_review_codex_model: str = "gpt-5.3-codex-spark"
+    ai_field_review_codex_reasoning_effort: str = "medium"
     ai_field_review_base_url: str = ""
     ai_field_review_api_key: str = ""
     ai_field_review_model: str = ""
@@ -312,6 +321,10 @@ class PipelineConfig:
     tmp_template_json_path: Path = Path("templates/templates.json")
     tmp_template_atlas_path: Path = Path("templates/Atlasa-templates.png")
     tmp_max_atlas_size: int = 8192
+    ngui_generated_dir: Path = Path("workspace/output/Font/NGUI/generated")
+    ngui_import_dir: Path = Path("workspace/output/Font/NGUI/ToImport")
+    ngui_max_atlas_size: int = 4096
+    ngui_glyph_padding: int = 2
     include_old_sdf_template_chars: bool = False
     protect_i2_tmp_fonts_from_replacement: bool = True
     enable_text_effect_material_cleanup: bool = True
@@ -474,6 +487,9 @@ def load_config(config_path: str | Path | None = None, quiet: bool = False) -> P
         google_proxy_http=get_value("google_proxy_http", "http://127.0.0.1:10808"),
         google_proxy_https=get_value("google_proxy_https", "http://127.0.0.1:10809"),
         enable_ai_translation=bool(get_value("enable_ai_translation", False)),
+        ai_translation_transport=get_value("ai_translation_transport", "http"),
+        ai_translation_codex_model=get_value("ai_translation_codex_model", "gpt-5.3-codex-spark"),
+        ai_translation_codex_reasoning_effort=get_value("ai_translation_codex_reasoning_effort", "low"),
         ai_translation_base_url=get_value("ai_translation_base_url", ""),
         ai_translation_api_key=get_value("ai_translation_api_key", ""),
         ai_translation_model=get_value("ai_translation_model", ""),
@@ -482,9 +498,13 @@ def load_config(config_path: str | Path | None = None, quiet: bool = False) -> P
         ai_translation_proxy_https=get_value("ai_translation_proxy_https", ""),
         ai_translation_batch_max_chars=int(get_value("ai_translation_batch_max_chars", 1200000) or 1200000),
         ai_translation_max_output_chars=int(get_value("ai_translation_max_output_chars", 384000) or 384000),
+        ai_translation_output_safety_divisor=max(1, int(get_value("ai_translation_output_safety_divisor", 12) or 12)),
         ai_translation_strategy=get_value("ai_translation_strategy", "default"),
         text_keys=list(get_value("text_keys", DEFAULT_TEXT_KEYS)),
         enable_ai_field_review=bool(get_value("enable_ai_field_review", False)),
+        ai_field_review_transport=get_value("ai_field_review_transport", "http"),
+        ai_field_review_codex_model=get_value("ai_field_review_codex_model", "gpt-5.3-codex-spark"),
+        ai_field_review_codex_reasoning_effort=get_value("ai_field_review_codex_reasoning_effort", "medium"),
         ai_field_review_base_url=get_value("ai_field_review_base_url", ""),
         ai_field_review_api_key=get_value("ai_field_review_api_key", ""),
         ai_field_review_model=get_value("ai_field_review_model", ""),
@@ -500,6 +520,10 @@ def load_config(config_path: str | Path | None = None, quiet: bool = False) -> P
         tmp_template_json_path=_resolve(root_dir, get_value("tmp_template_json_path", "templates/templates.json")),
         tmp_template_atlas_path=_resolve(root_dir, get_value("tmp_template_atlas_path", "templates/Atlasa-templates.png")),
         tmp_max_atlas_size=int(get_value("tmp_max_atlas_size", 8192) or 8192),
+        ngui_generated_dir=_resolve(root_dir, get_value("ngui_generated_dir", "workspace/output/Font/NGUI/generated")),
+        ngui_import_dir=_resolve(root_dir, get_value("ngui_import_dir", "workspace/output/Font/NGUI/ToImport")),
+        ngui_max_atlas_size=max(1, int(get_value("ngui_max_atlas_size", 4096) or 4096)),
+        ngui_glyph_padding=max(0, int(get_value("ngui_glyph_padding", 2) or 0)),
         include_old_sdf_template_chars=bool(get_value("include_old_sdf_template_chars", False)),
         protect_i2_tmp_fonts_from_replacement=bool(get_value("protect_i2_tmp_fonts_from_replacement", True)),
         enable_text_effect_material_cleanup=bool(get_value("enable_text_effect_material_cleanup", True)),

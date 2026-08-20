@@ -27,6 +27,8 @@ class DeepSeekTranslationStrategy(DefaultAITranslationStrategy):
             "保留换行、占位符、数字、货币符号、格式控制符和富文本标签。"
             "短 UI 文本要自然、紧凑，适合按钮、菜单和弹窗。"
             "只返回严格 JSON，格式为 {\"items\":[{\"id\":数字,\"translation\":\"译文\"}]}。"
+            "必须严格使用 JSON 属性分隔符：每个 id、translation、items 键后都必须是英文冒号 :，"
+            "绝不能误写成 >、=，也不能漏掉冒号；相邻对象之间必须使用英文逗号分隔。"
             "译文需要引号时优先使用中文引号“”或‘’，例如 <color=blue>“服务”</color>；"
             "如果必须使用英文双引号，必须按 JSON 规则转义为 \\\"，绝不能在 translation 字符串中输出未转义的英文双引号。"
             "返回前必须检查整个响应可以被标准 JSON 解析器直接解析。"

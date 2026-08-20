@@ -20,3 +20,9 @@ Builds/
 *.pdb
 *.mdb
 AssetPipeline_CLI/.nested_git_backup/
+
+# Local project configuration and private working notes
+/config.json
+/config.json.记得备份
+/优化方向.txt
+/重点记录.txt

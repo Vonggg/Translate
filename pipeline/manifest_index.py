@@ -8,8 +8,8 @@ from .shared import read_json, write_json
 
 
 TMP_MANIFEST_INDEX_NAME = "tmp_manifest_index.json"
-TMP_FONT_MARKERS = ("sdf", "fontasset", "font asset")
 INDEXED_RESOURCE_TYPES = {"MonoBehaviour", "TextAsset", "Texture2D", "Material", "Font"}
+TMP_MANIFEST_INDEX_SCHEMA_VERSION = 2
 
 
 def tmp_manifest_index_path(cfg: PipelineConfig) -> Path:
@@ -35,12 +35,6 @@ def build_tmp_manifest_index(cfg: PipelineConfig) -> dict[str, Any]:
             type_name = item.get("TypeName", item.get("typeName"))
             if type_name not in INDEXED_RESOURCE_TYPES:
                 continue
-            if type_name == "MonoBehaviour":
-                asset_name = str(item.get("AssetName", item.get("assetName", "")))
-                relative_path = str(item.get("RelativePath", item.get("relativePath", "")))
-                marker_text = f"{asset_name} {relative_path}".lower()
-                if not any(marker in marker_text for marker in TMP_FONT_MARKERS):
-                    continue
             items.append(
                 {
                     "manifest_path": str(manifest_path),
@@ -50,6 +44,7 @@ def build_tmp_manifest_index(cfg: PipelineConfig) -> dict[str, Any]:
             )
 
     payload = {
+        "schema_version": TMP_MANIFEST_INDEX_SCHEMA_VERSION,
         "resource_input_root": str(cfg.resource_input_root),
         "manifest_count": manifest_count,
         "item_count": len(items),
@@ -68,6 +63,8 @@ def load_tmp_manifest_index(cfg: PipelineConfig) -> list[tuple[Path, Path, dict[
     except Exception:
         return None
     if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != TMP_MANIFEST_INDEX_SCHEMA_VERSION:
         return None
     if str(payload.get("resource_input_root", "")) != str(cfg.resource_input_root):
         return None

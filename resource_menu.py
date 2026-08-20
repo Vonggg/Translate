@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 
 from support.config import load_config
+from support.image_restore import restore_edited_images_before_import
 from pipeline.catalog_tools import auto_patch_and_repack_catalog_after_import
 from pipeline.manifest_index import load_tmp_manifest_index, tmp_manifest_index_path
 from pipeline.resource_staging import (
@@ -343,6 +344,34 @@ def print_monobehaviour_export_summary(input_root: Path) -> None:
         print("[导出] 提示: UnityResourceCLI 未展开业务字段；若 AssetStudio 回填成功，以实际 JSON 统计为准。")
 
 
+def print_export_profile_summary(input_root: Path) -> None:
+    profile_sets: list[set[str]] = []
+    for manifest_path in sorted(input_root.rglob("manifest.json")):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            continue
+        profiles = manifest.get("ExportedProfiles")
+        if isinstance(profiles, list):
+            profile_sets.append({str(value).lower() for value in profiles if value})
+    if not profile_sets:
+        return
+    complete_profiles = set.intersection(*profile_sets)
+    labels = {
+        "basic": "1 基础资源",
+        "objects": "2 对象索引",
+        "mesh": "3 Mesh 索引",
+    }
+    completed = [labels[key] for key in ("basic", "objects", "mesh") if key in complete_profiles]
+    missing = [labels[key] for key in ("basic", "objects", "mesh") if key not in complete_profiles]
+    print(f"[增量导出] 当前 manifest 已累计: {', '.join(completed) if completed else '无'}")
+    if missing:
+        print(
+            f"[增量导出] 尚未导出: {', '.join(missing)}；"
+            "可再次执行一键导出并保留 workspace。"
+        )
+
+
 def print_actual_monobehaviour_json_summary(input_root: Path, sample_limit: int = 20000) -> None:
     base_keys = {"m_GameObject", "m_Enabled", "m_Script", "m_Name"}
     total = 0
@@ -380,7 +409,7 @@ def print_actual_monobehaviour_json_summary(input_root: Path, sample_limit: int 
 def print_import_options() -> None:
     print("导入内容选项:")
     print("  1. 文本替换 (workspace/output/Text)")
-    print("  2. TMP/SDF 字体替换 (workspace/output/Font/SDF/ToImport)")
+    print("  2. TMP/SDF/NGUI 字体替换 (workspace/output/Font/*/ToImport)")
     print("  3. TTF 字体替换 (workspace/output/Font/TTF/ToImport)")
     print("  4. 图片替换 (workspace/output/Image/ToImport)")
     print("  5. Object 屏蔽 (workspace/output/Object/ToImport)")
@@ -611,13 +640,24 @@ def build_import_overlay(cfg, selection: set[str]) -> Path | None:
 
     if "tmp" in selection:
         tmp_count = _merge_tree(cfg.import_overlay_dir, overlay_root, "TMP")
+        ngui_count = _merge_tree(cfg.ngui_import_dir, overlay_root, "NGUI")
         copied_counts.append(f"TMP={tmp_count}")
+        copied_counts.append(f"NGUI={ngui_count}")
 
     if "ttf" in selection:
         ttf_count = _stage_ttf_replacements(cfg, overlay_root)
         copied_counts.append(f"TTF={ttf_count}")
 
     if "image" in selection:
+        try:
+            restore_edited_images_before_import(
+                cfg.root_dir,
+                cfg.resource_input_root,
+                cfg.image_import_dir,
+            )
+        except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+            print(f"\033[91m[图片导入][停止] 自动恢复目录结构失败: {exc}\033[0m")
+            return None
         image_count = _merge_tree(cfg.image_import_dir, overlay_root, "图片")
         copied_counts.append(f"图片={image_count}")
 
@@ -709,18 +749,19 @@ def print_menu() -> None:
     print()
     print("说明:")
     print("  导出: 自动解析 catalog.json/catalog.bin 并补齐可定位的远程资源，再汇总 aa/Android 与 bin/Data")
-    print("        每次重建 workspace/input_sources；split 只在暂存区自动合并，不修改原游戏目录")
+    print("        源资源未变化时复用 workspace/input_sources；split 只在暂存区自动合并，不修改原游戏目录")
+    print("        支持保留 workspace 后按 1 -> 2 -> 3 分阶段增量导出，manifest 会自动合并")
     print("        导出成功后会在 workspace\\records\\file_id_map.json 记录各资源文件的 FileID 外部依赖映射")
     print("  导入: 使用导出时的统一资源暂存区，并按记录恢复 aa/Android 与 bin/Data 原始路径")
     print("        catalog 输出到 FinalResult/Bundle；远程路径改为本地路径时同步覆盖源 catalog/hash")
-    print("        修改过的 split 会额外输出到 FinalResult\\SplitBundles，并以蓝色提示必须同步替换")
+    print("        修改过的 split 会在 FinalResult 原目录中恢复为 .splitN，并删除仅供处理的合并版")
     print()
 
 
 def prompt_export_profile() -> str | None:
     print("导出内容:")
     print("  1. 基础资源：图片、字体、文本、材质及 MonoBehaviour")
-    print("  2. 对象索引：Sprite、GameObject、Transform、RectTransform、SpriteRenderer")
+    print("  2. 对象索引：Sprite、SpriteAtlas、GameObject、Transform、RectTransform、SpriteRenderer")
     print("  3. Mesh 索引：Mesh、MeshFilter、SkinnedMeshRenderer；通常同时选择 2")
     print("  a. 全部")
     print("  q. 取消")
@@ -735,7 +776,9 @@ def prompt_export_profile() -> str | None:
     except ValueError as exc:
         print(f"\033[91m[导出选择] {exc}\033[0m")
         return ""
-    profile_names = {1: "basic", 2: "objects", 3: "mesh"}
+    # parse_number_ranges 的公共返回类型是字符串编号；这里保持同一类型，
+    # 避免单选或组合选择时用 "1" 查询整数键导致 KeyError。
+    profile_names = {"1": "basic", "2": "objects", "3": "mesh"}
     return "+".join(profile_names[index] for index in sorted(selected))
 
 
@@ -760,13 +803,13 @@ def main() -> int:
             root = workspace_root(cfg)
             if _has_entries(root):
                 confirm = prompt_input(
-                    f"workspace 非空，是否清空 {root} ? "
-                    "输入 y 确认，其它任意键取消: "
+                    f"workspace 非空，将默认保留并增量合并导出: {root}。"
+                    "如需从零开始，输入 c 清空；直接回车或其它任意键保留: "
                 ).strip().lower()
-                if confirm == "y":
+                if confirm == "c":
                     clean_workspace_root(cfg)
                 else:
-                    print("已取消清空，继续保留现有 workspace 内容。")
+                    print("已保留 workspace；本次 profile 将替换同类型旧导出并合并 manifest。")
                     print()
             else:
                 root.mkdir(parents=True, exist_ok=True)
@@ -787,6 +830,7 @@ def main() -> int:
             if result == 0:
                 build_file_id_map(cfg)
                 print_monobehaviour_export_summary(input_root)
+                print_export_profile_summary(input_root)
             return result
         if choice == "2":
             clean_import_temp_roots(cfg)
@@ -827,7 +871,6 @@ def main() -> int:
             )
             if result == 0:
                 restored_paths = restore_imported_resource_paths(cfg, import_result_root)
-                prepare_split_sync_outputs(cfg, import_result_root, restored_paths)
                 catalog_logs = sorted(log_dir.glob("*.log")) + sorted(log_dir.glob("*.txt"))
                 auto_patch_and_repack_catalog_after_import(
                     cfg,
@@ -835,6 +878,7 @@ def main() -> int:
                     catalog_logs,
                     source_root / "aa" / "Android",
                 )
+                prepare_split_sync_outputs(cfg, import_result_root, restored_paths)
                 print_final_addressables_sync_reminder(cfg, import_result_root)
             return result
         if choice in {"q", "quit", "exit"}:

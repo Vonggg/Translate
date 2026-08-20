@@ -27,6 +27,48 @@ def load_script_output_manifest() -> dict[str, Any]:
     return data
 
 
+def expand_script_output_ids(
+    manifest: dict[str, Any],
+    script_ids: Iterable[str],
+) -> list[str]:
+    """Expand manifest includes while preserving the first occurrence order."""
+    scripts = manifest.get("scripts") if isinstance(manifest, dict) else None
+    if not isinstance(scripts, dict):
+        raise ValueError(f"脚本产物清单格式无效: {MANIFEST_PATH}")
+    expanded_ids: list[str] = []
+
+    def expand(script_id: str, active: set[str]) -> None:
+        if script_id in active:
+            raise ValueError(f"脚本产物清单 includes 存在循环: {script_id}")
+        entry = scripts.get(script_id)
+        if not isinstance(entry, dict):
+            raise KeyError(f"清单中不存在脚本 {script_id}")
+        if script_id not in expanded_ids:
+            expanded_ids.append(script_id)
+        includes = entry.get("includes")
+        if not isinstance(includes, list):
+            return
+        for included in includes:
+            if isinstance(included, str):
+                expand(included, active | {script_id})
+
+    for script_id in script_ids:
+        expand(str(script_id), set())
+    return expanded_ids
+
+
+def count_script_output_rules(manifest: dict[str, Any], script_ids: Iterable[str]) -> int:
+    scripts = manifest.get("scripts") if isinstance(manifest, dict) else None
+    if not isinstance(scripts, dict):
+        raise ValueError(f"脚本产物清单格式无效: {MANIFEST_PATH}")
+    return sum(
+        len(entry.get("outputs", []))
+        for script_id in expand_script_output_ids(manifest, script_ids)
+        if isinstance((entry := scripts.get(script_id)), dict)
+        and isinstance(entry.get("outputs", []), list)
+    )
+
+
 def _base_paths(cfg: PipelineConfig) -> dict[str, Path]:
     return {
         "root": cfg.root_dir.resolve(),
@@ -98,25 +140,7 @@ def collect_script_cleanup_targets(
     bases = _base_paths(cfg)
     targets: list[CleanupTarget] = []
     notes: list[str] = []
-    expanded_ids: list[str] = []
-
-    def expand(script_id: str, active: set[str]) -> None:
-        if script_id in active:
-            raise ValueError(f"脚本产物清单 includes 存在循环: {script_id}")
-        entry = scripts.get(script_id)
-        if not isinstance(entry, dict):
-            raise KeyError(f"清单中不存在脚本 {script_id}")
-        if script_id not in expanded_ids:
-            expanded_ids.append(script_id)
-        includes = entry.get("includes")
-        if not isinstance(includes, list):
-            return
-        for included in includes:
-            if isinstance(included, str):
-                expand(included, active | {script_id})
-
-    for script_id in script_ids:
-        expand(str(script_id), set())
+    expanded_ids = expand_script_output_ids(manifest, script_ids)
 
     for script_id in expanded_ids:
         entry = scripts.get(script_id)
