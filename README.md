@@ -2,21 +2,69 @@
 
 Unity 游戏资源汉化工具链。主要流程是：导出资源到 `workspace/input`，扫描并翻译文本，生成待导入的文本/字体/图片替换文件，最后重新导入并输出到 `workspace/FinalResult`。
 
-## 首次使用快速配置
+## 首次安装环境
 
-在新电脑或新游戏项目上，先运行：
+本项目包含 Python 流程脚本和 C# Unity 资源处理程序，新电脑需要同时准备 Python 与 .NET SDK。
+
+### 1. Python 3.9 或更高版本
+
+Python 负责快速配置、菜单、翻译、图片处理和整个流程的调度。先确认版本：
 
 ```powershell
-python .\快速配置.py --from-template
+python --version
 ```
 
-脚本以 `config.json.记得备份` 为通用模板，设置 adbuybox 根目录和当前 Python，并询问 Unity 与可选翻译方式。资源、Managed、Addressables catalog 和 IL2CPP stringliteral 使用固定的项目相对路径，不会扫描或选择资源目录。仓库自带的 `templates/fzkt.ttf` 会直接使用，无需配置。写入前会显示检查结果；已有 `config.json` 会按时间生成备份。
+推荐在仓库目录创建虚拟环境并安装 [requirements.txt](requirements.txt) 中的依赖：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
+```
+
+也可以使用已有的虚拟环境。之后在快速配置中把该环境目录或其中的 `python.exe` 填入 `python_executable`；留空则统一启动器继续使用启动它的当前 Python。
+
+### 2. .NET 8 SDK
+
+一键导出、一键导入和资源验证实际会通过 `dotnet run` 编译并启动 `AssetPipeline_CLI/UnityResourceCLI`。该工程目标框架是 `net8.0`，因此需要安装 .NET 8 SDK，或者能够构建 `net8.0` 的更高版本 SDK；只有 .NET Runtime 不够。安装后检查：
+
+```powershell
+dotnet --version
+```
+
+第一次运行时，`dotnet` 还可能需要还原 NuGet 依赖。公司电脑可通过公司软件中心或内部安装源安装；普通电脑可使用 Microsoft 提供的 .NET SDK 安装包。
+
+### 3. Unity Editor（按资源类型需要）
+
+只有脚本 0 检测到 TMP/SDF FontAsset、并在步骤 8 生成 TMP/SDF 字体时才需要完整 Unity Editor。纯文本、图片、TTF 或仅 NGUI 位图字体流程不依赖 Unity 字体生成；`unity_exe=auto` 时工具会按辅助工程版本自动查找已安装的 Unity。
+
+## 首次使用快速配置
+
+仓库提供的公开配置模板是：
+
+```text
+config（删除括弧后缀后运行快速配置）.json
+```
+
+首次使用时先手动重命名为 `config.json`，再运行快速配置：
+
+```powershell
+Rename-Item '.\config（删除括弧后缀后运行快速配置）.json' 'config.json'
+python .\快速配置.py
+```
+
+快速配置会设置 adbuybox 根目录和可选的虚拟 Python 环境，并询问 Unity 与可选翻译方式。资源、Managed、Addressables catalog 和 IL2CPP stringliteral 使用固定的项目相对路径，不会扫描或选择资源目录。仓库自带的 `templates/fzkt.ttf` 会直接使用，无需配置。写入前会显示检查结果；已有 `config.json` 会按时间生成备份。
 
 快速配置不会检查这些固定资源相对路径当前是否存在；具体资源流程运行时再按需检查。
 
-也可通过统一启动器选择 `0. 首次使用快速配置`。该入口固定使用启动器当前的 Python，因此旧 `config.json` 中失效的 `python_executable` 不会阻止配置。`python_executable` 是可选的虚拟 Python 环境配置：快速配置接受环境目录或具体 Python 可执行文件，留空时 `run_with_config_python.py` 使用启动器自身的当前 Python；填写时会检查 Python 版本及 `requirements.txt` 对应依赖。
+也可运行统一启动器并选择 `0. 首次使用快速配置`：
 
-分享工具时请分享不含凭据的 `config.json.记得备份`，不要直接分享个人 `config.json`。可用以下命令检查当前配置：
+```powershell
+python .\run_with_config_python.py
+```
+
+快速配置入口固定使用启动器当前的 Python，因此旧 `config.json` 中失效的 `python_executable` 不会阻止配置。`python_executable` 是可选的虚拟 Python 环境配置：快速配置接受环境目录或具体 Python 可执行文件，留空时 `run_with_config_python.py` 使用启动器自身的当前 Python；填写时会检查 Python 版本及 `requirements.txt` 对应依赖。
+
+可用以下命令检查当前配置：
 
 ```powershell
 python .\快速配置.py --check
@@ -85,8 +133,8 @@ project_root_dir/[project_name/]game-name/bak/64/DummyDll
   - 脚本 9 是否跳过 I2 运行时文本正在使用的 TMP FontAsset/Atlas，默认 `true`。
   - 用于排查或规避 I2 文本因字体替换引起的运行时刷新、卡顿或材质状态问题。
 - `enable_text_effect_material_cleanup`
-  - 是否允许脚本 5 写出普通 TMP Material 覆盖层，默认 `true`。
-  - 脚本 8/9 生成的 TMP FontAsset 会保留原字体的 Material 引用，不会覆盖这些材质字段，因此脚本 5 可以先清理普通 SDF 材质的阴影/描边参数。
+  - 为兼容旧配置保留；当前主流程不再读取这个开关。
+  - 脚本 5 只处理同 GameObject 上额外挂载的 Shadow/Outline 组件；TMP/SDF Material 的阴影、描边和发光参数由脚本 9 在字体导入覆盖层中统一处理。
 - `ttf_template_path`
   - 替换字体模板 TTF。模板不支持的译文字符会在脚本 7 中提示并停止。
 
@@ -158,11 +206,13 @@ project_root_dir/[project_name/]game-name/bak/64/DummyDll
 
 ## 常规使用顺序
 
+下面优先使用统一启动器调用各脚本，这样 `config.json` 中配置的 `python_executable` 才会生效。若直接执行 `python .\main.py` 等命令，则使用当前终端的 Python。
+
 ### 1. 一键导出资源
 
 ```powershell
-cd D:\user\von\NewTools\Translate\Translate
-python .\resource_menu.py
+Set-Location 'D:\path\to\Translate'
+python .\run_with_config_python.py resource_menu.py
 ```
 
 选择：
@@ -173,7 +223,7 @@ python .\resource_menu.py
 
 它会：
 
-- 检测 `.splitN` 分卷，确认后可自动合并。
+- 检测 `.splitN` 分卷并在暂存区自动合并，不修改游戏原目录。
 - 导出资源到 `workspace/input`。
 - 生成 `workspace/records/file_id_map.json`。
 - `workspace` 非空时默认保留并增量导出；只有输入 `c` 才会清空并从零开始。
@@ -181,19 +231,19 @@ python .\resource_menu.py
 ### 2. 扫描、判断字段、翻译、生成待替换文件
 
 ```powershell
-python .\main.py
+python .\run_with_config_python.py main.py
 ```
 
 推荐顺序：
 
 ```text
-0 -> 1 -> 2 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
+0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 ```
 
 如果 `enable_ai_field_review=false`，跳过脚本 1：
 
 ```text
-0 -> 2 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
+0 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 ```
 
 如果想一口气执行：
@@ -207,11 +257,12 @@ a. 全部执行
 ### 3. 手动处理图片或工具修补
 
 ```powershell
-python .\工具脚本.py
+python .\run_with_config_python.py 工具脚本.py
 ```
 
 常用：
 
+- 验证修改后重打资源与原始资源：主菜单 0
 - 图片导出整理：主菜单 1
 - 按 Sprite / NGUI UIAtlas 数据拆分 Texture2D 图集：主菜单 2
 - AI 翻译批次补跑：主菜单 3
@@ -228,7 +279,7 @@ python .\工具脚本.py
 ### 4. 一键导入
 
 ```powershell
-python .\resource_menu.py
+python .\run_with_config_python.py resource_menu.py
 ```
 
 选择：
@@ -252,17 +303,20 @@ python .\resource_menu.py
 - `5`: Object 屏蔽，读取 `workspace/output/Object/ToImport`
 - `a`: 全部
 
-导入不会覆盖原始资源，结果输出到：
+UnityResourceCLI 不会用重打后的 Bundle/Data 直接覆盖原始资源，结果输出到：
 
 ```text
 workspace/FinalResult
 ```
 
-Bundle 文件会放到：
+Addressables Bundle 和 `bin/Data` 资源会分别放到：
 
 ```text
 workspace/FinalResult/Bundle/Android
+workspace/FinalResult/Data
 ```
+
+例外是 Addressables catalog：如果导出阶段已把远程 InternalId 本地化，导入收尾可能同步更新游戏源目录中的 catalog/hash，并用橙色 `[源文件已修改]` 明确提示。
 
 如果检测到 Addressables catalog，导入收尾阶段会复用导出前生成的
 `workspace/output/catalog/Output.json`，按最终 Bundle 修正后回打生成最终 catalog 到：
@@ -390,16 +444,15 @@ Unity Localization 要特别注意：
 TextAsset 内嵌 CSV/TSV 会根据 `records.json` 中保留的结构化定位信息，只回写已选中的源语言单元格；
 Key、注释和其它语言列保持不变。字体和材质无法从这类静态表定位时会跳过，后续 TMP 字体仍通过译文字符集合统一生成。
 
-### 5. 清理译文字体材质的阴影/描边
+### 5. 清理译文/I2 文本额外挂载的阴影/描边组件
 
-脚本 5 有两条处理流程：
+脚本 5 根据 `records.json`、`material_map.json` 和译文使用关系定位文本所在的 GameObject，只处理额外挂载的 Shadow/Outline MonoBehaviour：
 
-- 清理普通 TMP/SDF 字体材质里的阴影、描边、发光参数。
-- 清理译文所在 GameObject 上额外挂载的 Shadow/Outline MonoBehaviour。
+- 普通译文会处理同 GameObject 上的 Shadow/Outline 组件。
+- 有 I2 语言表时，会精确定位相关 I2 GameObject 并处理同物体组件。
+- 不重写 Text/TMP/SDF 字体组件，也不在步骤 5 写出普通 Material 覆盖层。
 
-脚本 8/9 生成的 TMP FontAsset 会保留原字体的 Material 引用，因此脚本 5 写出的普通 Material 覆盖层不会被 SDF 字体替换覆盖。
-
-I2 运行时绑定文本不在主流程中直接改共享材质。脚本 5 会自动排除 I2 绑定到的 TMP 材质，I2 TMP 字体与实际使用材质由主流程脚本 9 统一处理。
+TMP/SDF Material 的阴影、描边和发光参数已合并到步骤 9 的 SDF 导入覆盖层中统一处理；I2 TMP 字体和实际使用材质也由步骤 9 处理。
 
 ### 6. 生成 TTF 替换字体
 
@@ -475,7 +528,7 @@ workspace/output/Font/NGUI/ToImport
 按顺序执行：
 
 ```text
-0 -> 1(仅 AI 字段判断开启时) -> 2 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
+0 -> 1(仅 AI 字段判断开启时) -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
 ```
 
 `a` 直接按顺序调用脚本 0 至 9 的同一执行入口，每一步使用独立子进程；步骤之间不会保留扫描、翻译产生的大量内存和线程状态。若检测到 Unity 在进入字体生成代码前发生原生启动崩溃，会安全清理失效的 `UnityLockfile` 并自动重试一次；失败时停止，不执行后续步骤。
@@ -548,6 +601,8 @@ workspace/FinalResult/Data
 
 ## 工具脚本.py 菜单说明
 
+- `0. 验证修改后重打资源与原始资源`
+  - 对照 `workspace/FinalResult`、统一资源暂存区和导出路径映射，验证重打资源能够重新导出，并检查资源类型、对象数量及 split 分卷边界等一致性。
 - `1. 一键复制导出图片到 workspace/AllPNG`
   - 把导出的 PNG 平铺整理，方便批量编辑；同时创建并保留 `修改后的图片目录` 和 `屏蔽object` 两个用户工作目录。
 - `2. 按 Sprite / NGUI UIAtlas 数据拆分 Texture2D 图集`
@@ -612,6 +667,7 @@ workspace/FinalResult/Data
 - 主菜单 5 可直接使用主菜单 2 输出到 `workspace/AllPNG/Sprite/PNG` 的拆分图集子图；输入子图文件名或完整路径，或将多张普通图片/子图复制到 `workspace/AllPNG/屏蔽object` 后批量处理。匹配时使用 `_allsprite_map.json` 中的 Sprite PathID，不再把整张 Texture2D 图集当作查询目标。
 - 普通 `_allpng_map.json` 与拆分图集映射彼此独立：即使普通图片映射不存在，只要主菜单 2 已生成 `_allsprite_map.json`，主菜单 5 仍可查询拆分子图。若只有 `Sprite/PNG` 而映射缺失，工具会提示重新执行主菜单 2，避免仅凭同名图片误匹配对象。
 - 在预览图片上右键命中使用了 Sprite/Texture2D 的层级时，菜单会提供“查询 Sprite / Texture2D 资源名字”，显示对应资源名、PathID、来源资源和 Bundle entry；没有图片资源的纯层级不会显示该项。
+- 在左侧层级树或预览图片上右键选择“仅显示此层级”时，会保留所选层级分支，同时隐藏其它同级分支以及这些分支全部下级层级的图片；恢复或重新选择显示范围后会重新合成预览。
 - Sprite 位于 `sharedassets*.assets`、UI 组件位于 `level*` 等其他资源文件时，会使用 `workspace/records/file_id_map.json` 解析非零 FileID，跨文件反查静态组件；层级预览也会从目标资源 scope 加载对应 Sprite/SpriteAtlas。对象查询缓存格式升级时会自动清除旧的空结果。
 - 输入 `p`，直接从当前父链的最高层开始预览。
 - 要选择起始层级，就在 `p` 后加层级数字；例如输入 `p3` 从层级 3 开始预览。
@@ -660,7 +716,7 @@ Unity Localization 里有两类资源最容易混：
 
 ### SerializeReference not supported in JSON import yet.
 
-当前导入工具暂不支持直接改 SerializeReference 内部字段。遇到时会提示并收集样本。一般 Unity Localization Settings、Locale 这类 Unity 自己的配置资产也不应该汉化。
+当前导入工具暂不支持直接改 SerializeReference 内部字段。遇到修改时会提示，并保留原资源内部数据，避免破坏引用结构；只有 `enable_sample_collection=true` 时才会额外收集诊断样本。一般 Unity Localization Settings、Locale 以及运行时 ID 之类的配置内容也不应该汉化。
 
 ## 目录结构
 

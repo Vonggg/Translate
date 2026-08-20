@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = ROOT_DIR / "config.json"
-DEFAULT_TEMPLATE_PATH = ROOT_DIR / "config.json.记得备份"
+RENAMED_CONFIG_SOURCE = ROOT_DIR / "config（删除括弧后缀后运行快速配置）.json"
 CODEX_TRANSLATION_MODEL = "gpt-5.3-codex-spark"
 CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 MINIMUM_PYTHON_VERSION = (3, 9)
@@ -64,6 +64,11 @@ class ConfigCheck:
 
 def _read_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
+        if path.resolve() == DEFAULT_CONFIG_PATH.resolve():
+            raise FileNotFoundError(
+                f"配置文件不存在: {path}\n"
+                f"首次使用前请先手动将 {RENAMED_CONFIG_SOURCE.name} 重命名为 config.json"
+            )
         raise FileNotFoundError(f"配置文件不存在: {path}")
     value = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(value, dict):
@@ -447,8 +452,17 @@ def _write_json_lf(path: Path, value: dict[str, Any]) -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Translate 项目首次使用快速配置")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="要生成或检查的 config.json")
-    parser.add_argument("--template", type=Path, default=DEFAULT_TEMPLATE_PATH, help="通用配置模板")
-    parser.add_argument("--from-template", action="store_true", help="忽略现有 config.json，从通用模板重新配置")
+    parser.add_argument(
+        "--template",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help="可选的基础配置文件；默认直接使用 config.json",
+    )
+    parser.add_argument(
+        "--from-template",
+        action="store_true",
+        help="从 --template 指定的基础配置重新配置；未指定时仍直接使用 config.json",
+    )
     parser.add_argument(
         "--project-dir",
         type=Path,

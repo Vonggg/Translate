@@ -25,6 +25,20 @@ QUICK = _load_quick_config()
 
 
 class QuickConfigTests(unittest.TestCase):
+    def test_default_template_points_directly_to_config_json(self) -> None:
+        with patch.object(sys, "argv", ["快速配置.py"]):
+            args = QUICK._parse_args()
+
+        self.assertEqual(args.config.resolve(), QUICK.DEFAULT_CONFIG_PATH.resolve())
+        self.assertEqual(args.template.resolve(), QUICK.DEFAULT_CONFIG_PATH.resolve())
+
+    def test_missing_default_config_explains_manual_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "config.json"
+            with patch.object(QUICK, "DEFAULT_CONFIG_PATH", missing):
+                with self.assertRaisesRegex(FileNotFoundError, "重命名为 config.json"):
+                    QUICK._read_json(missing)
+
     def test_choose_default_python_preserves_valid_configured_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             configured = Path(temporary) / "configured-python.exe"
