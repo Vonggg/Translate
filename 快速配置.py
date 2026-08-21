@@ -312,7 +312,9 @@ def _prompt_python_environment() -> str:
 def _prompt_translation(config: dict[str, Any]) -> None:
     print("\n请选择 AI 自动翻译方式；也可以跳过并稍后修改 config.json。")
     print(f"  0. 跳过，保留当前设置（当前 AI 翻译={'开启' if config.get('enable_ai_translation') else '关闭'}）")
-    print(f"  1. Codex CLI / {CODEX_TRANSLATION_MODEL}（使用 Codex 额度，无需 API Key）")
+    print(
+        f"  1. Codex CLI / {CODEX_TRANSLATION_MODEL}（使用 Codex 额度；失败时回退已配置的 HTTP AI）"
+    )
     print("  2. 自定义 OpenAI-compatible API（配置 Base URL、模型和 API Key）")
     print("  3. 关闭 AI 自动翻译并清空全部翻译密钥")
     choice = input("请选择 [0]: ").strip() or "0"
@@ -334,6 +336,19 @@ def _prompt_translation(config: dict[str, Any]) -> None:
         config["ai_translation_transport"] = "codex_cli"
         config["ai_translation_codex_model"] = CODEX_TRANSLATION_MODEL
         config["ai_translation_codex_reasoning_effort"] = effort
+        http_fallback_ready = all(
+            str(config.get(field, "") or "").strip()
+            for field in (
+                "ai_translation_base_url",
+                "ai_translation_model",
+                "ai_translation_api_key",
+            )
+        )
+        print(
+            "HTTP AI 回退已启用。"
+            if http_fallback_ready
+            else "HTTP AI 回退尚未完整配置；可先选择 2 配置接口，再重新选择 1 作为主通道。"
+        )
         return
     if choice == "2":
         old_base_url = str(config.get("ai_translation_base_url", "") or "").strip()

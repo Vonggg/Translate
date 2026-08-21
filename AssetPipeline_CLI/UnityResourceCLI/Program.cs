@@ -14,6 +14,9 @@ namespace UnityResourceCLI
                     return 0;
                 }
 
+                if (string.Equals(args[0], "encode-texture-worker", StringComparison.OrdinalIgnoreCase))
+                    return NativeTextureWorker.Run(args[1..]);
+
                 CliOptions options = CliOptions.Parse(args);
                 if (options.ShowHelp)
                 {

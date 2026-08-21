@@ -15,10 +15,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Compile Include="..\UABEA\UABEAvalonia\Logic\FileTypeDetector.cs" Link="UABEAvalonia\Logic\FileTypeDetector.cs" />
+    <None Update="ThirdParty\UABEA\classdata.tpk" Link="classdata.tpk" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
-  <ItemGroup>
-    <None Include="..\UABEA\ReleaseFiles\classdata.tpk" Link="classdata.tpk" CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
+  <Target Name="BuildNativeTextureEncoder" AfterTargets="Build" Condition="'$(OS)' == 'Windows_NT'">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\scripts\build_texture_encoder.ps1&quot; -Configuration &quot;$(Configuration)&quot; -OutputDirectory &quot;$(TargetDir).&quot;" />
+  </Target>
 </Project>

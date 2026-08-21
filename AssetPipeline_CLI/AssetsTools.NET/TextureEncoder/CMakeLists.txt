@@ -1,6 +1,15 @@
 ﻿add_library (TextureEncoder SHARED "TextureEncoder.cpp" "TextureEncoder.h" "TextureFormat.h")
 set_target_properties(TextureEncoder PROPERTIES OUTPUT_NAME "textureencoder")
 
+if (WIN32 AND NOT PVRTL_ENABLED)
+    # Cuttlefish's Windows binary imports a small PVRTexLib surface even when
+    # ETC2/ASTC encoding is used. Build the repository's no-op compatibility
+    # stub instead of distributing the separately licensed runtime.
+    add_library(PVRTexLibStub SHARED "pvrtlstub.c")
+    set_target_properties(PVRTexLibStub PROPERTIES OUTPUT_NAME "PVRTexLib")
+    add_dependencies(TextureEncoder PVRTexLibStub)
+endif()
+
 if (CMAKE_VERSION VERSION_GREATER 3.12)
     set_property(TARGET TextureEncoder PROPERTY CXX_STANDARD 20)
 endif()

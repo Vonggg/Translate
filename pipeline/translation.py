@@ -2077,8 +2077,33 @@ def _translate_google(text: str, cfg: PipelineConfig) -> str:
     return html.unescape(matches[0]) if matches else ""
 
 
-def _translate_ai(text: str, cfg: PipelineConfig) -> str:
+def _ai_http_translation_configured(cfg: PipelineConfig) -> bool:
+    return bool(
+        cfg.ai_translation_base_url.strip()
+        and cfg.ai_translation_api_key.strip()
+        and cfg.ai_translation_model.strip()
+    )
+
+
+def _ai_translation_transport_chain(cfg: PipelineConfig) -> list[str]:
     transport = str(getattr(cfg, "ai_translation_transport", "http") or "http").strip().lower()
+    if transport == "http":
+        return ["http"] if _ai_http_translation_configured(cfg) else []
+    if transport != "codex_cli":
+        raise RuntimeError(f"不支持的 AI translation transport: {transport}")
+
+    chain: list[str] = []
+    codex_model = str(
+        getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark")
+    ).strip()
+    if codex_model and codex_cli_available():
+        chain.append("codex_cli")
+    if _ai_http_translation_configured(cfg):
+        chain.append("http")
+    return chain
+
+
+def _translate_ai_once(text: str, cfg: PipelineConfig, transport: str) -> str:
     base_url = cfg.ai_translation_base_url.strip().rstrip("/")
     api_key = cfg.ai_translation_api_key.strip()
     model = (
@@ -2108,8 +2133,6 @@ def _translate_ai(text: str, cfg: PipelineConfig) -> str:
             working_directory=cfg.root_dir,
         )
         return str(result.get("translation", "")).strip()
-    if transport != "http":
-        raise RuntimeError(f"不支持的 AI translation transport: {transport}")
     if not (base_url and api_key and model):
         raise RuntimeError("AI translation is enabled but base_url/api_key/model is not configured.")
 
@@ -2152,21 +2175,52 @@ def _translate_ai(text: str, cfg: PipelineConfig) -> str:
     return str(content).strip()
 
 
+def _translate_ai(text: str, cfg: PipelineConfig) -> str:
+    transports = _ai_translation_transport_chain(cfg)
+    if not transports:
+        raise RuntimeError("AI translation is enabled but Codex CLI and HTTP AI are not available/configured.")
+
+    failures: list[str] = []
+    max_attempts = AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS + 1
+    for transport in transports:
+        display_name = "Codex CLI" if transport == "codex_cli" else "HTTP AI"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                translated = _translate_ai_once(text, cfg, transport)
+                if translated:
+                    return translated
+                raise RuntimeError("返回空译文")
+            except Exception as exc:
+                failures.append(f"{display_name}: {exc}")
+                if transport == "codex_cli":
+                    next_step = "切换到 HTTP AI" if "http" in transports else "回落普通翻译"
+                    _log(
+                        f"[翻译][Codex熔断] Codex CLI 请求失败，{next_step}，"
+                        f"不再重试 Codex: {_format_log_text(text)} ({exc})"
+                    )
+                    break
+                if attempt < max_attempts:
+                    _log(
+                        f"[翻译] {display_name} 请求失败，重试 "
+                        f"{attempt}/{AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS}: "
+                        f"{_format_log_text(text)} ({exc})"
+                    )
+                else:
+                    _log(
+                        f"[翻译] {display_name} 首次请求及 "
+                        f"{AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS} 次重试均失败，"
+                        f"回落普通翻译: {exc}"
+                    )
+    raise RuntimeError("；".join(failures))
+
+
 def _ai_translation_request_configured(cfg: PipelineConfig) -> bool:
-    transport = str(getattr(cfg, "ai_translation_transport", "http") or "http").strip().lower()
-    if transport == "codex_cli":
-        return bool(
-            cfg.enable_ai_translation
-            and str(getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark")).strip()
-            and codex_cli_available()
-        )
-    return bool(
-        cfg.enable_ai_translation
-        and transport == "http"
-        and cfg.ai_translation_base_url.strip()
-        and cfg.ai_translation_api_key.strip()
-        and cfg.ai_translation_model.strip()
-    )
+    if not cfg.enable_ai_translation:
+        return False
+    try:
+        return bool(_ai_translation_transport_chain(cfg))
+    except RuntimeError:
+        return False
 
 
 def _translate_ai_batch(
@@ -2176,21 +2230,33 @@ def _translate_ai_batch(
     batch_index: int,
     batch_count: int,
     artifact_prefix: str = "ai_translation",
+    codex_circuit: dict[str, Any] | None = None,
 ) -> dict[int, str]:
-    transport = str(getattr(cfg, "ai_translation_transport", "http") or "http").strip().lower()
+    configured_transport = str(
+        getattr(cfg, "ai_translation_transport", "http") or "http"
+    ).strip().lower()
+    transports = _ai_translation_transport_chain(cfg)
+    if codex_circuit is None:
+        codex_circuit = {}
+    codex_skipped_by_circuit = bool(
+        codex_circuit.get("open") and "codex_cli" in transports
+    )
+    if codex_skipped_by_circuit:
+        transports = [item for item in transports if item != "codex_cli"]
+        _log_dark_green(
+            f"[翻译][Codex熔断] batch={batch_index}/{batch_count} 本次操作此前已发生 "
+            "Codex CLI 错误，直接跳过并进入 HTTP AI。"
+        )
+    if not transports:
+        return {}
     base_url = cfg.ai_translation_base_url.strip().rstrip("/")
     api_key = cfg.ai_translation_api_key.strip()
-    model = (
-        str(getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark")).strip()
-        if transport == "codex_cli"
-        else cfg.ai_translation_model.strip()
-    )
-    if transport == "codex_cli" and not (model and codex_cli_available()):
-        raise RuntimeError("codex_cli 模式需要已安装、已登录的 codex CLI，并配置 model。")
-    if transport == "http" and not (base_url and api_key and model):
-        raise RuntimeError("AI translation is enabled but base_url/api_key/model is not configured.")
-    if transport not in {"http", "codex_cli"}:
-        raise RuntimeError(f"不支持的 AI translation transport: {transport}")
+    models = {
+        "codex_cli": str(
+            getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark")
+        ).strip(),
+        "http": cfg.ai_translation_model.strip(),
+    }
 
     import requests
 
@@ -2209,6 +2275,8 @@ def _translate_ai_batch(
     }
     all_translations: dict[int, str] = {}
     usage_items: list[dict[str, Any]] = []
+    request_saved = False
+    last_model = models[transports[0]]
 
     def archive_raw_response(data: dict[str, Any]) -> Path:
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -2222,7 +2290,15 @@ def _translate_ai_batch(
                 return raw_path
         raise RuntimeError(f"无法为 AI 原始响应分配存档文件名: {response_path.parent}")
 
-    def request_once(request_batch: list[tuple[int, str]], label: str, save_request: bool) -> dict[int, str]:
+    def request_once(
+        request_batch: list[tuple[int, str]],
+        label: str,
+        save_request: bool,
+        request_transport: str,
+    ) -> dict[int, str]:
+        nonlocal request_saved, last_model
+        model = models[request_transport]
+        last_model = model
         user_content = strategy.user_content(request_batch, batch_index, batch_count)
         payload = {
             "model": model,
@@ -2235,11 +2311,12 @@ def _translate_ai_batch(
             ],
         }
         payload.update(strategy.extra_payload())
-        if save_request:
+        if save_request and not request_saved:
             atomic_write_json(request_path, payload)
+            request_saved = True
             _log(f"[翻译] AI 请求内容已写入: {request_path}")
 
-        if transport == "codex_cli":
+        if request_transport == "codex_cli":
             structured, usage = request_structured_output(
                 model=model,
                 reasoning_effort=str(getattr(cfg, "ai_translation_codex_reasoning_effort", "low")),
@@ -2321,13 +2398,17 @@ def _translate_ai_batch(
             if item_id in expected_ids and translated
         }
 
-    initial_result = request_once(batch, "首轮", save_request=True)
-    all_translations.update(initial_result)
-    _log(
-        f"[翻译] AI batch={batch_index}/{batch_count} 首轮返回={len(initial_result)}/{len(batch)}"
-    )
+    if (
+        configured_transport == "codex_cli"
+        and transports[0] == "http"
+        and not codex_skipped_by_circuit
+    ):
+        _log_dark_green(
+            f"[翻译][AI回退] batch={batch_index}/{batch_count} Codex CLI 不可用，"
+            "直接切换到 HTTP AI。"
+        )
 
-    for retry_round in range(1, AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS + 1):
+    for transport_index, request_transport in enumerate(transports):
         missing_items = [
             (item_id, source_text)
             for item_id, source_text in batch
@@ -2335,30 +2416,61 @@ def _translate_ai_batch(
         ]
         if not missing_items:
             break
-        preview = ",".join(str(item_id) for item_id, _text in missing_items[:30])
-        suffix = "..." if len(missing_items) > 30 else ""
-        _log_blue(
-            f"[翻译][缺失重试] batch={batch_index}/{batch_count}，"
-            f"第 {retry_round}/{AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS} 轮仅重发 "
-            f"{len(missing_items)} 个 id: {preview}{suffix}"
-        )
-        try:
-            retry_result = request_once(
-                missing_items,
-                f"缺失重试 {retry_round}/{AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS}",
-                save_request=False,
-            )
-        except Exception as exc:
+        display_name = "Codex CLI" if request_transport == "codex_cli" else "HTTP AI"
+        if transport_index > 0:
             _log_dark_green(
-                f"[翻译][缺失重试] batch={batch_index}/{batch_count} "
-                f"第 {retry_round} 轮失败: {exc}"
+                f"[翻译][AI回退] batch={batch_index}/{batch_count} Codex CLI 仍缺少 "
+                f"{len(missing_items)} 条，切换到 HTTP AI；同样最多重试 "
+                f"{AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS} 次。"
             )
-            continue
-        all_translations.update(retry_result)
-        _log(
-            f"[翻译][缺失重试] 第 {retry_round} 轮补回={len(retry_result)}，"
-            f"当前={len(all_translations)}/{len(batch)}"
-        )
+
+        for retry_round in range(0, AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS + 1):
+            missing_items = [
+                (item_id, source_text)
+                for item_id, source_text in batch
+                if item_id not in all_translations
+            ]
+            if not missing_items:
+                break
+            label = (
+                f"{display_name} 首轮"
+                if retry_round == 0
+                else f"{display_name} 重试 {retry_round}/{AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS}"
+            )
+            if retry_round > 0:
+                preview = ",".join(str(item_id) for item_id, _text in missing_items[:30])
+                suffix = "..." if len(missing_items) > 30 else ""
+                _log_blue(
+                    f"[翻译][AI重试] batch={batch_index}/{batch_count}，{label}，"
+                    f"仅重发 {len(missing_items)} 个 id: {preview}{suffix}"
+                )
+            try:
+                retry_result = request_once(
+                    missing_items,
+                    label,
+                    save_request=not request_saved,
+                    request_transport=request_transport,
+                )
+            except Exception as exc:
+                _log_dark_green(
+                    f"[翻译][AI重试] batch={batch_index}/{batch_count} "
+                    f"{label}失败: {exc}"
+                )
+                if request_transport == "codex_cli":
+                    codex_circuit["open"] = True
+                    codex_circuit["reason"] = str(exc)
+                    _log_dark_green(
+                        f"[翻译][Codex熔断] batch={batch_index}/{batch_count} "
+                        "Codex CLI 进程请求失败；本批立即切换 HTTP AI，"
+                        "本次操作的后续批次将全部跳过 Codex。"
+                    )
+                    break
+                continue
+            all_translations.update(retry_result)
+            _log(
+                f"[翻译][AI重试] {label} 返回={len(retry_result)}，"
+                f"当前={len(all_translations)}/{len(batch)}"
+            )
 
     missing_ids = [item_id for item_id, _text in batch if item_id not in all_translations]
     if missing_ids:
@@ -2387,7 +2499,7 @@ def _translate_ai_batch(
     )
     combined_response = {
         "object": "chat.completion",
-        "model": model,
+        "model": last_model,
         "choices": [
             {
                 "index": 0,
@@ -2629,6 +2741,7 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
             )
             ai_translated_ids: set[int] = set()
             failed_ai_batches: list[int] = []
+            codex_circuit: dict[str, Any] = {}
             for batch_index, batch in active_batches:
                 batch_size = len(strategy.user_content(batch, batch_index, len(batches)))
                 estimated_output = sum(strategy.estimate_output_chars(text) for _index, text in batch)
@@ -2638,7 +2751,14 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
                 )
                 wait_stop, wait_thread = _start_wait_logger(f"[翻译] AI batch={batch_index}/{len(batches)}")
                 try:
-                    batch_result = _translate_ai_batch(batch, cfg, strategy, batch_index, len(batches))
+                    batch_result = _translate_ai_batch(
+                        batch,
+                        cfg,
+                        strategy,
+                        batch_index,
+                        len(batches),
+                        codex_circuit=codex_circuit,
+                    )
                 except Exception as exc:
                     failed_ai_batches.append(batch_index)
                     _log_dark_green(
@@ -3929,6 +4049,7 @@ def _post_ai_field_review_batch(
     prompt: str,
     batch_index: int,
     batch_count: int,
+    transport: str | None = None,
 ) -> list[str]:
     system_prompt = (
         "你是 Unity 游戏汉化字段筛选助手。"
@@ -3944,7 +4065,9 @@ def _post_ai_field_review_batch(
         "返回前逐块自检，避免漏掉玩家可见文本，也不要选择场景名、Tag、输入轴、资源键或回调名。"
         "不要解释。"
     )
-    transport = str(getattr(cfg, "ai_field_review_transport", "http") or "http").strip().lower()
+    transport = transport or str(
+        getattr(cfg, "ai_field_review_transport", "http") or "http"
+    ).strip().lower()
     if transport == "codex_cli":
         result, _usage = request_structured_output(
             model=model,
@@ -4008,27 +4131,49 @@ def _post_ai_field_review_batch(
     return _parse_ai_field_response(str(content))
 
 
+def _ai_field_http_configured(cfg: PipelineConfig) -> bool:
+    return bool(
+        cfg.ai_field_review_base_url.strip()
+        and cfg.ai_field_review_api_key.strip()
+        and cfg.ai_field_review_model.strip()
+    )
+
+
+def _ai_field_transport_chain(cfg: PipelineConfig) -> list[str]:
+    transport = str(
+        getattr(cfg, "ai_field_review_transport", "http") or "http"
+    ).strip().lower()
+    if transport == "http":
+        return ["http"] if _ai_field_http_configured(cfg) else []
+    if transport != "codex_cli":
+        return []
+
+    chain: list[str] = []
+    codex_model = str(
+        getattr(cfg, "ai_field_review_codex_model", "gpt-5.3-codex-spark")
+    ).strip()
+    if codex_model and codex_cli_available():
+        chain.append("codex_cli")
+    if _ai_field_http_configured(cfg):
+        chain.append("http")
+    return chain
+
+
 def _request_ai_field_selection(cfg: PipelineConfig, candidates_path: Path) -> list[str]:
-    transport = str(getattr(cfg, "ai_field_review_transport", "http") or "http").strip().lower()
+    configured_transport = str(
+        getattr(cfg, "ai_field_review_transport", "http") or "http"
+    ).strip().lower()
     base_url = cfg.ai_field_review_base_url.strip().rstrip("/")
     api_key = cfg.ai_field_review_api_key.strip()
-    model = (
-        str(getattr(cfg, "ai_field_review_codex_model", "gpt-5.3-codex-spark")).strip()
-        if transport == "codex_cli"
-        else cfg.ai_field_review_model.strip()
-    )
-    if transport == "codex_cli":
-        if not model or not codex_cli_available():
-            return _manual_ai_field_selection(
-                cfg,
-                candidates_path,
-                "codex_cli 模式需要已安装、已登录的 codex CLI，并配置 model；将使用人工判断。",
-            )
-    elif transport == "http":
-        if not (base_url and api_key and model):
-            return _manual_ai_field_selection(cfg, candidates_path, "未配置 AI 接口 base_url/api_key/model，将使用人工判断。")
-    else:
+    transports = _ai_field_transport_chain(cfg)
+    if not transports:
         return _manual_ai_field_selection(cfg, candidates_path, "未配置 AI 接口 base_url/api_key/model，将使用人工判断。")
+    models = {
+        "codex_cli": str(
+            getattr(cfg, "ai_field_review_codex_model", "gpt-5.3-codex-spark")
+        ).strip(),
+        "http": cfg.ai_field_review_model.strip(),
+    }
     if not candidates_path.is_file():
         raise FileNotFoundError(f"字段候选文件不存在: {candidates_path}")
 
@@ -4039,11 +4184,12 @@ def _request_ai_field_selection(cfg: PipelineConfig, candidates_path: Path) -> l
         if line.strip().startswith("field:")
     ]
     print(
-        f"[AI字段] 自动请求 AI 字段判断: transport={transport}, model={model}, "
-        f"base_url={base_url if transport == 'http' else '(Codex CLI)'}, "
+        f"[AI字段] 自动请求 AI 字段判断: chain={' -> '.join(transports)}, "
         f"候选字段={len(candidate_lines)}, 文件大小={candidates_path.stat().st_size} bytes",
         flush=True,
     )
+    if configured_transport == "codex_cli" and transports[0] == "http":
+        _log_dark_green("[AI字段][AI回退] Codex CLI 不可用，直接切换到 HTTP AI。")
     batches = _split_ai_field_review_batches(prompt)
     if len(batches) > 1:
         print(
@@ -4053,25 +4199,74 @@ def _request_ai_field_selection(cfg: PipelineConfig, candidates_path: Path) -> l
         )
     try:
         fields: list[str] = []
+        codex_circuit_open = False
         for index, batch_prompt in enumerate(batches, start=1):
             batch_size = len(batch_prompt.encode("utf-8"))
             batch_field_count = sum(
                 1 for line in batch_prompt.splitlines()
                 if line.strip().startswith("field:")
             )
-            _log(
-                f"[AI字段] 开始发送 batch={index}/{len(batches)}，"
-                f"字段={batch_field_count}，大小={batch_size} bytes"
-            )
-            batch_fields = _post_ai_field_review_batch(
-                cfg,
-                base_url,
-                api_key,
-                model,
-                batch_prompt,
-                index,
-                len(batches),
-            )
+            batch_fields: list[str] | None = None
+            failures: list[Exception] = []
+            batch_transports = transports
+            if codex_circuit_open and "codex_cli" in batch_transports:
+                batch_transports = [
+                    item for item in batch_transports if item != "codex_cli"
+                ]
+                _log_dark_green(
+                    f"[AI字段][Codex熔断] batch={index}/{len(batches)} "
+                    "本次操作此前已发生 Codex CLI 错误，直接跳过并进入 HTTP AI。"
+                )
+            for transport_index, request_transport in enumerate(batch_transports):
+                display_name = "Codex CLI" if request_transport == "codex_cli" else "HTTP AI"
+                if transport_index > 0:
+                    _log_dark_green(
+                        f"[AI字段][AI回退] batch={index}/{len(batches)} Codex CLI 失败，"
+                        f"切换到 HTTP AI；同样最多重试 {AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS} 次。"
+                    )
+                for retry_round in range(0, AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS + 1):
+                    label = (
+                        "首次请求"
+                        if retry_round == 0
+                        else f"重试 {retry_round}/{AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS}"
+                    )
+                    _log(
+                        f"[AI字段] {display_name} {label}: batch={index}/{len(batches)}，"
+                        f"字段={batch_field_count}，大小={batch_size} bytes"
+                    )
+                    try:
+                        returned_fields = _post_ai_field_review_batch(
+                            cfg,
+                            base_url,
+                            api_key,
+                            models[request_transport],
+                            batch_prompt,
+                            index,
+                            len(batches),
+                            transport=request_transport,
+                        )
+                        if not returned_fields:
+                            raise RuntimeError("AI 字段判断返回为空")
+                        batch_fields = returned_fields
+                        break
+                    except Exception as exc:
+                        failures.append(exc)
+                        _log_dark_green(
+                            f"[AI字段][AI重试] {display_name} {label}失败: {exc}"
+                        )
+                        if request_transport == "codex_cli":
+                            codex_circuit_open = True
+                            _log_dark_green(
+                                f"[AI字段][Codex熔断] batch={index}/{len(batches)} "
+                                "Codex CLI 进程请求失败；本批立即切换 HTTP AI，"
+                                "本次操作的后续批次将全部跳过 Codex。"
+                            )
+                            break
+                if batch_fields is not None:
+                    break
+            if batch_fields is None:
+                detail = failures[-1] if failures else RuntimeError("没有可用 AI 字段判断通道")
+                raise detail
             _log(
                 f"[AI字段] AI batch={index}/{len(batches)} 返回字段数: {len(batch_fields)}，"
                 f"发送大小={batch_size} bytes"

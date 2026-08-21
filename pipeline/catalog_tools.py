@@ -46,6 +46,10 @@ def _log_orange(message: str) -> None:
     print(f"\033[38;5;208m{message}\033[0m", flush=True)
 
 
+def _log_red(message: str) -> None:
+    print(f"\033[91m{message}\033[0m", flush=True)
+
+
 def printable_ascii_runs(data: bytes, min_len: int = 4) -> list[tuple[int, str]]:
     rows: list[tuple[int, str]] = []
     for match in re.finditer(rb"[\x20-\x7e]{%d,}" % min_len, data):
@@ -776,9 +780,12 @@ def validate_catalog_crc_algorithm(
         })
 
     if failures:
-        print(f"[catalog][停止] CRC 算法自校验未通过: checked={checked}, passed={passed}, failures={len(failures)}")
+        _log_red(
+            "[catalog][停止] CRC 算法自校验未通过: "
+            f"checked={checked}, passed={passed}, failures={len(failures)}"
+        )
         for failure in failures[:10]:
-            print(f"[catalog][停止] {failure}")
+            _log_red(f"[catalog][停止] {failure}")
         if cfg.enable_sample_collection:
             save_catalog_crc_sample(
                 cfg,
@@ -868,6 +875,7 @@ def patch_expanded_catalog_from_final_bundles(
     update_size: bool = True,
     update_crc: bool = True,
     zero_crc: bool = False,
+    reference_catalog_path: Path | None = None,
 ) -> tuple[int, int, Path]:
     source = output_json_path.resolve()
     if not source.is_file():
@@ -883,15 +891,66 @@ def patch_expanded_catalog_from_final_bundles(
     if not isinstance(options, list):
         raise RuntimeError("m_ExtraDataString 中没有 AssetBundleRequestOptions")
 
+    reference_options = options
+    if reference_catalog_path is not None:
+        reference_source = reference_catalog_path.resolve()
+        if reference_source != source:
+            if not reference_source.is_file():
+                raise FileNotFoundError(f"catalog 匹配基准不存在: {reference_source}")
+            reference_catalog = json.loads(reference_source.read_text(encoding="utf-8-sig"))
+            reference_extra = (
+                reference_catalog.get("m_ExtraDataString")
+                if isinstance(reference_catalog, dict)
+                else None
+            )
+            loaded_reference_options = (
+                reference_extra.get("AssetBundleRequestOptions")
+                if isinstance(reference_extra, dict)
+                else None
+            )
+            if not isinstance(loaded_reference_options, list):
+                raise RuntimeError(
+                    f"catalog 匹配基准中没有 AssetBundleRequestOptions: {reference_source}"
+                )
+            if len(loaded_reference_options) != len(options):
+                raise RuntimeError(
+                    "catalog 匹配基准与当前 Output.json 的 Bundle 条目数量不同: "
+                    f"reference={len(loaded_reference_options)}, current={len(options)}"
+                )
+            # The binary offsets and mutable metadata may differ between views,
+            # but these identity fields must remain in the same order.  Pairing
+            # by index preserves localized InternalIds in the current catalog.
+            for index, (reference_row, current_row) in enumerate(
+                zip(loaded_reference_options, options)
+            ):
+                if not isinstance(reference_row, dict) or not isinstance(current_row, dict):
+                    raise RuntimeError(f"catalog Bundle 条目不是对象: index={index}")
+                for field in ("m_Hash", "PrimaryKey", "m_BundleName"):
+                    reference_value = reference_row.get(field)
+                    current_value = current_row.get(field)
+                    if (
+                        isinstance(reference_value, str)
+                        and reference_value
+                        and isinstance(current_value, str)
+                        and current_value
+                        and reference_value != current_value
+                    ):
+                        raise RuntimeError(
+                            "catalog 匹配基准与当前 Output.json 条目顺序不一致: "
+                            f"index={index}, field={field}, "
+                            f"reference={reference_value!r}, current={current_value!r}"
+                        )
+            reference_options = loaded_reference_options
+
     bundle_files = collect_final_bundle_files(bundle_root)
     option_by_crc_size: dict[tuple[int, int], list[dict]] = {}
-    for row in options:
-        if not isinstance(row, dict):
+    for index, reference_row in enumerate(reference_options):
+        if not isinstance(reference_row, dict):
             continue
-        row_crc = row.get("m_Crc")
-        row_size = row.get("m_BundleSize")
+        row_crc = reference_row.get("m_Crc")
+        row_size = reference_row.get("m_BundleSize")
         if isinstance(row_crc, int) and isinstance(row_size, int):
-            option_by_crc_size.setdefault((row_crc, row_size), []).append(row)
+            option_by_crc_size.setdefault((row_crc, row_size), []).append(options[index])
 
     crc_map = dict(crc_by_bundle_name or {})
     if update_crc:
@@ -1012,9 +1071,25 @@ def auto_patch_and_repack_catalog_after_import(
         print(f"[catalog][提示] 未找到导出前的 Output.json，兜底解析: {cfg.catalog_source_path}")
         _formatted_path, expanded_path = parse_catalog_to_output(cfg, cfg.catalog_source_path, output_dir)
 
+    baseline_path = expanded_path.with_suffix(
+        expanded_path.suffix + ".bak_before_catalog_auto_patch"
+    )
+    matching_catalog_path = baseline_path if baseline_path.is_file() else expanded_path
+    if matching_catalog_path != expanded_path:
+        _log_green(
+            "[catalog] 使用首次自动修正前的基准做 CRC/尺寸匹配: "
+            f"{matching_catalog_path}"
+        )
+
     source_bundle_root = source_bundle_root or _source_catalog_android_root(cfg)
-    if not validate_catalog_crc_algorithm(cfg, expanded_path, source_bundle_root, bundle_root, output_dir):
-        print("[catalog][停止] 未修改 catalog。请先确认 CRC 算法或样本。")
+    if not validate_catalog_crc_algorithm(
+        cfg,
+        matching_catalog_path,
+        source_bundle_root,
+        bundle_root,
+        output_dir,
+    ):
+        _log_red("[catalog][停止] 未修改 catalog。请先确认 CRC 算法或样本。")
         return None
 
     manual_crc = {}
@@ -1026,6 +1101,7 @@ def auto_patch_and_repack_catalog_after_import(
         crc_by_bundle_name=manual_crc,
         source_bundle_root=source_bundle_root,
         zero_crc=True,
+        reference_catalog_path=matching_catalog_path,
     )
     _log_green(f"[catalog] 已按最终 bundle 修正 Output.json: size={size_updates}, crc置0={crc_updates}")
     _log_green(f"[catalog] Output.json 自动修正前备份: {backup_path}")

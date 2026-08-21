@@ -4,7 +4,7 @@ Unity 游戏资源汉化工具链。主要流程是：导出资源到 `workspace
 
 ## 首次安装环境
 
-本项目包含 Python 流程脚本和 C# Unity 资源处理程序，新电脑需要同时准备 Python 与 .NET SDK。
+本项目包含 Python 流程脚本、C# Unity 资源处理程序，以及用于 ETC2/ASTC 的原生纹理编码器。新电脑需要准备 Python、.NET SDK 和 Windows C++ 构建工具。
 
 ### 1. Python 3.9 或更高版本
 
@@ -33,7 +33,18 @@ dotnet --version
 
 第一次运行时，`dotnet` 还可能需要还原 NuGet 依赖。公司电脑可通过公司软件中心或内部安装源安装；普通电脑可使用 Microsoft 提供的 .NET SDK 安装包。
 
-### 3. Unity Editor（按资源类型需要）
+### 3. Visual Studio C++ 与 CMake
+
+图片导入会调用仓库内的原生 `TextureEncoder`，把替换图重新编码为游戏原有的 ETC2/ASTC GPU 压缩格式。Windows 上请通过 Visual Studio Installer 安装：
+
+- 使用 C++ 的桌面开发
+- MSVC x64/x86 生成工具
+- Windows SDK
+- 适用于 Windows 的 C++ CMake 工具
+
+无需手动配置 PATH。第一次执行 `dotnet build`、一键导入或资源验证时，项目会通过 `vswhere` 自动找到 Visual Studio 自带的 CMake，构建 `textureencoder.dll` 和不启用 PVRTC 的 `PVRTexLib.dll` 兼容占位库，并把它们与 `cuttlefish.dll` 一起复制到 CLI 输出目录。ETC2/ASTC 编码在隔离子进程中执行；原生 DLL 缺失、编码异常或子进程崩溃时，主导入流程会回退为兼容的单 mip RGBA32。仅当 `enable_sample_collection=true` 时才会把替换图片、manifest 和错误信息写入 `样本/TextureEncode_*`，关闭时不保存失败样本。RGBA32 回退结果通常比 GPU 压缩格式大，应结合日志检查后再发布。
+
+### 4. Unity Editor（按资源类型需要）
 
 只有脚本 0 检测到 TMP/SDF FontAsset、并在步骤 8 生成 TMP/SDF 字体时才需要完整 Unity Editor。纯文本、图片、TTF 或仅 NGUI 位图字体流程不依赖 Unity 字体生成；`unity_exe=auto` 时工具会按辅助工程版本自动查找已安装的 Unity。
 
@@ -85,7 +96,8 @@ python .\快速配置.py --check
 - `resource_managed_subpath`
   - Managed DLL 目录相对路径，一般是 `game-name/game/assets/bin/Data/Managed`。
 - `catalog_source_subpath`
-  - Addressables `catalog.json` 相对路径，一般在 `game-name/game/assets/aa/catalog.json`。
+  - Addressables `catalog.json` 或 `catalog.bin` 相对路径，一般在 `game-name/game/assets/aa/`。
+  - 即使模板填写 `catalog.json`，运行时也会读取同目录 `settings.json` 并自动选择实际存在的 `catalog.bin`/`catalog.json`。
 - `resource_staging_root`
   - 一键导出使用的统一原始资源暂存目录，默认 `workspace/input_sources`。
   - 源文件指纹没有变化时会直接复用；源文件变化或用户明确清空 workspace 时才会重建。不要在其中保存手工文件。
@@ -142,10 +154,10 @@ project_root_dir/[project_name/]game-name/bak/64/DummyDll
 
 - `enable_ai_translation`
   - `true` 时优先使用 AI 整表翻译。
-  - AI 失败时回落到 `translate_provider` 指定的普通翻译。
+  - `codex_cli` 模式下，Codex CLI 进程一旦报错、超时或额度不足，会立即触发本次操作的熔断：当前批立刻切换到已配置的 OpenAI-compatible HTTP AI，后续批次全部跳过 Codex。Codex 成功响应但只漏少量条目时仍可重试缺失条目；HTTP AI 最多重试 3 次，最后才回落到 `translate_provider` 指定的普通翻译（通常为百度）。
 - `ai_translation_transport`
   - `http`：使用下方的 OpenAI-compatible HTTP 接口配置。
-  - `codex_cli`：通过本机已登录的 `codex exec` 调用 Codex，使用 `ai_translation_codex_model`；无需 API key。
+  - `codex_cli`：通过本机已登录的 `codex exec` 调用 Codex，使用 `ai_translation_codex_model`；无需 API key。若同时填写 HTTP 接口配置，该接口会作为 Codex 的第二级 AI 回退。
 - `ai_translation_codex_model`
   - Codex CLI 模型，例如 `gpt-5.3-codex-spark`。
 - `ai_translation_codex_reasoning_effort`
@@ -170,12 +182,12 @@ project_root_dir/[project_name/]game-name/bak/64/DummyDll
   - `false`：扫描时按 `text_keys` 白名单提取文本。
   - `true`：扫描时先用 `string_field_blacklist` 排除明显不该翻译的字段，再记录所有字符串字段，之后让 AI 判断哪些字段需要汉化。
 - `ai_field_review_transport` / `ai_field_review_codex_model`
-  - 可设为 `codex_cli` 并指定 Codex 模型，让字段判断复用本机 Codex 登录。
+  - 可设为 `codex_cli` 并指定 Codex 模型，让字段判断复用本机 Codex 登录。若同时填写字段判断 HTTP 接口配置，Codex CLI 一旦报错便立即熔断，当前批和本次操作的后续批次直接使用 HTTP AI；HTTP AI 最多重试 3 次。
 - `ai_field_review_codex_reasoning_effort`
   - 字段判断默认使用 `medium`，在判断质量和额度消耗之间取平衡。
 - `ai_field_review_base_url` / `ai_field_review_api_key` / `ai_field_review_model`
-  - AI 字段判断接口配置。
-  - 如果未配置或访问失败，脚本会提示把 `workspace/records/string_field_review.txt` 手动交给 AI 判断。
+  - AI 字段判断接口配置；在 `codex_cli` 模式下也会保留并用作第二级 AI 回退。
+  - Codex 和 HTTP AI 均未配置或重试后仍失败时，脚本会提示把 `workspace/records/string_field_review.txt` 手动交给 AI 判断。
 - `string_field_blacklist`
   - 字段黑名单。典型例子：`m_Script`、`m_Name`、`m_Entries.Array*.m_Key`。
   - Unity Localization 的 Shared Data key 不应该翻译，所以 `m_Entries.Array*.m_Key` 必须保留在黑名单里。
@@ -377,7 +389,7 @@ InternalId 被改为本地 RuntimePath，就会同步覆盖源 `game/assets/aa` 
 
 脚本 4 回写时会再次依据过滤后的 `records.json` 建立 `(文件、完整 field 路径、原文)` 精确白名单。即使同一原文同时出现在可翻译字段和运行时字段中，也只修改 AI 已选择的具体位置；运行时字段安全规则仍会进行第二次拦截。
 
-一键全部执行时，步骤 1 采用严格非交互模式：Codex CLI 或 HTTP 请求超时/失败后会立即返回失败，Windows 下同时终止对应进程树，外层不会继续执行步骤 2–9，也不会停在人工粘贴提示。单独执行步骤 1 时仍允许失败后人工粘贴字段列表。等待上限由 `ai_field_review_timeout` 控制。
+一键全部执行时，步骤 1 采用严格非交互模式：Codex CLI 报错后立即熔断并切换 HTTP AI，HTTP AI 完成重试后仍失败才会返回失败；Windows 下同时终止对应超时进程树，外层不会继续执行步骤 2–9，也不会停在人工粘贴提示。单独执行步骤 1 时仍允许全部自动通道失败后人工粘贴字段列表。每次请求的等待上限由 `ai_field_review_timeout` 控制。
 
 `a` 全部执行以及 `1-3`、`0,2,4-9` 等连续/组合执行统一采用 fail-fast：任一步骤抛出异常、返回非零状态或收到人工中断，当前执行链立即结束，尚未启动的后续步骤不会执行。只有明确返回成功的步骤才会启动下一步。
 

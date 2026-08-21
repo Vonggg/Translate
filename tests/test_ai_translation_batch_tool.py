@@ -142,10 +142,59 @@ class AITranslationBatchToolTests(unittest.TestCase):
                 batch_tool.resend_batch(self.request_path, self.response_path)
 
         raw_paths = list(self.tmp_path.glob("ai_translation_response_batch_002_raw_*.json"))
-        self.assertEqual(len(raw_paths), 1)
+        self.assertEqual(len(raw_paths), 4)
         raw_data = json.loads(raw_paths[0].read_text(encoding="utf-8"))
         self.assertEqual(raw_data["error"]["message"], "queue timeout")
         self.assertFalse(self.response_path.exists())
+
+    def test_codex_resend_falls_back_to_configured_http_ai(self) -> None:
+        self.write_request([{"id": 557, "text": "Restart"}])
+        circuit_file = self.tmp_path / "codex-circuit.json"
+        cfg = SimpleNamespace(
+            ai_translation_transport="codex_cli",
+            ai_translation_codex_model="codex-model",
+            ai_translation_codex_reasoning_effort="low",
+            ai_translation_base_url="https://example.invalid",
+            ai_translation_api_key="key",
+            ai_translation_model="http-model",
+            ai_translation_proxy_http="",
+            ai_translation_proxy_https="",
+            ai_translation_timeout=10,
+            root_dir=self.tmp_path,
+        )
+        with (
+            mock.patch.object(batch_tool, "load_config", return_value=cfg),
+            mock.patch.object(batch_tool, "get_strategy", return_value=_FakeStrategy()),
+            mock.patch(
+                "pipeline.translation.codex_cli_available",
+                return_value=True,
+            ),
+            mock.patch.object(
+                batch_tool,
+                "request_structured_output",
+                side_effect=RuntimeError("codex failed"),
+            ) as codex_request,
+            mock.patch.object(
+                batch_tool,
+                "post_ai_payload",
+                return_value=_response([{"id": 557, "translation": "重新开始"}]),
+            ) as http_request,
+        ):
+            batch_tool.resend_batch(
+                self.request_path,
+                self.response_path,
+                circuit_file,
+            )
+            batch_tool.resend_batch(
+                self.request_path,
+                self.response_path,
+                circuit_file,
+            )
+
+        self.assertEqual(codex_request.call_count, 1)
+        self.assertEqual(http_request.call_count, 2)
+        self.assertTrue(circuit_file.is_file())
+        self.assertTrue(self.response_path.is_file())
 
 
 class MainAITranslationBatchTests(unittest.TestCase):
@@ -262,7 +311,14 @@ class MainAITranslationBatchTests(unittest.TestCase):
 
             calls: list[tuple[list[int], int, int]] = []
 
-            def fake_translate_ai_batch(batch, _cfg, _strategy, batch_index, batch_count):
+            def fake_translate_ai_batch(
+                batch,
+                _cfg,
+                _strategy,
+                batch_index,
+                batch_count,
+                **_kwargs,
+            ):
                 calls.append(([item_id for item_id, _text in batch], batch_index, batch_count))
                 return {item_id: f"译文 {item_id}" for item_id, _text in batch}
 

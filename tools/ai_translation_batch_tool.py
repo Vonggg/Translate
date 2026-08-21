@@ -16,6 +16,7 @@ from support.config import load_config
 from pipeline.ai_translation_strategy import get_strategy
 from pipeline.codex_cli_provider import request_structured_output, translation_schema
 from pipeline.shared import atomic_write_json, read_json, write_json
+from pipeline.translation import _ai_translation_transport_chain
 
 _REQUEST_JSON_DELIMITER_TYPO = re.compile(
     r'("(?:items|id|translation|text)")\s*[=>]\s*(?=[\[\{"\-0-9tfn])'
@@ -247,26 +248,40 @@ def _response_message_content(data: dict[str, Any], label: str) -> tuple[str, st
     return str(message.get("content", "")), str(choice.get("finish_reason", ""))
 
 
-def resend_batch(request_path: Path, response_path: Path) -> None:
+def resend_batch(
+    request_path: Path,
+    response_path: Path,
+    codex_circuit_file: Path | None = None,
+) -> None:
     cfg = load_config(quiet=True)
     strategy = get_strategy(cfg)
-    transport = str(getattr(cfg, "ai_translation_transport", "http") or "http").strip().lower()
+    configured_transport = str(
+        getattr(cfg, "ai_translation_transport", "http") or "http"
+    ).strip().lower()
+    transports = _ai_translation_transport_chain(cfg)
+    codex_skipped_by_circuit = bool(
+        codex_circuit_file is not None
+        and codex_circuit_file.is_file()
+        and "codex_cli" in transports
+    )
+    if codex_skipped_by_circuit:
+        transports = [item for item in transports if item != "codex_cli"]
+        log(
+            "[AI补批][Codex熔断] 本次批量操作此前已发生 Codex CLI 错误，"
+            "直接跳过并进入 HTTP AI。"
+        )
     base_url = cfg.ai_translation_base_url.strip().rstrip("/")
     api_key = cfg.ai_translation_api_key.strip()
-    if transport == "http" and not (base_url and api_key):
-        raise RuntimeError("AI 翻译接口未配置 base_url/api_key，无法重发批次。")
-    if transport not in {"http", "codex_cli"}:
-        raise RuntimeError(f"不支持的 AI translation transport: {transport}")
+    if not transports:
+        raise RuntimeError("Codex CLI 和 HTTP AI 均不可用或配置不完整，无法重发批次。")
 
     original_payload = read_json(request_path)
-    if transport == "codex_cli":
-        model = str(
+    models = {
+        "codex_cli": str(
             getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark")
-        ).strip()
-    else:
-        model = str(original_payload.get("model") or cfg.ai_translation_model).strip()
-    if not model:
-        raise RuntimeError("request JSON 和 config.json 都没有配置 model。")
+        ).strip(),
+        "http": str(cfg.ai_translation_model).strip(),
+    }
 
     proxies = {
         key: value
@@ -279,11 +294,16 @@ def resend_batch(request_path: Path, response_path: Path) -> None:
 
     log(f"[AI补批] 请求文件: {request_path}")
     log(f"[AI补批] 输出文件: {response_path}")
-    endpoint = base_url if transport == "http" else "Codex CLI"
     log(
-        f"[AI补批] transport={transport}, model={model}, endpoint={endpoint}, "
+        f"[AI补批] chain={' -> '.join(transports)}, "
         f"strategy={getattr(strategy, 'name', 'custom')}"
     )
+    if (
+        configured_transport == "codex_cli"
+        and transports[0] == "http"
+        and not codex_skipped_by_circuit
+    ):
+        log("[AI补批][AI回退] Codex CLI 不可用，直接切换到 HTTP AI。")
 
     id_to_source = load_request_items(request_path)
     pending_items = list(id_to_source.items())
@@ -295,13 +315,19 @@ def resend_batch(request_path: Path, response_path: Path) -> None:
 
     all_translations: dict[int, str] = {}
     usage_items: list[dict[str, Any]] = []
+    last_model = models[transports[0]]
+    last_error: Exception | None = None
 
     def request_sub_batch(
         sub_batch: list[tuple[int, str]],
         label: str,
         sub_index: int,
         sub_count: int,
+        request_transport: str,
     ) -> dict[int, str]:
+        nonlocal last_model
+        model = models[request_transport]
+        last_model = model
         estimated_output = sum(strategy.estimate_output_chars(text) for _item_id, text in sub_batch)
         user_content_size = len(strategy.user_content(sub_batch, sub_index, sub_count))
         log_green(
@@ -309,7 +335,7 @@ def resend_batch(request_path: Path, response_path: Path) -> None:
             f"条目={len(sub_batch)}，输入字符={user_content_size}，预计输出={estimated_output}"
         )
         payload = make_batch_payload(cfg, strategy, model, sub_batch, sub_index, sub_count)
-        if transport == "codex_cli":
+        if request_transport == "codex_cli":
             started_at = time.monotonic()
             structured, usage = request_structured_output(
                 model=model,
@@ -368,17 +394,7 @@ def resend_batch(request_path: Path, response_path: Path) -> None:
             log(f"[AI补批][提示] {label} 忽略了 {unexpected_count} 个非本批或无效 id")
         return accepted
 
-    for sub_index, sub_batch in enumerate(sub_batches, start=1):
-        label = f"子批 {sub_index}/{len(sub_batches)}"
-        parsed = request_sub_batch(sub_batch, label, sub_index, len(sub_batches))
-        all_translations.update(parsed)
-        missing_in_sub_batch = [item_id for item_id, _text in sub_batch if item_id not in parsed]
-        log(
-            f"[AI补批] {label} 完成，返回={len(parsed)}，"
-            f"缺少={len(missing_in_sub_batch)}，累计={len(all_translations)}"
-        )
-
-    for retry_round in range(1, MAX_MISSING_RETRY_ROUNDS + 1):
+    for transport_index, request_transport in enumerate(transports):
         missing_items = [
             (item_id, source_text)
             for item_id, source_text in pending_items
@@ -386,42 +402,78 @@ def resend_batch(request_path: Path, response_path: Path) -> None:
         ]
         if not missing_items:
             break
-        retry_batches = strategy.build_batches(missing_items)
-        preview = ",".join(str(item_id) for item_id, _text in missing_items[:30])
-        suffix = "..." if len(missing_items) > 30 else ""
-        log(
-            f"[AI补批][缺失重试] 第 {retry_round}/{MAX_MISSING_RETRY_ROUNDS} 轮，"
-            f"仅重发 {len(missing_items)} 个 id: {preview}{suffix}"
-        )
-        before_count = len(all_translations)
-        for retry_index, retry_batch in enumerate(retry_batches, start=1):
-            label = (
-                f"缺失重试 {retry_round}/{MAX_MISSING_RETRY_ROUNDS} "
-                f"子批 {retry_index}/{len(retry_batches)}"
-            )
-            parsed = request_sub_batch(
-                retry_batch,
-                label,
-                retry_index,
-                len(retry_batches),
-            )
-            all_translations.update(parsed)
+        display_name = "Codex CLI" if request_transport == "codex_cli" else "HTTP AI"
+        if transport_index > 0:
             log(
-                f"[AI补批] {label} 完成，返回={len(parsed)}，累计={len(all_translations)}"
+                f"[AI补批][AI回退] Codex CLI 仍缺少 {len(missing_items)} 条，"
+                f"切换到 HTTP AI；同样最多重试 {MAX_MISSING_RETRY_ROUNDS} 次。"
             )
-        if len(all_translations) == before_count:
-            log(f"[AI补批][缺失重试] 第 {retry_round} 轮没有补回任何条目")
+        codex_transport_failed = False
+        for retry_round in range(0, MAX_MISSING_RETRY_ROUNDS + 1):
+            missing_items = [
+                (item_id, source_text)
+                for item_id, source_text in pending_items
+                if item_id not in all_translations
+            ]
+            if not missing_items:
+                break
+            retry_batches = strategy.build_batches(missing_items)
+            attempt_label = (
+                "首轮"
+                if retry_round == 0
+                else f"重试 {retry_round}/{MAX_MISSING_RETRY_ROUNDS}"
+            )
+            before_count = len(all_translations)
+            for retry_index, retry_batch in enumerate(retry_batches, start=1):
+                label = (
+                    f"{display_name} {attempt_label} "
+                    f"子批 {retry_index}/{len(retry_batches)}"
+                )
+                try:
+                    parsed = request_sub_batch(
+                        retry_batch,
+                        label,
+                        retry_index,
+                        len(retry_batches),
+                        request_transport,
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    log(f"[AI补批][AI重试] {label}失败: {exc}")
+                    if request_transport == "codex_cli":
+                        codex_transport_failed = True
+                        if codex_circuit_file is not None:
+                            atomic_write_json(
+                                codex_circuit_file,
+                                {"open": True, "reason": str(exc)},
+                            )
+                        log(
+                            "[AI补批][Codex熔断] Codex CLI 进程请求失败；"
+                            "本批立即切换 HTTP AI，本次操作的后续批次将全部跳过 Codex。"
+                        )
+                        break
+                    continue
+                all_translations.update(parsed)
+                log(
+                    f"[AI补批] {label} 完成，返回={len(parsed)}，累计={len(all_translations)}"
+                )
+            if len(all_translations) == before_count:
+                log(f"[AI补批][AI重试] {display_name} {attempt_label}没有补回任何条目")
+            if codex_transport_failed:
+                break
 
     missing_ids = [item_id for item_id, _text in pending_items if item_id not in all_translations]
     if missing_ids:
         preview = ",".join(str(item_id) for item_id in missing_ids[:30])
         suffix = "..." if len(missing_ids) > 30 else ""
+        error_suffix = f"；最后错误: {last_error}" if last_error is not None else ""
         raise RuntimeError(
             f"经过 {MAX_MISSING_RETRY_ROUNDS} 轮缺失重试后仍缺少 "
-            f"{len(missing_ids)} 个 id: {preview}{suffix}；原始响应已单独留档。"
+            f"{len(missing_ids)} 个 id: {preview}{suffix}；原始响应已单独留档"
+            f"{error_suffix}。"
         )
 
-    combined = make_combined_response(model, all_translations, usage_items)
+    combined = make_combined_response(last_model, all_translations, usage_items)
     write_json(response_path, combined)
     log_green(f"[AI补批] 已合并写入 response: {response_path}，条目={len(all_translations)}")
 
@@ -472,6 +524,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request", required=True, type=Path, help="ai_translation_request_batch_XXX.json")
     parser.add_argument("--response", type=Path, help="ai_translation_response_batch_XXX.json；不填则按 request 文件名自动推导")
     parser.add_argument("--trans", type=Path, help="trans.json；不填则使用当前 config 的 workspace/records/trans.json")
+    parser.add_argument(
+        "--codex-circuit-file",
+        type=Path,
+        help="同一次多批操作共享的 Codex 熔断标记文件。",
+    )
     return parser.parse_args()
 
 
@@ -483,7 +540,7 @@ def main() -> int:
     trans_path = (args.trans or (cfg.stage_record_dir / cfg.output_trans_json)).resolve()
 
     if args.mode in {"resend", "resend-and-patch"}:
-        resend_batch(request_path, response_path)
+        resend_batch(request_path, response_path, args.codex_circuit_file)
     if args.mode in {"patch-trans", "resend-and-patch"}:
         patch_trans_from_response(request_path, response_path, trans_path)
     return 0

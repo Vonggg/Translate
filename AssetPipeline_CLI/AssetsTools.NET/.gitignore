@@ -21,6 +21,9 @@ x64/
 x86/
 bld/
 [Bb]in/
+!NativeLibs/cuttlefish/windows/bin/
+NativeLibs/cuttlefish/windows/bin/*
+!NativeLibs/cuttlefish/windows/bin/cuttlefish.dll
 [Oo]bj/
 [Ll]og/
 

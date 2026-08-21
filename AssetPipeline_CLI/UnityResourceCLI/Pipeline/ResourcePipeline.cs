@@ -1023,7 +1023,8 @@ namespace UnityResourceCLI
                 if (item.TypeName == nameof(AssetClassID.Texture2D) || item.ExportKind.StartsWith("texture-", StringComparison.OrdinalIgnoreCase))
                 {
                     Log($"    {item.TypeName}: {item.AssetName} <- {item.RelativePath}");
-                    byte[]? bytes = ApplyTextureReplacement(inst, info, replacementPath);
+                    byte[]? bytes = ApplyTextureReplacement(
+                        inst, info, replacementPath, manifestDir, item);
                     if (bytes != null)
                     {
                         SetAssetReplacement(info, bytes);
@@ -1132,7 +1133,12 @@ namespace UnityResourceCLI
                 || relativePath.Equals("bundle", StringComparison.OrdinalIgnoreCase);
         }
 
-        private byte[]? ApplyTextureReplacement(AssetsFileInstance inst, AssetFileInfo info, string replacementPath)
+        private byte[]? ApplyTextureReplacement(
+            AssetsFileInstance inst,
+            AssetFileInfo info,
+            string replacementPath,
+            string manifestDir,
+            ExportManifestItem item)
         {
             AssetTypeValueField? baseField = SafeGetBaseField(inst, info);
             if (baseField == null)
@@ -1145,27 +1151,136 @@ namespace UnityResourceCLI
                 return null;
             }
 
+            TextureFormat originalFormat = (TextureFormat)tex.m_TextureFormat;
+            TextureFormat importFormat = GetImportTextureFormat(originalFormat);
+            int mipCount = Math.Max(1, tex.m_MipCount);
+            bool requiresNativeEncoder = RequiresNativeTextureEncoder(importFormat);
+            bool nativeEncodeSucceeded = false;
+
+            if (importFormat != originalFormat)
+            {
+                Log(
+                    $"      Texture format {originalFormat} cannot be re-encoded with its Crunch wrapper; " +
+                    $"using GPU-compressed {importFormat} instead."
+                );
+            }
+
             try
             {
-                EncodeTextureImageFromReplacement(tex, replacementPath, options.JpegQuality);
+                EncodeTextureImageFromReplacement(
+                    tex,
+                    replacementPath,
+                    importFormat,
+                    mipCount,
+                    options.JpegQuality
+                );
+                nativeEncodeSucceeded = requiresNativeEncoder;
+            }
+            catch (Exception ex) when (requiresNativeEncoder)
+            {
+                LogRed(
+                    $"      原生纹理编码失败，将回退 RGBA32: " +
+                    $"format={importFormat}, error={ex.GetType().Name}: {ex.Message}"
+                );
+                if (options.SaveSamples)
+                {
+                    SaveTextureEncodingFailureSample(
+                        replacementPath,
+                        manifestDir,
+                        item,
+                        originalFormat,
+                        importFormat,
+                        mipCount,
+                        ex
+                    );
+                }
+                else
+                {
+                    Log("      [样本] 自动保存已关闭，未记录纹理编码失败样本。");
+                }
+
+                EncodeRgba32Fallback(tex, replacementPath);
+                Log(
+                    $"      已使用旧版 RGBA32 链路完成回退: " +
+                    $"mips={tex.m_MipCount}, data={tex.m_CompleteImageSize:N0} bytes."
+                );
             }
             catch (NotSupportedException)
             {
-                Log($"      Texture format {(TextureFormat)tex.m_TextureFormat} is not supported for encoding; using RGBA32.");
-                EncodeTextureImageFromReplacement(tex, replacementPath, TextureFormat.RGBA32, options.JpegQuality);
+                Log($"      Texture format {originalFormat} is not supported for encoding; using RGBA32.");
+                EncodeTextureImageFromReplacement(
+                    tex,
+                    replacementPath,
+                    TextureFormat.RGBA32,
+                    mipCount,
+                    options.JpegQuality
+                );
             }
             catch (NotImplementedException)
             {
-                Log($"      Texture format {(TextureFormat)tex.m_TextureFormat} is not implemented for encoding; using RGBA32.");
-                EncodeTextureImageFromReplacement(tex, replacementPath, TextureFormat.RGBA32, options.JpegQuality);
+                Log($"      Texture format {originalFormat} is not implemented for encoding; using RGBA32.");
+                EncodeTextureImageFromReplacement(
+                    tex,
+                    replacementPath,
+                    TextureFormat.RGBA32,
+                    mipCount,
+                    options.JpegQuality
+                );
+            }
+            if (nativeEncodeSucceeded)
+            {
+                Log(
+                    $"      Native texture encode: {originalFormat} -> " +
+                    $"{(TextureFormat)tex.m_TextureFormat}, mips={tex.m_MipCount}, " +
+                    $"data={tex.m_CompleteImageSize:N0} bytes."
+                );
             }
             tex.WriteTo(baseField);
             return baseField.WriteToByteArray();
         }
 
-        private static void EncodeTextureImageFromReplacement(TextureFile tex, string replacementPath, int jpegQuality)
+        private static TextureFormat GetImportTextureFormat(TextureFormat format)
         {
-            if ((TextureFormat)tex.m_TextureFormat == TextureFormat.Alpha8)
+            return format switch
+            {
+                TextureFormat.DXT1Crunched => TextureFormat.DXT1,
+                TextureFormat.DXT5Crunched => TextureFormat.DXT5,
+                TextureFormat.ETC_RGB4Crunched => TextureFormat.ETC_RGB4,
+                TextureFormat.ETC2_RGBA8Crunched => TextureFormat.ETC2_RGBA8,
+                _ => format,
+            };
+        }
+
+        private static bool RequiresNativeTextureEncoder(TextureFormat format)
+        {
+            return format is
+                TextureFormat.ETC_RGB4 or
+                TextureFormat.ETC2_RGB4 or
+                TextureFormat.ETC2_RGBA1 or
+                TextureFormat.ETC2_RGBA8 or
+                TextureFormat.ASTC_RGB_4x4 or
+                TextureFormat.ASTC_RGB_5x5 or
+                TextureFormat.ASTC_RGB_6x6 or
+                TextureFormat.ASTC_RGB_8x8 or
+                TextureFormat.ASTC_RGB_10x10 or
+                TextureFormat.ASTC_RGB_12x12 or
+                TextureFormat.ASTC_RGBA_4x4 or
+                TextureFormat.ASTC_RGBA_5x5 or
+                TextureFormat.ASTC_RGBA_6x6 or
+                TextureFormat.ASTC_RGBA_8x8 or
+                TextureFormat.ASTC_RGBA_10x10 or
+                TextureFormat.ASTC_RGBA_12x12;
+        }
+
+        private static void EncodeTextureImageFromReplacement(
+            TextureFile tex,
+            string replacementPath,
+            TextureFormat format,
+            int mipCount,
+            int jpegQuality
+        )
+        {
+            if (format == TextureFormat.Alpha8)
             {
                 EncodeAlpha8Replacement(tex, replacementPath);
                 return;
@@ -1174,14 +1289,67 @@ namespace UnityResourceCLI
             // RGB24's native image path applies a different row/channel
             // convention from the other encoders. Encode it explicitly so the
             // resulting Unity rows and RGB order are deterministic.
-            if ((TextureFormat)tex.m_TextureFormat == TextureFormat.RGB24)
+            if (format == TextureFormat.RGB24)
             {
                 EncodeRgb24Replacement(tex, replacementPath);
                 return;
             }
 
+            if (RequiresNativeTextureEncoder(format))
+            {
+                Log(
+                    $"      Native texture worker input: format={format}, " +
+                    $"mips={mipCount}."
+                );
+                NativeTextureEncodingResult result = NativeTextureWorker.EncodeIsolated(
+                    replacementPath,
+                    format,
+                    mipCount,
+                    jpegQuality
+                );
+                tex.SetEncodedMips(result.Mips, result.Width, result.Height, format);
+                return;
+            }
+
+            if (TextureEncoderWrapper.NativeLibrariesSupported())
+            {
+                using FileStream fs = File.OpenRead(replacementPath);
+                ImageResult image = ImageResult.FromStream(fs, ColorComponents.RedGreenBlueAlpha);
+                byte[] bgraData = (byte[])image.Data.Clone();
+                TextureOperations.SwapRBComponentsInplace(bgraData);
+                Log(
+                    $"      Native texture input: format={format}, size={image.Width}x{image.Height}, " +
+                    $"mips={mipCount}, buffer={bgraData.Length:N0} bytes."
+                );
+                tex.EncodeTextureRaw(
+                    bgraData,
+                    image.Width,
+                    image.Height,
+                    format,
+                    mipCount,
+                    jpegQuality,
+                    useBgra: true
+                );
+                return;
+            }
+
             using MemoryStream imageStream = LoadReplacementImageFlippedVertically(replacementPath, jpegQuality);
-            tex.EncodeTextureImage(imageStream, 1, jpegQuality);
+            tex.EncodeTextureImage(imageStream, format, mipCount, jpegQuality);
+        }
+
+        private static void EncodeRgba32Fallback(TextureFile tex, string replacementPath)
+        {
+            using FileStream fs = File.OpenRead(replacementPath);
+            ImageResult image = ImageResult.FromStream(fs, ColorComponents.RedGreenBlueAlpha);
+            byte[] unityRows = TextureOperations.FlipRGBA32Vertically(
+                image.Data, image.Width, image.Height);
+            tex.SetPictureData(
+                unityRows,
+                image.Width,
+                image.Height,
+                TextureFormat.RGBA32,
+                mipCount: 1
+            );
         }
 
         private static void EncodeRgb24Replacement(TextureFile tex, string replacementPath)
@@ -1222,16 +1390,6 @@ namespace UnityResourceCLI
             tex.m_CompleteImageSize = alpha8.Length;
             tex.m_MipCount = 1;
             tex.m_MipMap = false;
-        }
-
-        private static void EncodeTextureImageFromReplacement(TextureFile tex, string replacementPath, TextureFormat format, int jpegQuality)
-        {
-            // This overload is used after the original format encoder rejects
-            // the texture. The RGBA32 fallback follows the existing pre-flipped
-            // memory-stream contract, which is intentionally separate from the
-            // successful original-format path above.
-            using MemoryStream imageStream = LoadReplacementImageFlippedVertically(replacementPath, jpegQuality);
-            tex.EncodeTextureImage(imageStream, format, 1, jpegQuality);
         }
 
         private static MemoryStream LoadReplacementImageFlippedVertically(string replacementPath, int jpegQuality)
@@ -1573,6 +1731,83 @@ namespace UnityResourceCLI
         {
             byte[] digest = SHA256.HashData(Encoding.UTF8.GetBytes(value));
             return Convert.ToHexString(digest).ToLowerInvariant();
+        }
+
+        private void SaveTextureEncodingFailureSample(
+            string replacementPath,
+            string manifestDir,
+            ExportManifestItem item,
+            TextureFormat originalFormat,
+            TextureFormat importFormat,
+            int mipCount,
+            Exception exception)
+        {
+            try
+            {
+                string sampleRoot = ResolveSampleRoot();
+                Directory.CreateDirectory(sampleRoot);
+                string safeName = Sanitize($"{item.AssetName}_{item.PathId}");
+                string sampleDir = Path.Combine(
+                    sampleRoot,
+                    $"TextureEncode_{safeName}_{DateTime.Now:yyyyMMdd_HHmmss_fff}"
+                );
+                Directory.CreateDirectory(sampleDir);
+
+                CopySampleFile(
+                    replacementPath,
+                    Path.Combine(sampleDir, "replacement", Path.GetFileName(replacementPath))
+                );
+
+                string originalPath = Path.Combine(manifestDir, item.RelativePath);
+                if (File.Exists(originalPath))
+                {
+                    CopySampleFile(
+                        originalPath,
+                        Path.Combine(sampleDir, "original_export", Path.GetFileName(originalPath))
+                    );
+                }
+
+                string manifestPath = Path.Combine(manifestDir, "manifest.json");
+                if (File.Exists(manifestPath))
+                    CopySampleFile(manifestPath, Path.Combine(sampleDir, "manifest.json"));
+
+                File.WriteAllText(
+                    Path.Combine(sampleDir, "info.txt"),
+                    string.Join(
+                        Environment.NewLine,
+                        new[]
+                        {
+                            "Native texture encoding failure sample",
+                            $"time={DateTime.Now:O}",
+                            $"asset_name={item.AssetName}",
+                            $"path_id={item.PathId}",
+                            $"relative_path={item.RelativePath}",
+                            $"bundle_entry={item.BundleEntryName}",
+                            $"original_format={originalFormat}",
+                            $"requested_format={importFormat}",
+                            $"requested_mips={mipCount}",
+                            $"replacement_path={replacementPath}",
+                            $"original_export_path={originalPath}",
+                            $"manifest_dir={manifestDir}",
+                            $"source_root={options.SourceRoot}",
+                            $"work_root={options.WorkRoot}",
+                            $"replacement_root={options.ReplacementRoot}",
+                            "exception:",
+                            exception.ToString(),
+                        }
+                    ),
+                    Encoding.UTF8
+                );
+
+                LogPurple($"      原生纹理编码失败样本已保存: {sampleDir}");
+            }
+            catch (Exception sampleException)
+            {
+                LogPurple(
+                    $"      WARNING: 原生纹理编码失败样本保存失败: " +
+                    $"{sampleException.GetType().Name}: {sampleException.Message}"
+                );
+            }
         }
 
         private void SaveSerializeReferenceSample(string replacementPath, string manifestDir, ExportManifestItem item, int preservedCount)

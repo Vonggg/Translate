@@ -20,6 +20,7 @@ Builds/
 *.pdb
 *.mdb
 AssetPipeline_CLI/.nested_git_backup/
+AssetPipeline_CLI/AssetsTools.NET/build-native/
 
 # Local project configuration and private working notes
 /config.json

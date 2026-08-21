@@ -9180,6 +9180,7 @@ def run_restore_records_by_field() -> None:
     if _ai_translation_request_configured(cfg):
         strategy = get_strategy(cfg)
         batches = strategy.build_batches(pending_items)
+        codex_circuit: dict[str, object] = {}
         for batch_index, batch in enumerate(batches, start=1):
             print(
                 f"\033[92m[字段恢复] 开始 AI batch={batch_index}/{len(batches)}，"
@@ -9197,6 +9198,7 @@ def run_restore_records_by_field() -> None:
                     batch_index,
                     len(batches),
                     artifact_prefix="ai_translation_restore",
+                    codex_circuit=codex_circuit,
                 )
             except Exception as exc:
                 print(
@@ -9437,7 +9439,13 @@ def _select_ai_batch_request_paths() -> list[Path] | None:
         print("输入不能为空，请重新输入。")
 
 
-def run_ai_translation_batch_tool(mode: str, request_path: Path, response_path: Path | None = None, patch_after: bool = False) -> int:
+def run_ai_translation_batch_tool(
+    mode: str,
+    request_path: Path,
+    response_path: Path | None = None,
+    patch_after: bool = False,
+    codex_circuit_file: Path | None = None,
+) -> int:
     if not AI_TRANSLATION_BATCH_TOOL.is_file():
         print(f"AI 补批工具不存在: {AI_TRANSLATION_BATCH_TOOL}")
         return 1
@@ -9454,6 +9462,8 @@ def run_ai_translation_batch_tool(mode: str, request_path: Path, response_path: 
     ]
     if response_path is not None:
         command.extend(["--response", str(response_path)])
+    if codex_circuit_file is not None:
+        command.extend(["--codex-circuit-file", str(codex_circuit_file)])
     result = subprocess.run(command, check=False)
     if result.returncode != 0:
         return result.returncode
@@ -9503,23 +9513,30 @@ def run_ai_translation_batch_menu() -> None:
         return
     succeeded: list[Path] = []
     failed: list[tuple[Path, int]] = []
-    for index, request_path in enumerate(request_paths, start=1):
-        response_path = _default_response_path_for_ai_request(request_path)
-        print()
-        print(
-            f"[AI补批] 批次 {index}/{len(request_paths)}: {request_path.name}"
-        )
-        print(f"[AI补批] response 文件将使用: {response_path}")
-        result = run_ai_translation_batch_tool(mode, request_path, response_path)
-        if result != 0:
-            failed.append((request_path, result))
+    with tempfile.TemporaryDirectory(prefix="translate_codex_circuit_") as circuit_dir:
+        codex_circuit_file = Path(circuit_dir) / "open.json"
+        for index, request_path in enumerate(request_paths, start=1):
+            response_path = _default_response_path_for_ai_request(request_path)
+            print()
             print(
-                f"\033[91m[AI补批][失败] {request_path.name} "
-                f"返回码={result}；继续后续批次。\033[0m"
+                f"[AI补批] 批次 {index}/{len(request_paths)}: {request_path.name}"
             )
-            continue
-        succeeded.append(request_path)
-        print(f"\033[92m[AI补批][完成] {request_path.name}\033[0m")
+            print(f"[AI补批] response 文件将使用: {response_path}")
+            result = run_ai_translation_batch_tool(
+                mode,
+                request_path,
+                response_path,
+                codex_circuit_file=codex_circuit_file,
+            )
+            if result != 0:
+                failed.append((request_path, result))
+                print(
+                    f"\033[91m[AI补批][失败] {request_path.name} "
+                    f"返回码={result}；继续后续批次。\033[0m"
+                )
+                continue
+            succeeded.append(request_path)
+            print(f"\033[92m[AI补批][完成] {request_path.name}\033[0m")
 
     print()
     print(

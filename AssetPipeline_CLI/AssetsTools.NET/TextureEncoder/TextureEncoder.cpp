@@ -2,6 +2,7 @@
 #include "TextureFormat.h"
 #include "cuttlefish/Image.h"
 #include "cuttlefish/Texture.h"
+#include <climits>
 #include <cstring>
 
 using namespace std;
@@ -209,7 +210,14 @@ EXPORT TextureDataBuffer ConvertAndFreeTexture(cuttlefish::Texture* texture, Tex
         TextureDataMip* mip = &buffer.mips[i];
         mip->width = texture->width(i);
         mip->height = texture->height(i);
-        mip->size = texture->dataSize(i);
+        size_t mipSize = texture->dataSize(i);
+        if (mipSize > INT_MAX)
+        {
+            FreeTextureDataBuffer(buffer.mips, i);
+            delete texture;
+            return MakeError(TextureEncoderError::AllocateMemory);
+        }
+        mip->size = static_cast<int>(mipSize);
         mip->data = malloc(mip->size);
         if (mip->data == nullptr)
         {

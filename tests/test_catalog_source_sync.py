@@ -7,10 +7,81 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from pipeline.catalog_tools import auto_patch_and_repack_catalog_after_import
+from pipeline.catalog_tools import (
+    auto_patch_and_repack_catalog_after_import,
+    patch_expanded_catalog_from_final_bundles,
+    validate_catalog_crc_algorithm,
+)
 
 
 class CatalogSourceSyncTests(unittest.TestCase):
+    def test_repeated_import_uses_original_catalog_metadata_for_matching(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_path = root / "Output.json"
+            baseline_path = output_path.with_suffix(
+                output_path.suffix + ".bak_before_catalog_auto_patch"
+            )
+            source_bundle_root = root / "source" / "Android"
+            final_bundle_root = root / "final" / "Bundle" / "Android"
+            source_bundle_root.mkdir(parents=True)
+            final_bundle_root.mkdir(parents=True)
+            bundle_name = "_generatedisolationlocal_assets_all.bundle"
+            source_bundle = source_bundle_root / bundle_name
+            final_bundle = final_bundle_root / bundle_name
+            source_bundle.write_bytes(b"original")
+            final_bundle.write_bytes(b"second-import-result")
+
+            base_row = {
+                "InternalId": f"{{RuntimePath}}/Android/{bundle_name}",
+                "PrimaryKey": "generated_0123456789abcdef.bundle",
+                "m_Hash": "0123456789abcdef",
+                "m_BundleName": "generated",
+                "m_Crc": 123456789,
+                "m_BundleSize": len(b"original"),
+            }
+            baseline_catalog = {
+                "m_ExtraDataString": {"AssetBundleRequestOptions": [base_row]}
+            }
+            current_row = dict(base_row, m_Crc=0, m_BundleSize=999999)
+            current_catalog = {
+                "m_ExtraDataString": {"AssetBundleRequestOptions": [current_row]}
+            }
+            baseline_path.write_text(json.dumps(baseline_catalog), encoding="utf-8")
+            output_path.write_text(json.dumps(current_catalog), encoding="utf-8")
+            cfg = SimpleNamespace(enable_sample_collection=False, root_dir=root)
+
+            with patch(
+                "pipeline.catalog_tools.calculate_unityfs_uncompressed_crc",
+                return_value=123456789,
+            ):
+                self.assertTrue(
+                    validate_catalog_crc_algorithm(
+                        cfg,
+                        baseline_path,
+                        source_bundle_root,
+                        final_bundle_root,
+                        root,
+                    )
+                )
+                size_updates, crc_updates, returned_backup = (
+                    patch_expanded_catalog_from_final_bundles(
+                        output_path,
+                        final_bundle_root,
+                        source_bundle_root=source_bundle_root,
+                        zero_crc=True,
+                        reference_catalog_path=baseline_path,
+                    )
+                )
+
+            patched = json.loads(output_path.read_text(encoding="utf-8"))
+            patched_row = patched["m_ExtraDataString"]["AssetBundleRequestOptions"][0]
+            self.assertEqual(patched_row["m_BundleSize"], len(b"second-import-result"))
+            self.assertEqual(patched_row["m_Crc"], 0)
+            self.assertEqual(size_updates, 1)
+            self.assertEqual(crc_updates, 0)
+            self.assertEqual(returned_backup, baseline_path)
+
     def test_source_catalog_is_replaced_after_remote_path_localization(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

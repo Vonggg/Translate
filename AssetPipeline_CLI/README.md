@@ -1,43 +1,41 @@
 # AssetPipeline CLI
 
-这个目录里放的是一套本地化的开源资源管线工具，目标是尽量摆脱手动点 UABEA 的工作方式。
-它由主项目的 `resource_menu.py` 调用，和汉化/字体流水线共享主项目的 `workspace` 工作区；本目录不再维护独立 `workspace`。
+这里是当前项目使用的 Unity 资源命令行管线，由主项目的 `resource_menu.py` 调用，并与汉化、字体流程共用主项目的 `workspace`。
 
 ## 目录内容
 
-- `UABEA/`
 - `UnityResourceCLI/`
-  - 一个专注于 `Texture2D`、`TextAsset`、`MonoBehaviour`、`Material` 和 `Font` 导入/导出的命令行工具。
-  - 图片导入/导出保留 `png` 和 `jpg` 支持。
+  - 负责 `Texture2D`、`TextAsset`、`MonoBehaviour`、`Material` 和 `Font` 的导入、导出。
+  - `ThirdParty/UABEA/` 仅保留运行必需的 `FileTypeDetector.cs`、`classdata.tpk` 和 UABEA 许可证。
 - `AssetsTools.NET/`
-  - UABEA 所使用的核心资源读写库，也适合后续继续扩展自定义 CLI。
+  - 当前 CLI 实际使用的 Unity assets、bundle 读写及纹理编码库。
 - `scripts/`
-  - 资源 CLI 以及剩余 UABEA 辅助功能的轻量封装脚本。
+  - 当前资源 CLI 的 PowerShell/Python 封装，以及本机纹理编码库的构建脚本。
 
 ## 脚本功能
 
 - `Export-UnityResource.ps1`
-  - 将 `Texture2D`、`TextAsset`、`MonoBehaviour`、`Material`、`Font` 导出到工作目录。
+  - 将支持的 Unity 资源导出到工作目录。
 - `Import-UnityResource.ps1`
-  - 把编辑后的导出结果导入到结果目录中，不会改动原始文件。
-- `Export-Bundle.ps1`
-  - 执行 `batchexportbundle`
-- `Import-Bundle.ps1`
-  - 执行 `batchimportbundle`
-- `Apply-Emip.ps1`
-  - 执行 `applyemip`
+  - 把编辑后的资源导入结果目录，不改动原始文件。
 - `unity_resource_pipeline.py`
-  - 用 Python 调用资源导入/导出的入口脚本。
+  - Python 侧的资源导入、导出入口。
+- `build_texture_encoder.ps1`
+  - 构建 ETC2/ASTC 等格式所需的本机纹理编码库。
 
 ## 快速开始
 
 ```powershell
-cd D:\user\von\NewTools\Translate\Translate
+cd D:\user\von\NewTools\Translate
 python resource_menu.py
 ```
 
-## 说明
+## UABEA 参考源码
 
-- UABEA 仍然保留作为参考实现。
-- 新的 CLI 就是你后续自动化资源流程的直接脚本目标。
-- 如果后面还要继续扩展资源管线，这里就是在 `AssetsTools.NET` 基础上继续长大的地方。
+完整 UABEA 源码不参与当前构建，也不随本仓库同步，已移至：
+
+```text
+D:\user\von\NewTools\样本\UABEA
+```
+
+项目需要的两个 UABEA 运行依赖已经单独提取到 `UnityResourceCLI/ThirdParty/UABEA/`，无需从上述参考源码目录加载。

@@ -471,6 +471,16 @@ namespace AssetsTools.NET.Texture
         /// <summary>
         /// Store new encoded mips into this texture's fields.
         /// </summary>
+        public void SetEncodedMips(byte[][] mips, int width, int height, TextureFormat format)
+        {
+            if (mips == null || mips.Length == 0)
+                throw new ArgumentException("At least one encoded mip is required.", nameof(mips));
+            FinalizeEncodedData(mips, width, height, format);
+        }
+
+        /// <summary>
+        /// Store new encoded mips into this texture's fields.
+        /// </summary>
         private void FinalizeEncodedData(byte[][] mips, int width, int height, TextureFormat format)
         {
             // CreateSwizzler may change the texture format here, but this is probably
