@@ -7,7 +7,10 @@ import shutil
 from pathlib import Path
 
 from support.config import load_config
-from support.image_restore import restore_edited_images_before_import
+from support.image_restore import (
+    print_not_imported_images,
+    restore_edited_images_before_import,
+)
 from pipeline.catalog_tools import auto_patch_and_repack_catalog_after_import
 from pipeline.manifest_index import load_tmp_manifest_index, tmp_manifest_index_path
 from pipeline.resource_staging import (
@@ -626,7 +629,11 @@ def _stage_ttf_replacements(cfg, destination_root: Path) -> int:
     return copied
 
 
-def build_import_overlay(cfg, selection: set[str]) -> Path | None:
+def build_import_overlay(
+    cfg,
+    selection: set[str],
+    not_imported_images: list[Path] | None = None,
+) -> Path | None:
     overlay_root = cfg.root_dir / "workspace" / "temp" / "selected_import_overlay"
     if overlay_root.exists():
         shutil.rmtree(overlay_root)
@@ -654,6 +661,7 @@ def build_import_overlay(cfg, selection: set[str]) -> Path | None:
                 cfg.root_dir,
                 cfg.resource_input_root,
                 cfg.image_import_dir,
+                not_imported_images,
             )
         except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
             print(f"\033[91m[图片导入][停止] 自动恢复目录结构失败: {exc}\033[0m")
@@ -846,7 +854,12 @@ def main() -> int:
                 print("无效选择，请重新运行并输入 1、2、3、4、5、a 或 q。")
                 print()
                 return 1
-            replacement_root = build_import_overlay(cfg, selection)
+            not_imported_images: list[Path] = []
+            replacement_root = build_import_overlay(
+                cfg,
+                selection,
+                not_imported_images,
+            )
             if replacement_root is None:
                 print("未找到可导入的替换文件，本次未执行导入。")
                 print()
@@ -880,6 +893,8 @@ def main() -> int:
                 )
                 prepare_split_sync_outputs(cfg, import_result_root, restored_paths)
                 print_final_addressables_sync_reminder(cfg, import_result_root)
+            if "image" in selection:
+                print_not_imported_images(not_imported_images)
             return result
         if choice in {"q", "quit", "exit"}:
             return 0

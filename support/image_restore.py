@@ -6,6 +6,23 @@ from pathlib import Path
 from support.image_import_utils import copy_image_for_import
 
 
+def _print_red(message: str) -> None:
+    print(f"\033[91m{message}\033[0m", flush=True)
+
+
+def print_not_imported_images(paths: list[Path]) -> None:
+    unique_paths = sorted(
+        {Path(path) for path in paths},
+        key=lambda path: str(path).lower(),
+    )
+    if not unique_paths:
+        print("\033[92m[图片导入][未导入图片] 无。\033[0m", flush=True)
+        return
+    _print_red(f"[图片导入][未导入图片] 共 {len(unique_paths)} 张:")
+    for path in unique_paths:
+        _print_red(f"  - {path}")
+
+
 def load_allpng_map(map_path: Path) -> list[dict[str, str]]:
     if not map_path.is_file():
         raise FileNotFoundError(f"映射文件不存在: {map_path}")
@@ -18,7 +35,12 @@ def load_allpng_map(map_path: Path) -> list[dict[str, str]]:
     return [item for item in items if isinstance(item, dict)]
 
 
-def restore_images_to_import(edited_root: Path, to_import_root: Path, map_path: Path) -> int:
+def restore_images_to_import(
+    edited_root: Path,
+    to_import_root: Path,
+    map_path: Path,
+    imported_images: set[Path] | None = None,
+) -> int:
     restored = 0
     missing = 0
     items = load_allpng_map(map_path)
@@ -38,6 +60,8 @@ def restore_images_to_import(edited_root: Path, to_import_root: Path, map_path: 
 
         target_path = to_import_root / Path(original_relative_path)
         copy_image_for_import(edited_path, target_path)
+        if imported_images is not None:
+            imported_images.add(edited_path.resolve())
         restored += 1
         print(f"[图片恢复] {edited_path} -> {target_path}")
 
@@ -72,6 +96,7 @@ def restore_split_sprites_to_import(
     to_import_root: Path,
     sprite_map_path: Path,
     source_root: Path,
+    imported_images: set[Path] | None = None,
 ) -> tuple[int, int, int]:
     """Patch edited Unity Sprite/NGUI UIAtlas PNGs into original Texture2D atlases."""
     from PIL import Image
@@ -94,7 +119,7 @@ def restore_split_sprites_to_import(
             continue
         if not isinstance(rect, dict):
             invalid += 1
-            print(f"[图集回拼][跳过] 缺少矩形数据: {flat_name}")
+            _print_red(f"[图集回拼][跳过] 缺少矩形数据: {flat_name}")
             continue
         texture_path = Path(texture_png)
         key = str(texture_path.resolve()).lower()
@@ -112,20 +137,20 @@ def restore_split_sprites_to_import(
             relative_texture_path = texture_path.relative_to(source_root)
         except ValueError:
             invalid += len(group["sprites"])
-            print(f"[图集回拼][跳过] 原图集不在 workspace/input 中: {texture_path}")
+            _print_red(f"[图集回拼][跳过] 原图集不在 workspace/input 中: {texture_path}")
             continue
         target_path = to_import_root / relative_texture_path
         base_path = target_path if target_path.is_file() else texture_path
         if not base_path.is_file():
             invalid += len(group["sprites"])
-            print(f"[图集回拼][跳过] 找不到原始 Texture2D: {texture_path}")
+            _print_red(f"[图集回拼][跳过] 找不到原始 Texture2D: {texture_path}")
             continue
         try:
             with Image.open(base_path) as opened_atlas:
                 atlas = opened_atlas.convert("RGBA")
         except Exception as exc:
             invalid += len(group["sprites"])
-            print(f"[图集回拼][跳过] 无法读取原始 Texture2D {base_path}: {exc}")
+            _print_red(f"[图集回拼][跳过] 无法读取原始 Texture2D {base_path}: {exc}")
             continue
 
         atlas_patched = 0
@@ -140,18 +165,18 @@ def restore_split_sprites_to_import(
             expected_size = (height, width) if rotation == 4 else (width, height)
             if width <= 0 or height <= 0:
                 invalid += 1
-                print(f"[图集回拼][跳过] 矩形尺寸无效: {edited_path.name}")
+                _print_red(f"[图集回拼][跳过] 矩形尺寸无效: {edited_path.name}")
                 continue
             try:
                 with Image.open(edited_path) as opened_sprite:
                     sprite = opened_sprite.convert("RGBA")
             except Exception as exc:
                 invalid += 1
-                print(f"[图集回拼][跳过] 无法读取子图 {edited_path.name}: {exc}")
+                _print_red(f"[图集回拼][跳过] 无法读取子图 {edited_path.name}: {exc}")
                 continue
             if sprite.size != expected_size:
                 invalid += 1
-                print(
+                _print_red(
                     f"[图集回拼][跳过] {edited_path.name} 尺寸={sprite.size[0]}x{sprite.size[1]}，"
                     f"应为={expected_size[0]}x{expected_size[1]}"
                 )
@@ -159,19 +184,21 @@ def restore_split_sprites_to_import(
             sprite = _undo_sprite_packing(sprite, rotation)
             if sprite.size != (width, height):
                 invalid += 1
-                print(f"[图集回拼][跳过] 还原 packing rotation 后尺寸异常: {edited_path.name}")
+                _print_red(f"[图集回拼][跳过] 还原 packing rotation 后尺寸异常: {edited_path.name}")
                 continue
             # Unity Sprite textureRect uses a bottom-left origin; NGUI UIAtlas
             # mSprites stores y from the top edge of the atlas.
             top = y if is_ngui else atlas.height - y - height
             if x < 0 or top < 0 or x + width > atlas.width or top + height > atlas.height:
                 invalid += 1
-                print(f"[图集回拼][跳过] 子图矩形超出原图集: {edited_path.name}")
+                _print_red(f"[图集回拼][跳过] 子图矩形超出原图集: {edited_path.name}")
                 continue
             # 透明像素也必须覆盖原区域，否则旧图会从透明处残留。
             atlas.paste(sprite, (x, top))
             atlas_patched += 1
             patched_sprites += 1
+            if imported_images is not None:
+                imported_images.add(edited_path.resolve())
             print(
                 f"[图集回拼] {edited_path.name} -> {relative_texture_path} "
                 f"({x}, {y}, {width}, {height})"
@@ -191,6 +218,7 @@ def restore_edited_images_before_import(
     root_dir: Path,
     source_root: Path,
     to_import_root: Path,
+    not_imported_images: list[Path] | None = None,
 ) -> tuple[int, int, int, int]:
     """Restore flat edited images immediately before the image import overlay is built."""
     all_image_root = root_dir / "workspace" / "AllPNG"
@@ -221,9 +249,15 @@ def restore_edited_images_before_import(
             )
 
     print("[图片导入] 正在自动恢复修改图片的目录结构并回拼 Sprite 图集...", flush=True)
+    imported_images: set[Path] = set()
     restored = 0
     if image_map_path.is_file():
-        restored = restore_images_to_import(edited_root, to_import_root, image_map_path)
+        restored = restore_images_to_import(
+            edited_root,
+            to_import_root,
+            image_map_path,
+            imported_images,
+        )
     else:
         print("[图片恢复] 修改目录中只有已映射的 Sprite 子图，跳过普通图片恢复。")
 
@@ -236,6 +270,7 @@ def restore_edited_images_before_import(
             to_import_root,
             sprite_map_path,
             source_root,
+            imported_images,
         )
     else:
         print("[图集回拼] 未找到 Sprite 映射，跳过拆分子图回拼；如需回拼请先执行工具脚本菜单 2。")
@@ -244,4 +279,8 @@ def restore_edited_images_before_import(
         f"[图片导入] 自动恢复完成：普通图片={restored}，回拼子图={patched_sprites}，"
         f"生成图集={rebuilt_atlases}，无效子图={invalid}。"
     )
+    if not_imported_images is not None:
+        not_imported_images.extend(
+            path for path in edited_paths if path.resolve() not in imported_images
+        )
     return restored, patched_sprites, rebuilt_atlases, invalid

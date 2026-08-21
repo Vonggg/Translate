@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from PIL import Image
@@ -128,11 +130,16 @@ class SplitSpriteReassemblyTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            self.assertEqual(
-                restore_split_sprites_to_import(
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = restore_split_sprites_to_import(
                     edited_root, root / "ToImport", sprite_map, source_root
-                ),
-                (0, 0, 1),
+                )
+
+            self.assertEqual(result, (0, 0, 1))
+            self.assertIn(
+                "\033[91m[图集回拼][跳过] Wrong.png 尺寸=3x3，应为=2x2\033[0m",
+                output.getvalue(),
             )
 
     def test_ngui_sprite_uses_top_left_atlas_coordinates(self) -> None:
