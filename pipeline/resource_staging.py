@@ -39,7 +39,7 @@ def _log_orange(message: str) -> None:
 
 
 def resource_state_root(cfg: PipelineConfig) -> Path:
-    return cfg.root_dir / "workspace" / "resource_state"
+    return cfg.workspace_root / "resource_state"
 
 
 def resource_source_map_path(cfg: PipelineConfig) -> Path:
@@ -127,8 +127,7 @@ def _reusable_staging_root(
         return None
     if state.get("source_fingerprint") != source_fingerprint:
         return None
-    staging_value = state.get("staging_root")
-    staging_root = Path(staging_value) if isinstance(staging_value, str) else cfg.resource_staging_root
+    staging_root = _resolve_staging_root_from_state(cfg, state, state_path)
     if not staging_root.is_dir():
         return None
     entries = state.get("entries")
@@ -137,8 +136,8 @@ def _reusable_staging_root(
     for entry in entries:
         if not isinstance(entry, dict):
             return None
-        staged_path = entry.get("staged_path")
-        if not isinstance(staged_path, str) or not Path(staged_path).is_file():
+        staged_relative = entry.get("staged_relative")
+        if not isinstance(staged_relative, str) or not (staging_root / staged_relative).is_file():
             return None
     return staging_root
 
@@ -146,6 +145,70 @@ def _reusable_staging_root(
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _resolve_staging_root_from_state(
+    cfg: PipelineConfig,
+    state: dict[str, Any],
+    state_path: Path | None = None,
+) -> Path:
+    """Resolve and, when safe, migrate an absolute staging path in old state.
+
+    Resource maps written before project-specific workspaces contain absolute
+    ``workspace/input_sources`` paths.  When the whole workspace is moved to
+    ``workspace<project_name>``, the files move with it but those recorded
+    paths do not. Prefer the configured staging directory when it exists and
+    rebase every derived path by ``staged_relative``.
+    """
+
+    configured_root = cfg.resource_staging_root.resolve()
+    staging_value = state.get("staging_root")
+    recorded_root: Path | None = None
+    if isinstance(staging_value, str) and staging_value.strip():
+        recorded_root = Path(staging_value)
+        if not recorded_root.is_absolute():
+            recorded_root = cfg.root_dir / recorded_root
+        recorded_root = recorded_root.resolve()
+
+    workspace_root = cfg.workspace_root.resolve()
+    recorded_in_current_workspace = False
+    if recorded_root is not None:
+        try:
+            recorded_root.relative_to(workspace_root)
+            recorded_in_current_workspace = True
+        except ValueError:
+            pass
+
+    if configured_root.is_dir():
+        staging_root = configured_root
+    elif recorded_root is not None and (
+        recorded_root == configured_root or recorded_in_current_workspace
+    ):
+        staging_root = recorded_root
+    else:
+        staging_root = configured_root
+
+    if recorded_root == staging_root:
+        return staging_root
+    if staging_root != configured_root or not configured_root.is_dir():
+        return staging_root
+
+    state["staging_root"] = str(configured_root)
+    entries = state.get("entries")
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            staged_relative = entry.get("staged_relative")
+            if isinstance(staged_relative, str) and staged_relative:
+                entry["staged_path"] = str(configured_root / staged_relative)
+    if state_path is not None:
+        _write_json(state_path, state)
+    _log_blue(
+        f"[资源暂存] 已将旧工作区路径映射迁移到当前项目: "
+        f"{recorded_root or '(未记录)'} -> {configured_root}"
+    )
+    return staging_root
 
 
 def _game_root(cfg: PipelineConfig) -> Path:
@@ -730,8 +793,10 @@ def load_prepared_resource_source(cfg: PipelineConfig) -> Path | None:
     except Exception as exc:
         print(f"[资源暂存][停止] 路径映射读取失败: {exc}")
         return None
-    staging_value = state.get("staging_root") if isinstance(state, dict) else None
-    staging_root = Path(staging_value) if isinstance(staging_value, str) else cfg.resource_staging_root
+    if not isinstance(state, dict):
+        print(f"[资源暂存][停止] 路径映射结构异常: {map_path}")
+        return None
+    staging_root = _resolve_staging_root_from_state(cfg, state, map_path)
     if not staging_root.is_dir():
         print(f"[资源暂存][停止] 统一资源目录不存在，请重新执行一键导出: {staging_root}")
         return None

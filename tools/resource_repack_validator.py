@@ -14,6 +14,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from support.config import load_config
+from pipeline.resource_staging import load_prepared_resource_source
 
 
 CLI_PROJECT = SCRIPT_DIR / "AssetPipeline_CLI" / "UnityResourceCLI" / "UnityResourceCLI.csproj"
@@ -112,7 +113,7 @@ def _prepare_candidates(
     candidate_root: Path,
 ) -> tuple[Path, int]:
     staging_value = state.get("staging_root")
-    source_root = Path(str(staging_value)) if staging_value else SCRIPT_DIR / "workspace" / "input_sources"
+    source_root = Path(str(staging_value)) if staging_value else final_root.parent / "input_sources"
     if not source_root.is_dir():
         raise FileNotFoundError(f"原始资源缓存不存在，请重新执行一键导出: {source_root}")
 
@@ -141,14 +142,18 @@ def _prepare_candidates(
 
 def run_resource_repack_validation() -> int:
     cfg = load_config()
-    workspace = cfg.root_dir / "workspace"
+    workspace = cfg.workspace_root
     source_map = workspace / "resource_state" / "resource_source_map.json"
     final_root = workspace / "FinalResult"
-    report_path = workspace / "records" / "resource_repack_validation.json"
-    log_path = workspace / "logs" / "资源重打验证.log"
+    report_path = cfg.record_dir / "resource_repack_validation.json"
+    log_path = cfg.log_dir / "资源重打验证.log"
 
     try:
         state = _load_source_map(source_map)
+        source_root = load_prepared_resource_source(cfg)
+        if source_root is None:
+            raise FileNotFoundError("原始资源缓存不存在，请重新执行一键导出。")
+        state["staging_root"] = str(source_root)
         if not final_root.is_dir():
             raise FileNotFoundError(f"FinalResult 不存在，请先执行一键导入: {final_root}")
         (workspace / "temp").mkdir(parents=True, exist_ok=True)
@@ -162,11 +167,13 @@ def run_resource_repack_validation() -> int:
                 raise RuntimeError("FinalResult 中没有找到可与原始缓存配对的修改资源。")
 
             print(f"[资源验证] 已配对修改资源: {prepared} 个")
+            artifacts_root = workspace / "temp" / "dotnet_artifacts"
             command = [
-                "dotnet", "run", "--project", str(CLI_PROJECT), "-c", "Release", "--no-restore", "--",
+                "dotnet", "run", "--project", str(CLI_PROJECT), "-c", "Release",
+                "--artifacts-path", str(artifacts_root), "--",
                 "verify",
                 "--source", str(source_root),
-                "--work", str(workspace / "records"),
+                "--work", str(cfg.record_dir),
                 "--result-root", str(candidate_root),
                 "--managed", str(cfg.resource_managed_root),
                 "--report", str(report_path),

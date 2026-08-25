@@ -14,6 +14,7 @@ from typing import Any, Iterable
 import lz4.block
 
 from support.config import PipelineConfig
+from support.process_lock import interprocess_file_lock
 from tools.catalog_bin_tool import (
     parse_catalog_file as parse_binary_catalog_file,
     repack_binary_catalog_from_legacy_output,
@@ -557,7 +558,7 @@ def _source_catalog_android_root(cfg: PipelineConfig) -> Path:
 
 
 def _sample_root(cfg: PipelineConfig) -> Path:
-    return cfg.root_dir / "样本"
+    return cfg.sample_root
 
 
 def _copy_if_exists(source: Path, destination: Path) -> None:
@@ -812,6 +813,16 @@ def validate_catalog_crc_algorithm(
 
 
 def export_bundle_crc_with_unity(cfg: PipelineConfig, bundle_root: Path, output_path: Path) -> dict[str, int]:
+    lock_path = cfg.unity_font_project / ".translate-unity.lock"
+    with interprocess_file_lock(lock_path, label="Catalog CRC排队"):
+        return _export_bundle_crc_with_unity_locked(cfg, bundle_root, output_path)
+
+
+def _export_bundle_crc_with_unity_locked(
+    cfg: PipelineConfig,
+    bundle_root: Path,
+    output_path: Path,
+) -> dict[str, int]:
     launcher = cfg.unity_font_project / "Tools" / "export_bundle_crc.py"
     if not launcher.is_file():
         print(f"[catalog] Unity CRC launcher 不存在，跳过: {launcher}")
@@ -834,6 +845,8 @@ def export_bundle_crc_with_unity(cfg: PipelineConfig, bundle_root: Path, output_
         str(cfg.unity_exe),
         "--project-root",
         str(cfg.unity_font_project),
+        "--log-file",
+        str(cfg.log_dir / "bundle_crc_unity.log"),
     ]
     print("[catalog] 正在调用 Unity 计算最终 bundle CRC...", flush=True)
     result = subprocess.run(command, check=False)
@@ -1107,12 +1120,8 @@ def auto_patch_and_repack_catalog_after_import(
     _log_green(f"[catalog] Output.json 自动修正前备份: {backup_path}")
 
     catalog_source = cfg.catalog_source_path
-    remote_report_path = (
-        cfg.root_dir
-        / "workspace"
-        / "resource_state"
-        / "addressables_remote_resources.json"
-    )
+    workspace_root = getattr(cfg, "workspace_root", cfg.root_dir / "workspace")
+    remote_report_path = workspace_root / "resource_state" / "addressables_remote_resources.json"
     localized_internal_id_count = 0
     source_catalog_modified = False
     if remote_report_path.is_file():

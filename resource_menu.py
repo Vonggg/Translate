@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
 import shutil
 from pathlib import Path
 
-from support.config import load_config
+from support.config import activate_config_path, load_config
 from support.image_restore import (
     print_not_imported_images,
     restore_edited_images_before_import,
@@ -30,12 +31,21 @@ def prompt_input(message: str) -> str:
     return input(f"\033[38;5;208m{message}\033[0m")
 
 
+def _activate_entry_config(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", type=Path)
+    options, _ = parser.parse_known_args(argv)
+    if options.config is not None:
+        activate_config_path(options.config)
+
+
 def log_source_modified(message: str) -> None:
     print(f"\033[38;5;208m[源文件已修改] {message}\033[0m", flush=True)
 
 
 def workspace_root(cfg) -> Path:
-    return cfg.root_dir / "workspace"
+    configured = getattr(cfg, "workspace_root", None)
+    return Path(configured) if configured is not None else cfg.root_dir / "workspace"
 
 
 def workspace_temp_root(cfg) -> Path:
@@ -124,6 +134,7 @@ def run_pipeline(
     verbose_export_assets: bool = False,
     import_workers: int = 0,
     save_samples: bool = False,
+    sample_root: Path | None = None,
 ) -> int:
     command = [
         sys.executable,
@@ -146,6 +157,8 @@ def run_pipeline(
         command.extend(["--replacement-root", str(replacement_root)])
     if result_root is not None:
         command.extend(["--result-root", str(result_root)])
+    if sample_root is not None:
+        command.extend(["--sample-root", str(sample_root)])
     if mode == "export":
         command.extend(["--export-profile", export_profile])
         command.extend(["--export-workers", str(max(0, export_workers))])
@@ -318,6 +331,7 @@ def print_monobehaviour_export_summary(input_root: Path) -> None:
     total = 0
     custom = 0
     base_only = 0
+    preserved = 0
     failed = 0
     manifest_count = 0
     for manifest_path in sorted(input_root.rglob("manifest.json")):
@@ -335,14 +349,20 @@ def print_monobehaviour_export_summary(input_root: Path) -> None:
             total += int(summary.get("Total", 0) or 0)
             custom += int(summary.get("WithCustomFields", 0) or 0)
             base_only += int(summary.get("BaseOnly", 0) or 0)
+            preserved += int(summary.get("Preserved", 0) or 0)
             failed += int(summary.get("Failed", 0) or 0)
     if total == 0:
         print("[导出] UnityResourceCLI MonoBehaviour 展开统计: 未发现 MonoBehaviour。")
         return
     print(
         f"[导出] UnityResourceCLI MonoBehaviour 展开统计: manifest={manifest_count}, total={total}, "
-        f"custom={custom}, baseOnly={base_only}, failed={failed}"
+        f"custom={custom}, baseOnly={base_only}, preserved={preserved}, failed={failed}"
     )
+    if preserved > 0:
+        print(
+            f"[导出] 提示: {preserved} 个 MonoBehaviour 因模板信息不足或结构不匹配未导出，"
+            "原始对象会被保留。"
+        )
     if custom == 0:
         print("[导出] 提示: UnityResourceCLI 未展开业务字段；若 AssetStudio 回填成功，以实际 JSON 统计为准。")
 
@@ -634,7 +654,7 @@ def build_import_overlay(
     selection: set[str],
     not_imported_images: list[Path] | None = None,
 ) -> Path | None:
-    overlay_root = cfg.root_dir / "workspace" / "temp" / "selected_import_overlay"
+    overlay_root = workspace_temp_root(cfg) / "selected_import_overlay"
     if overlay_root.exists():
         shutil.rmtree(overlay_root)
     overlay_root.mkdir(parents=True, exist_ok=True)
@@ -658,7 +678,7 @@ def build_import_overlay(
     if "image" in selection:
         try:
             restore_edited_images_before_import(
-                cfg.root_dir,
+                workspace_root(cfg),
                 cfg.resource_input_root,
                 cfg.image_import_dir,
                 not_imported_images,
@@ -691,7 +711,7 @@ def _has_files(root: Path) -> bool:
 
 
 def build_filtered_import_work_root(cfg, replacement_root: Path) -> Path | None:
-    work_root = cfg.root_dir / "workspace" / "temp" / "selected_import_work"
+    work_root = workspace_temp_root(cfg) / "selected_import_work"
     if work_root.exists():
         shutil.rmtree(work_root)
     work_root.mkdir(parents=True, exist_ok=True)
@@ -791,12 +811,14 @@ def prompt_export_profile() -> str | None:
 
 
 def main() -> int:
+    _activate_entry_config(sys.argv[1:])
     cfg = load_config()
     input_root = cfg.resource_input_root
     managed_root = cfg.resource_managed_root
     replacement_root = cfg.import_overlay_dir
-    import_result_root = cfg.root_dir / "workspace" / "FinalResult"
+    import_result_root = workspace_root(cfg) / "FinalResult"
     log_dir = cfg.log_dir
+    print(f"当前项目工作区: {workspace_root(cfg)}")
 
     while True:
         print_menu()
@@ -805,7 +827,8 @@ def main() -> int:
             export_profile = prompt_export_profile()
             if export_profile is None:
                 print("已取消导出。")
-                return 0
+                print()
+                continue
             if not export_profile:
                 return 1
             root = workspace_root(cfg)
@@ -849,7 +872,7 @@ def main() -> int:
             if selection is None:
                 print("已取消导入。")
                 print()
-                return 0
+                continue
             if not selection:
                 print("无效选择，请重新运行并输入 1、2、3、4、5、a 或 q。")
                 print()
@@ -881,6 +904,7 @@ def main() -> int:
                 import_result_root,
                 import_workers=cfg.max_import_workers,
                 save_samples=cfg.enable_sample_collection,
+                sample_root=cfg.sample_root,
             )
             if result == 0:
                 restored_paths = restore_imported_resource_paths(cfg, import_result_root)

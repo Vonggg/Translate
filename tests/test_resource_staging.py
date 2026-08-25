@@ -13,6 +13,7 @@ from pipeline.resource_staging import (
     _write_split_parts_next_to_merged,
     _build_remote_downloads,
     inspect_and_download_catalog_resources,
+    load_prepared_resource_source,
     prepare_split_sync_outputs,
     prepare_unified_resource_source,
     print_final_addressables_sync_reminder,
@@ -24,6 +25,90 @@ from support.config import load_config
 
 
 class ResourceStagingTests(unittest.TestCase):
+    def test_old_absolute_staging_map_rebases_to_project_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tool_root = root / "tool"
+            old_staging_root = tool_root / "workspace" / "input_sources"
+            current_staging_root = tool_root / "workspaceDemo" / "input_sources"
+            staged_relative = Path("aa") / "Android" / "demo.bundle"
+            current_file = current_staging_root / staged_relative
+            current_file.parent.mkdir(parents=True)
+            current_file.write_bytes(b"bundle")
+
+            cfg = replace(
+                load_config(),
+                root_dir=tool_root,
+                project_name="Demo",
+                resource_staging_root=current_staging_root,
+            )
+            map_path = resource_source_map_path(cfg)
+            map_path.parent.mkdir(parents=True)
+            map_path.write_text(
+                json.dumps(
+                    {
+                        "state_version": 2,
+                        "staging_root": str(old_staging_root),
+                        "entries": [
+                            {
+                                "staged_relative": str(staged_relative),
+                                "staged_path": str(old_staging_root / staged_relative),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                resolved = load_prepared_resource_source(cfg)
+
+            self.assertEqual(resolved, current_staging_root)
+            migrated = json.loads(map_path.read_text(encoding="utf-8"))
+            self.assertEqual(Path(migrated["staging_root"]), current_staging_root)
+            self.assertEqual(
+                Path(migrated["entries"][0]["staged_path"]),
+                current_file,
+            )
+            self.assertIn("旧工作区路径映射迁移到当前项目", output.getvalue())
+
+    def test_project_workspace_does_not_fall_back_to_other_workspace_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tool_root = root / "tool"
+            old_staging_root = tool_root / "workspace" / "input_sources"
+            old_staging_root.mkdir(parents=True)
+            (old_staging_root / "old.bundle").write_bytes(b"other-project")
+            current_staging_root = tool_root / "workspaceDemo" / "input_sources"
+
+            cfg = replace(
+                load_config(),
+                root_dir=tool_root,
+                project_name="Demo",
+                resource_staging_root=current_staging_root,
+            )
+            map_path = resource_source_map_path(cfg)
+            map_path.parent.mkdir(parents=True)
+            map_path.write_text(
+                json.dumps(
+                    {
+                        "state_version": 2,
+                        "staging_root": str(old_staging_root),
+                        "entries": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                resolved = load_prepared_resource_source(cfg)
+
+            self.assertIsNone(resolved)
+            self.assertIn(str(current_staging_root), output.getvalue())
+            self.assertNotIn("旧工作区路径映射迁移到当前项目", output.getvalue())
+
     def test_split_output_preserves_fixed_boundaries_and_verifies_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

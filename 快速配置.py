@@ -569,6 +569,8 @@ def main() -> int:
         "stringliteral_json_subpath", "python_executable", "unity_exe",
     ):
         print(f"  {key}: {config.get(key, '')}")
+    project_name = str(config.get("project_name", "") or "").strip()
+    print(f"  实际工作区目录: {ROOT_DIR / f'workspace{project_name}'}")
     checks = validate_config(config)
     print_checks(checks)
     if not all(check.ok for check in checks if check.required):

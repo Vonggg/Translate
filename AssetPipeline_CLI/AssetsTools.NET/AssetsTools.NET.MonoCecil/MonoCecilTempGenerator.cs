@@ -1,5 +1,6 @@
 ﻿using Mono.Cecil;
 using Mono.Cecil.Rocks;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -82,59 +83,146 @@ namespace AssetsTools.NET.Extra
             string assemblyName = Path.GetFileName(path);
             lock (loadedAssemblies)
             {
-                if (loadedAssemblies.ContainsKey(assemblyName))
+                if (loadedAssemblies.TryGetValue(assemblyName, out AssemblyDefinition loadedAssembly)
+                    && loadedAssembly != null)
                 {
-                    return loadedAssemblies[assemblyName];
+                    return loadedAssembly;
                 }
 
-                loadedAssemblies[assemblyName] = null;
+                DefaultAssemblyResolver resolver = new DefaultAssemblyResolver();
+                resolver.AddSearchDirectory(Path.GetDirectoryName(path));
+
+                ReaderParameters readerParameters = new ReaderParameters()
+                {
+                    AssemblyResolver = resolver
+                };
+
+                try
+                {
+                    AssemblyDefinition asmDef = AssemblyDefinition.ReadAssembly(path, readerParameters);
+                    loadedAssemblies[assemblyName] = asmDef;
+                    return asmDef;
+                }
+                catch
+                {
+                    loadedAssemblies.Remove(assemblyName);
+                    resolver.Dispose();
+                    throw;
+                }
             }
-
-            DefaultAssemblyResolver resolver = new DefaultAssemblyResolver();
-            resolver.AddSearchDirectory(Path.GetDirectoryName(path));
-
-            ReaderParameters readerParameters = new ReaderParameters()
-            {
-                AssemblyResolver = resolver
-            };
-
-            AssemblyDefinition asmDef = AssemblyDefinition.ReadAssembly(path, readerParameters);
-            lock (loadedAssemblies)
-            {
-                loadedAssemblies[assemblyName] = asmDef;
-            }
-
-            return asmDef;
         }
 
         private void RecursiveTypeLoad(
             ModuleDefinition module, string nameSpace, string typeName, List<AssetTypeTemplateField> attf,
             int availableDepth, ref bool usingManagedReference)
         {
-            // TypeReference needed for TypeForwardedTo in UnityEngine (and others)
-            TypeReference typeRef;
             TypeDefinition type;
 
             if (typeName.Contains('/'))
             {
                 string[] types = typeName.Split('/');
-                type = new TypeReference(nameSpace, types[0], module, module).Resolve();
+                type = ResolveTopLevelType(module, nameSpace, types[0]);
                 for (int i = 1; i < types.Length; i++)
                 {
-                    typeRef = new TypeReference("", types[i], module, module)
+                    TypeDefinition nestedType = type.NestedTypes.FirstOrDefault(
+                        candidate => candidate.Name == types[i]
+                    );
+                    if (nestedType == null)
                     {
-                        DeclaringType = type
-                    };
-                    type = typeRef.Resolve();
+                        throw new TypeLoadException(
+                            $"Unable to resolve nested managed type '{type.FullName}/{types[i]}'."
+                        );
+                    }
+                    type = nestedType;
                 }
             }
             else
             {
-                typeRef = new TypeReference(nameSpace, typeName, module, module);
-                type = typeRef.Resolve();
+                type = ResolveTopLevelType(module, nameSpace, typeName);
             }
 
             RecursiveTypeLoad(type, attf, availableDepth, true, ref usingManagedReference);
+        }
+
+        private TypeDefinition ResolveTopLevelType(
+            ModuleDefinition module, string nameSpace, string typeName)
+        {
+            TypeDefinition type = module.GetType(nameSpace, typeName);
+            if (type != null)
+            {
+                return type;
+            }
+
+            // Real CLR facade assemblies normally expose forwarded types here.
+            ExportedType exportedType = module.ExportedTypes.FirstOrDefault(
+                candidate => candidate.Namespace == nameSpace && candidate.Name == typeName
+            );
+            if (exportedType != null)
+            {
+                try
+                {
+                    type = exportedType.Resolve();
+                }
+                catch (ResolutionException)
+                {
+                    type = null;
+                }
+                if (type != null)
+                {
+                    return type;
+                }
+            }
+
+            // Il2CppDumper commonly emits an empty UnityEngine.dll facade without
+            // ExportedTypes. The real types still live in UnityEngine.*Module.dll.
+            if (module.Assembly?.Name?.Name == "UnityEngine" && Directory.Exists(managedPath))
+            {
+                TypeDefinition relocatedType = null;
+                foreach (string candidatePath in Directory.EnumerateFiles(
+                    managedPath,
+                    "UnityEngine.*Module.dll",
+                    SearchOption.TopDirectoryOnly
+                ).OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        AssemblyDefinition candidateAssembly = GetAssemblyWithDependencies(candidatePath);
+                        TypeDefinition candidateType = candidateAssembly.MainModule.GetType(nameSpace, typeName);
+                        if (candidateType == null)
+                        {
+                            continue;
+                        }
+                        if (relocatedType != null)
+                        {
+                            throw new TypeLoadException(
+                                $"Managed type '{nameSpace}.{typeName}' exists in multiple Unity modules."
+                            );
+                        }
+                        relocatedType = candidateType;
+                    }
+                    catch (Exception exception) when (
+                        exception is ResolutionException ||
+                        exception is BadImageFormatException ||
+                        exception is IOException
+                    )
+                    {
+                        // Optional or malformed modules must not stop the remaining
+                        // exact-name candidates from being checked.
+                    }
+                }
+                if (relocatedType != null)
+                {
+                    return relocatedType;
+                }
+            }
+
+            string fullName = string.IsNullOrEmpty(nameSpace)
+                ? typeName
+                : $"{nameSpace}.{typeName}";
+            throw new TypeLoadException(
+                $"Unable to resolve managed type '{fullName}' in assembly " +
+                $"'{module.Assembly?.Name?.Name ?? module.Name}'."
+            );
         }
 
         private void RecursiveTypeLoad(
@@ -283,6 +371,15 @@ namespace AssetsTools.NET.Extra
                         !f.HasConstant) // field is not public, has exception attribute, readonly, or const
                     {
                         TypeDefWithSelfRef solidifiedFieldType = parentType.SolidifyType(f.FieldType);
+
+                        // Unity serializes only SZARRAY (single-dimensional, zero-based)
+                        // arrays. A public multidimensional array in an IL2CPP dummy DLL
+                        // is not present in the serialized payload; accepting it shifts
+                        // every following field and eventually reads past the object.
+                        if (solidifiedFieldType.typeRef is ArrayType arrayType && !arrayType.IsVector)
+                        {
+                            continue;
+                        }
 
                         if (TryGetListOrArrayElement(solidifiedFieldType, out TypeDefWithSelfRef elemType))
                         {

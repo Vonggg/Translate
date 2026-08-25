@@ -215,13 +215,13 @@ def restore_split_sprites_to_import(
 
 
 def restore_edited_images_before_import(
-    root_dir: Path,
+    workspace_root: Path,
     source_root: Path,
     to_import_root: Path,
     not_imported_images: list[Path] | None = None,
 ) -> tuple[int, int, int, int]:
     """Restore flat edited images immediately before the image import overlay is built."""
-    all_image_root = root_dir / "workspace" / "AllPNG"
+    all_image_root = workspace_root / "AllPNG"
     edited_root = all_image_root / "修改后的图片目录"
     edited_paths = sorted(path for path in edited_root.rglob("*") if path.is_file()) if edited_root.is_dir() else []
     if not edited_paths:

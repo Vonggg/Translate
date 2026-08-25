@@ -4,6 +4,7 @@ using AssetsTools.NET.Texture;
 using Newtonsoft.Json.Linq;
 using StbImageSharp;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -18,7 +19,7 @@ namespace UnityResourceCLI
 {
     internal sealed class ResourcePipeline
     {
-        private const int ExportManifestSchemaVersion = 4;
+        private const int ExportManifestSchemaVersion = 5;
         private const long ExportProgressInterval = 10_000;
         private const int LargeReplacementSpoolThreshold = 8 * 1024 * 1024;
         private bool legacyManifestReferenceWarningShown;
@@ -138,6 +139,11 @@ namespace UnityResourceCLI
                     worker.ExportFile(sourcePath);
                 }
                 progress.LogFinal();
+                if (progress.HasCriticalFailure)
+                {
+                    LogRed("Export stopped: one or more asset byte ranges are outside the source file.");
+                    return 2;
+                }
                 Log($"Export finished. Processed {serialProcessed} file(s).");
                 return 0;
             }
@@ -154,6 +160,11 @@ namespace UnityResourceCLI
             });
 
             progress.LogFinal();
+            if (progress.HasCriticalFailure)
+            {
+                LogRed("Export stopped: one or more asset byte ranges are outside the source file.");
+                return 2;
+            }
             Log($"Export finished. Processed {processed} file(s).");
             return 0;
         }
@@ -303,6 +314,11 @@ namespace UnityResourceCLI
             {
                 if (AreProfileOutputsReusable(sourceDir, previousManifest!, currentTypeNames, out string reuseReason))
                 {
+                    if (currentTypeNames.Contains(nameof(AssetClassID.MonoBehaviour)))
+                    {
+                        foreach (ExportManifestMonoBehaviourFailure failure in previousManifest!.MonoBehaviourFailures)
+                            exportProgress?.ReportMonoBehaviourFailure(failure, cached: true);
+                    }
                     Log(
                         $"  Reusing unchanged export profile(s): {string.Join(", ", requestedProfiles.OrderBy(value => value))}; " +
                         $"validated {previousManifest!.Items.Count(item => currentTypeNames.Contains(item.TypeName)):N0} item(s)."
@@ -339,7 +355,10 @@ namespace UnityResourceCLI
                     : new List<ExportManifestItem>(),
                 MonoBehaviourSummaries = canMerge && !currentTypeNames.Contains(nameof(AssetClassID.MonoBehaviour))
                     ? previousManifest!.MonoBehaviourSummaries
-                    : new List<ExportManifestMonoBehaviourSummary>()
+                    : new List<ExportManifestMonoBehaviourSummary>(),
+                MonoBehaviourFailures = canMerge && !currentTypeNames.Contains(nameof(AssetClassID.MonoBehaviour))
+                    ? previousManifest!.MonoBehaviourFailures
+                    : new List<ExportManifestMonoBehaviourFailure>()
             };
             if (canMerge)
                 Log($"  Incremental manifest: retained {manifest.Items.Count:N0} item(s), replacing {string.Join(", ", currentTypeNames.OrderBy(value => value))}.");
@@ -606,13 +625,26 @@ namespace UnityResourceCLI
 
                 foreach (AssetFileInfo info in infos)
                 {
-                    AssetTypeValueField? baseField = SafeGetBaseField(inst, info);
+                    ExportManifestMonoBehaviourFailure? monoFailure = null;
+                    AssetTypeValueField? baseField = type == AssetClassID.MonoBehaviour
+                        ? TryGetMonoBehaviourBaseFieldForExport(inst, info, out monoFailure)
+                        : SafeGetBaseField(inst, info);
                     if (baseField == null)
                     {
                         if (type == AssetClassID.MonoBehaviour)
                         {
                             monoSummary.Total++;
-                            monoSummary.Failed++;
+                            if (monoFailure != null)
+                            {
+                                if (IsRawObjectRangeInvalid(monoFailure))
+                                    monoSummary.Failed++;
+                                else
+                                    monoSummary.Preserved++;
+                                monoFailure.RelativeBase = manifestRelativeBase.Replace('\\', '/');
+                                monoFailure.BundleEntryName = bundleEntryName ?? "";
+                                manifest.MonoBehaviourFailures.Add(monoFailure);
+                                exportProgress?.ReportMonoBehaviourFailure(monoFailure, cached: false);
+                            }
                         }
                         exportProgress?.ReportItem();
                         continue;
@@ -713,13 +745,28 @@ namespace UnityResourceCLI
                 Log(
                     $"  MonoBehaviour summary ({(bundleEntryName ?? sourceStem)}): " +
                     $"total={monoSummary.Total}, custom={monoSummary.WithCustomFields}, " +
-                    $"baseOnly={monoSummary.BaseOnly}, failed={monoSummary.Failed}"
+                    $"baseOnly={monoSummary.BaseOnly}, preserved={monoSummary.Preserved}, " +
+                    $"failed={monoSummary.Failed}"
                 );
-                if (monoSummary.WithCustomFields == 0)
+                if (monoSummary.BaseOnly > 0 && monoSummary.WithCustomFields == 0)
                 {
                     Log(
                         "  WARNING: MonoBehaviour custom fields were not expanded. " +
                         "Only m_GameObject/m_Enabled/m_Script/m_Name were exported; translation scan may find no text."
+                    );
+                }
+                if (monoSummary.Preserved > 0)
+                {
+                    LogYellow(
+                        $"  MonoBehaviour 无法安全展开并保留原资源={monoSummary.Preserved}；" +
+                        "这些对象未导出，导入时会保留原资源。"
+                    );
+                }
+                if (monoSummary.Failed > 0)
+                {
+                    LogRed(
+                        $"  MonoBehaviour 对象字节范围越界={monoSummary.Failed}；" +
+                        "已确认源资源对象表指向文件范围之外，导出将返回失败。"
                     );
                 }
             }
@@ -1420,6 +1467,33 @@ namespace UnityResourceCLI
             if (baseField == null)
                 return null;
 
+            if (info.TypeId == (int)AssetClassID.MonoBehaviour)
+            {
+                long expandedSize;
+                try
+                {
+                    expandedSize = baseField.WriteToByteArray().LongLength;
+                }
+                catch (Exception exception)
+                {
+                    LogRed(
+                        $"      [MonoBehaviour][停止替换][已保留原资源] " +
+                        $"当前模板无法完整回写 PathID={info.PathId}: " +
+                        FormatDiagnosticException(exception)
+                    );
+                    return null;
+                }
+                if (expandedSize != info.ByteSize)
+                {
+                    LogRed(
+                        $"      [MonoBehaviour][停止替换][已保留原资源] " +
+                        $"当前模板只覆盖 {expandedSize}/{info.ByteSize} 字节，" +
+                        $"PathID={info.PathId}，拒绝用不完整 JSON 截断对象。"
+                    );
+                    return null;
+                }
+            }
+
             // GetTemplateBaseField only returns the built-in MonoBehaviour shell for
             // script-backed objects. GetBaseField expands that shell with the managed
             // script fields and exposes the exact template that was used to deserialize
@@ -1506,6 +1580,11 @@ namespace UnityResourceCLI
         private static void LogBlue(string message)
         {
             Console.WriteLine($"\u001b[94m[UnityResourceCLI] {message}\u001b[0m");
+        }
+
+        private static void LogYellow(string message)
+        {
+            Console.WriteLine($"\u001b[93m[UnityResourceCLI] {message}\u001b[0m");
         }
 
         private static void LogRed(string message)
@@ -1873,6 +1952,9 @@ namespace UnityResourceCLI
 
         private string ResolveSampleRoot()
         {
+            if (!string.IsNullOrWhiteSpace(options.SampleRoot))
+                return Path.GetFullPath(options.SampleRoot);
+
             string? dir = AppContext.BaseDirectory;
             while (!string.IsNullOrWhiteSpace(dir))
             {
@@ -1885,7 +1967,7 @@ namespace UnityResourceCLI
             DirectoryInfo? parent = Directory.GetParent(workRoot);
             while (parent != null)
             {
-                if (string.Equals(parent.Name, "workspace", StringComparison.OrdinalIgnoreCase) && parent.Parent != null)
+                if (parent.Name.StartsWith("workspace", StringComparison.OrdinalIgnoreCase) && parent.Parent != null)
                     return Path.Combine(parent.Parent.FullName, "样本");
                 parent = parent.Parent;
             }
@@ -2072,6 +2154,218 @@ namespace UnityResourceCLI
             }
         }
 
+        private AssetTypeValueField? TryGetMonoBehaviourBaseFieldForExport(
+            AssetsFileInstance inst,
+            AssetFileInfo info,
+            out ExportManifestMonoBehaviourFailure? failure
+        )
+        {
+            failure = null;
+            AssetTypeValueField? baseField;
+            try
+            {
+                baseField = am.GetBaseField(inst, info);
+            }
+            catch (Exception exception)
+            {
+                AssetTypeValueField? baseHeader = null;
+                Exception? baseHeaderException = null;
+                try
+                {
+                    baseHeader = am.GetBaseField(
+                        inst,
+                        info,
+                        AssetReadFlags.SkipMonoBehaviourFields
+                    );
+                }
+                catch (Exception fallbackException)
+                {
+                    baseHeaderException = fallbackException;
+                }
+
+                failure = CreateMonoBehaviourFailure(
+                    inst,
+                    info,
+                    baseHeader,
+                    exception,
+                    baseHeaderException
+                );
+                return null;
+            }
+
+            try
+            {
+                long expandedSize = baseField.WriteToByteArray().LongLength;
+                if (expandedSize != info.ByteSize)
+                {
+                    var exception = new InvalidDataException(
+                        $"Expanded template covers {expandedSize} / {info.ByteSize} bytes."
+                    );
+                    failure = CreateMonoBehaviourFailure(
+                        inst,
+                        info,
+                        baseField,
+                        exception,
+                        null
+                    );
+                    return null;
+                }
+            }
+            catch (Exception exception)
+            {
+                failure = CreateMonoBehaviourFailure(
+                    inst,
+                    info,
+                    baseField,
+                    exception,
+                    null
+                );
+                return null;
+            }
+
+            return baseField;
+        }
+
+        private ExportManifestMonoBehaviourFailure CreateMonoBehaviourFailure(
+            AssetsFileInstance inst,
+            AssetFileInfo info,
+            AssetTypeValueField? baseHeader,
+            Exception exception,
+            Exception? baseHeaderException
+        )
+        {
+            string reasonCode = exception switch
+            {
+                EndOfStreamException => "template_data_mismatch",
+                TypeLoadException => "managed_type_unresolved",
+                InvalidDataException => "template_size_mismatch",
+                _ when exception.GetType().Name.Contains("ResolutionException", StringComparison.Ordinal)
+                    => "managed_dependency_unresolved",
+                _ => "template_parse_error"
+            };
+
+            var failure = new ExportManifestMonoBehaviourFailure
+            {
+                SourceFile = inst.path ?? "",
+                PathId = info.PathId,
+                TypeIdOrIndex = info.TypeIdOrIndex,
+                ScriptIndex = GetScriptIndexOrUnknown(inst, info),
+                ReasonCode = baseHeaderException == null
+                    ? reasonCode
+                    : "base_header_unreadable",
+                ExceptionType = exception.GetType().Name,
+                Reason = FormatDiagnosticException(exception),
+                BaseHeaderReadable = baseHeaderException == null && baseHeader != null
+            };
+            if (baseHeaderException != null)
+            {
+                failure.Reason += $"; base header: {FormatDiagnosticException(baseHeaderException)}";
+            }
+            PopulateRawObjectRangeStatus(inst, info, failure);
+            if (baseHeader != null)
+            {
+                PopulateMonoScriptIdentity(inst, baseHeader, failure);
+            }
+            return failure;
+        }
+
+        private void PopulateMonoScriptIdentity(
+            AssetsFileInstance inst,
+            AssetTypeValueField baseHeader,
+            ExportManifestMonoBehaviourFailure failure
+        )
+        {
+            try
+            {
+                AssetPPtr script = AssetPPtr.FromField(baseHeader["m_Script"]);
+                failure.ScriptFileId = script.FileId;
+                failure.ScriptPathId = script.PathId;
+                if (script.IsNull())
+                    return;
+
+                AssetsFileInstance? scriptFile = script.FileId == 0
+                    ? inst
+                    : inst.GetDependency(am, script.FileId - 1);
+                if (scriptFile == null)
+                    return;
+
+                AssetFileInfo scriptInfo = scriptFile.file.GetAssetInfo(script.PathId);
+                if (scriptInfo == null)
+                    return;
+
+                AssetTypeValueField scriptField = am.GetBaseField(
+                    scriptFile,
+                    scriptInfo,
+                    AssetReadFlags.SkipMonoBehaviourFields
+                );
+                failure.AssemblyName = scriptField["m_AssemblyName"].AsString;
+                failure.Namespace = scriptField["m_Namespace"].AsString;
+                failure.ClassName = scriptField["m_ClassName"].AsString;
+            }
+            catch
+            {
+                // FileID/PathID above remain sufficient for a stable diagnostic key.
+            }
+        }
+
+        private static ushort GetScriptIndexOrUnknown(
+            AssetsFileInstance inst,
+            AssetFileInfo info
+        )
+        {
+            try
+            {
+                return info.GetScriptIndex(inst.file);
+            }
+            catch
+            {
+                return ushort.MaxValue;
+            }
+        }
+
+        private static void PopulateRawObjectRangeStatus(
+            AssetsFileInstance inst,
+            AssetFileInfo info,
+            ExportManifestMonoBehaviourFailure failure
+        )
+        {
+            try
+            {
+                long objectOffset = info.GetAbsoluteByteOffset(inst.file);
+                long streamLength = inst.file.Reader.BaseStream.Length;
+                long declaredLength = inst.file.Header.FileSize;
+                long availableLength = Math.Min(streamLength, declaredLength);
+                failure.RawObjectRangeChecked = true;
+                failure.RawObjectRangeValid = objectOffset >= 0
+                    && objectOffset >= inst.file.Header.DataOffset
+                    && objectOffset <= availableLength
+                    && info.ByteSize <= availableLength - objectOffset;
+            }
+            catch
+            {
+                failure.RawObjectRangeChecked = false;
+                failure.RawObjectRangeValid = false;
+            }
+        }
+
+        private static bool IsRawObjectRangeInvalid(
+            ExportManifestMonoBehaviourFailure failure
+        )
+        {
+            return failure.RawObjectRangeChecked && !failure.RawObjectRangeValid;
+        }
+
+        private static string FormatDiagnosticException(Exception exception)
+        {
+            string message = exception.Message
+                .Replace('\r', ' ')
+                .Replace('\n', ' ')
+                .Trim();
+            if (message.Length > 600)
+                message = message.Substring(0, 600) + "...";
+            return $"{exception.GetType().Name}: {message}";
+        }
+
         private AssetTypeValueField? SafeGetBaseField(AssetsFileInstance inst, AssetFileInfo info)
         {
             try
@@ -2255,8 +2549,13 @@ namespace UnityResourceCLI
         private sealed class ExportProgress
         {
             private readonly long interval;
+            private readonly ConcurrentDictionary<string, MonoBehaviourFailureGroup> monoBehaviourFailures = new();
             private long processed;
             private long nextHeartbeat;
+            private long preservedMonoBehaviours;
+            private long criticalMonoBehaviours;
+
+            public bool HasCriticalFailure => Volatile.Read(ref criticalMonoBehaviours) > 0;
 
             public ExportProgress(long interval)
             {
@@ -2280,10 +2579,167 @@ namespace UnityResourceCLI
                 }
             }
 
+            public void ReportMonoBehaviourFailure(
+                ExportManifestMonoBehaviourFailure failure,
+                bool cached
+            )
+            {
+                string scriptLabel = GetScriptLabel(failure);
+                string key = string.Join(
+                    "\n",
+                    GetScriptKey(failure),
+                    failure.ReasonCode,
+                    failure.ExceptionType,
+                    IsRawObjectRangeInvalid(failure).ToString()
+                );
+                MonoBehaviourFailureGroup group = monoBehaviourFailures.GetOrAdd(
+                    key,
+                    _ => new MonoBehaviourFailureGroup(scriptLabel, failure)
+                );
+                long count = Interlocked.Increment(ref group.Count);
+                bool critical = IsRawObjectRangeInvalid(failure);
+                if (critical)
+                    Interlocked.Increment(ref criticalMonoBehaviours);
+                else
+                    Interlocked.Increment(ref preservedMonoBehaviours);
+
+                if (count != 1)
+                    return;
+
+                string cacheLabel = cached ? "[缓存]" : "";
+                string location = FormatFailureLocation(failure);
+                if (critical)
+                {
+                    LogRed(
+                        $"  [MonoBehaviour][对象字节越界][源资源损坏]{cacheLabel} " +
+                        $"Script={scriptLabel}, 首个对象={location}, reason={failure.Reason}"
+                    );
+                }
+                else if (failure.BaseHeaderReadable)
+                {
+                    LogYellow(
+                        $"  [MonoBehaviour][模板信息不足或结构不匹配][已保留原资源]{cacheLabel} " +
+                        $"Script={scriptLabel}, 首个对象={location}, reason={failure.Reason}"
+                    );
+                }
+                else
+                {
+                    string rangeLabel = failure.RawObjectRangeChecked
+                        ? "对象字节范围正常"
+                        : "对象字节范围未能校验";
+                    LogYellow(
+                        $"  [MonoBehaviour][完整模板及基础头均无法读取][{rangeLabel}][已保留原资源]{cacheLabel} " +
+                        $"Script={scriptLabel}, 首个对象={location}, reason={failure.Reason}"
+                    );
+                }
+            }
+
             public void LogFinal()
             {
                 long current = Volatile.Read(ref processed);
                 Log($"[导出进度] 已处理 {current:N0} 条资源（完成）");
+
+                long preserved = Volatile.Read(ref preservedMonoBehaviours);
+                long critical = Volatile.Read(ref criticalMonoBehaviours);
+                if (preserved == 0 && critical == 0)
+                    return;
+
+                if (preserved > 0)
+                {
+                    LogYellow(
+                        $"[MonoBehaviour][最终汇总] 无法安全展开但对象范围未发现越界={preserved:N0}，" +
+                        "均未导出且会保留原资源。"
+                    );
+                }
+                if (critical > 0)
+                {
+                    LogRed(
+                        $"[MonoBehaviour][最终汇总] 已确认对象字节范围越界={critical:N0}，" +
+                        "源资源对象表无效，导出将返回失败。"
+                    );
+                }
+
+                foreach (MonoBehaviourFailureGroup group in monoBehaviourFailures.Values
+                    .OrderBy(value => value.ScriptLabel, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(value => value.FirstFailure.ReasonCode, StringComparer.OrdinalIgnoreCase))
+                {
+                    ExportManifestMonoBehaviourFailure first = group.FirstFailure;
+                    Action<string> logger = IsRawObjectRangeInvalid(first) ? LogRed : LogYellow;
+                    logger(
+                        $"[MonoBehaviour][汇总项] Script={group.ScriptLabel}, " +
+                        $"count={Volatile.Read(ref group.Count):N0}, reason={first.ReasonCode}, " +
+                        $"首个对象={FormatFailureLocation(first)}"
+                    );
+                }
+            }
+
+            private static string GetScriptKey(ExportManifestMonoBehaviourFailure failure)
+            {
+                if (!string.IsNullOrWhiteSpace(failure.ClassName))
+                {
+                    return string.Join(
+                        "|",
+                        failure.AssemblyName,
+                        failure.Namespace,
+                        failure.ClassName
+                    );
+                }
+                return string.Join(
+                    "|",
+                    failure.SourceFile,
+                    failure.BundleEntryName,
+                    failure.RelativeBase,
+                    failure.ScriptIndex,
+                    failure.TypeIdOrIndex,
+                    failure.ScriptFileId,
+                    failure.ScriptPathId
+                );
+            }
+
+            private static string GetScriptLabel(ExportManifestMonoBehaviourFailure failure)
+            {
+                if (!string.IsNullOrWhiteSpace(failure.ClassName))
+                {
+                    string qualifiedName = string.IsNullOrWhiteSpace(failure.Namespace)
+                        ? failure.ClassName
+                        : $"{failure.Namespace}.{failure.ClassName}";
+                    string assemblyName = failure.AssemblyName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                        ? failure.AssemblyName.Substring(0, failure.AssemblyName.Length - 4)
+                        : failure.AssemblyName;
+                    return string.IsNullOrWhiteSpace(assemblyName)
+                        ? qualifiedName
+                        : $"{assemblyName}:{qualifiedName}";
+                }
+                if (failure.ScriptFileId != 0 || failure.ScriptPathId != 0)
+                    return $"FileID={failure.ScriptFileId},PathID={failure.ScriptPathId}";
+                string scriptIndex = failure.ScriptIndex == ushort.MaxValue
+                    ? "unknown"
+                    : failure.ScriptIndex.ToString();
+                return $"ScriptIndex={scriptIndex},TypeIndex={failure.TypeIdOrIndex}";
+            }
+
+            private static string FormatFailureLocation(ExportManifestMonoBehaviourFailure failure)
+            {
+                string entry = string.IsNullOrWhiteSpace(failure.BundleEntryName)
+                    ? failure.SourceFile
+                    : failure.BundleEntryName;
+                return $"{entry}/PathID={failure.PathId}";
+            }
+
+            private sealed class MonoBehaviourFailureGroup
+            {
+                public string ScriptLabel { get; }
+                public ExportManifestMonoBehaviourFailure FirstFailure { get; }
+                public long Count;
+
+                public MonoBehaviourFailureGroup(
+                    string scriptLabel,
+                    ExportManifestMonoBehaviourFailure firstFailure
+                )
+                {
+                    ScriptLabel = scriptLabel;
+                    FirstFailure = firstFailure;
+                }
             }
         }
     }

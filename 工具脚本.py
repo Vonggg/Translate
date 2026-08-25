@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import hashlib
 import math
@@ -13,7 +14,7 @@ import tempfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-from support.config import load_config
+from support.config import activate_config_path, load_config
 from support.image_restore import load_allpng_map
 from support.menu_selection import parse_number_ranges
 from support.script_output_cleanup import (
@@ -30,29 +31,72 @@ from pipeline.shared import atomic_write_json
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_SOURCE_ROOT = SCRIPT_DIR / "workspace" / "input"
-DEFAULT_DEST_ROOT = SCRIPT_DIR / "workspace" / "手动替换"
-DEFAULT_ALL_IMAGE_ROOT = SCRIPT_DIR / "workspace" / "AllPNG"
+
+
+def _parse_entry_args(argv: list[str], *, activate: bool) -> list[str]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", type=Path)
+    options, remaining = parser.parse_known_args(argv)
+    if activate and options.config is not None:
+        activate_config_path(options.config)
+    return remaining
+
+
+# 工具脚本的大量默认路径会在模块初始化时生成。作为脚本直接运行时，
+# 必须先激活 --config，不能等到 main() 才切换。
+_ENTRY_ARGS: list[str] | None = None
+if __name__ == "__main__":
+    _ENTRY_ARGS = _parse_entry_args(sys.argv[1:], activate=True)
+
+try:
+    _DEFAULT_CONFIG = load_config(quiet=True)
+except Exception:
+    _DEFAULT_CONFIG = None
+DEFAULT_WORKSPACE_ROOT = (
+    _DEFAULT_CONFIG.workspace_root
+    if _DEFAULT_CONFIG is not None
+    else SCRIPT_DIR / "workspace"
+)
+DEFAULT_SOURCE_ROOT = (
+    _DEFAULT_CONFIG.resource_input_root
+    if _DEFAULT_CONFIG is not None
+    else DEFAULT_WORKSPACE_ROOT / "input"
+)
+DEFAULT_RECORD_ROOT = (
+    _DEFAULT_CONFIG.stage_record_dir
+    if _DEFAULT_CONFIG is not None
+    else DEFAULT_WORKSPACE_ROOT / "records"
+)
+DEFAULT_DEST_ROOT = DEFAULT_WORKSPACE_ROOT / "手动替换"
+DEFAULT_ALL_IMAGE_ROOT = DEFAULT_WORKSPACE_ROOT / "AllPNG"
 DEFAULT_ALL_IMAGE_PNG_ROOT = DEFAULT_ALL_IMAGE_ROOT / "PNG"
 DEFAULT_EDITED_IMAGE_ROOT = DEFAULT_ALL_IMAGE_ROOT / "修改后的图片目录"
-DEFAULT_OBJECT_TO_IMPORT_ROOT = SCRIPT_DIR / "workspace" / "output" / "Object" / "ToImport"
+DEFAULT_OBJECT_TO_IMPORT_ROOT = (
+    _DEFAULT_CONFIG.object_import_dir
+    if _DEFAULT_CONFIG is not None
+    else DEFAULT_WORKSPACE_ROOT / "output" / "Object" / "ToImport"
+)
 DEFAULT_ALL_IMAGE_MAP = DEFAULT_ALL_IMAGE_ROOT / "_allpng_map.json"
 DEFAULT_BLOCK_IMAGE_ROOT = DEFAULT_ALL_IMAGE_ROOT / "屏蔽object"
-DEFAULT_BLOCK_RECORD = SCRIPT_DIR / "workspace" / "records" / "blocked_image_objects.json"
+DEFAULT_BLOCK_RECORD = DEFAULT_RECORD_ROOT / "blocked_image_objects.json"
 DEFAULT_STORE_PRODUCT_BLOCK_RECORD = (
-    SCRIPT_DIR / "workspace" / "records" / "blocked_store_products.json"
+    DEFAULT_RECORD_ROOT / "blocked_store_products.json"
 )
-DEFAULT_IMAGE_OBJECT_INDEX = SCRIPT_DIR / "workspace" / "records" / "image_object_index.json"
-DEFAULT_OBJECT_GRAPH_CACHE = SCRIPT_DIR / "workspace" / "records" / "object_graph_cache.pkl"
-DEFAULT_FILE_ID_MAP = SCRIPT_DIR / "workspace" / "records" / "file_id_map.json"
-DEFAULT_OBJECT_PREVIEW_ROOT = SCRIPT_DIR / "workspace" / "preview" / "ObjectHierarchy"
-DEFAULT_CATALOG_OUTPUT = SCRIPT_DIR / "workspace" / "output" / "catalog" / "Output.json"
+DEFAULT_IMAGE_OBJECT_INDEX = DEFAULT_RECORD_ROOT / "image_object_index.json"
+DEFAULT_OBJECT_GRAPH_CACHE = DEFAULT_RECORD_ROOT / "object_graph_cache.pkl"
+DEFAULT_FILE_ID_MAP = DEFAULT_RECORD_ROOT / "file_id_map.json"
+DEFAULT_OBJECT_PREVIEW_ROOT = DEFAULT_WORKSPACE_ROOT / "preview" / "ObjectHierarchy"
+DEFAULT_CATALOG_OUTPUT = (
+    _DEFAULT_CONFIG.result_dir / "catalog" / "Output.json"
+    if _DEFAULT_CONFIG is not None
+    else DEFAULT_WORKSPACE_ROOT / "output" / "catalog" / "Output.json"
+)
 DEFAULT_ALL_SPRITE_ROOT = DEFAULT_ALL_IMAGE_ROOT / "Sprite"
 DEFAULT_ALL_SPRITE_PNG_ROOT = DEFAULT_ALL_SPRITE_ROOT / "PNG"
 DEFAULT_ALL_SPRITE_MAP = DEFAULT_ALL_SPRITE_ROOT / "_allsprite_map.json"
-DEFAULT_MISSING_TTF_CHARS_FILE = SCRIPT_DIR / "workspace" / "records" / "translation_chars_missing_from_ttf.txt"
-DEFAULT_TRANS_JSON = SCRIPT_DIR / "workspace" / "records" / "trans.json"
-DEFAULT_RECORDS_JSON = SCRIPT_DIR / "workspace" / "records" / "records.json"
+DEFAULT_MISSING_TTF_CHARS_FILE = DEFAULT_RECORD_ROOT / "translation_chars_missing_from_ttf.txt"
+DEFAULT_TRANS_JSON = DEFAULT_RECORD_ROOT / "trans.json"
+DEFAULT_RECORDS_JSON = DEFAULT_RECORD_ROOT / "records.json"
 FIND_PATH_ID_SCRIPT = SCRIPT_DIR / "support" / "查找PathID文件.py"
 FIND_ASSET_NAME_SCRIPT = SCRIPT_DIR / "support" / "查找资源名文件.py"
 AI_TRANSLATION_BATCH_TOOL = SCRIPT_DIR / "tools" / "ai_translation_batch_tool.py"
@@ -2783,6 +2827,81 @@ def _preview_asset_name(entry: dict | None, type_name: str, path_id: int) -> str
     return f"{type_name}_{path_id}"
 
 
+def _preview_entry_path(entry: dict | None) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    entry_path = entry.get("path")
+    return str(entry_path) if entry_path else ""
+
+
+def _preview_split_image_path(
+    *,
+    item_type: str,
+    path_id: int,
+    source: str,
+    bundle_entry: str,
+    sprite_name: str = "",
+) -> str:
+    mapping = _safe_read_json(DEFAULT_ALL_SPRITE_MAP)
+    items = mapping.get("items") if isinstance(mapping, dict) else None
+    if not isinstance(items, list):
+        return ""
+    wanted_source = source.replace("/", "\\").casefold()
+    wanted_bundle = bundle_entry.casefold()
+    wanted_name = sprite_name.casefold()
+    for item in items:
+        if not isinstance(item, dict) or item.get("item_type") != item_type:
+            continue
+        if item_type == "sprite" and int(item.get("sprite_path_id", 0) or 0) != path_id:
+            continue
+        if item_type == "ngui_sprite":
+            references = item.get("atlas_references")
+            if not isinstance(references, list):
+                references = [item]
+            if not any(
+                int(reference.get("atlas_path_id", 0) or 0) == path_id
+                and str(reference.get("source_resource", "")).replace("/", "\\").casefold()
+                == wanted_source
+                and str(reference.get("bundle_entry", "")).casefold() == wanted_bundle
+                for reference in references
+                if isinstance(reference, dict)
+            ):
+                continue
+            if wanted_name and str(item.get("sprite_name", "")).casefold() != wanted_name:
+                continue
+        elif (
+            str(item.get("source_resource", "")).replace("/", "\\").casefold()
+            != wanted_source
+            or str(item.get("bundle_entry", "")).casefold() != wanted_bundle
+        ):
+            continue
+        flat_name = str(item.get("flat_name", "")).strip()
+        if flat_name:
+            return str(DEFAULT_ALL_SPRITE_PNG_ROOT / flat_name)
+    return ""
+
+
+def _preview_allpng_path(export_path: str) -> str:
+    if not export_path:
+        return ""
+    mapping = _safe_read_json(DEFAULT_ALL_IMAGE_MAP)
+    if not isinstance(mapping, dict):
+        return ""
+    source_root = Path(str(mapping.get("source_root", DEFAULT_SOURCE_ROOT)))
+    wanted = os.path.normcase(os.path.abspath(export_path))
+    for item in mapping.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        original_relative = str(item.get("original_relative_path", "")).strip()
+        flat_name = str(item.get("flat_name", "")).strip()
+        if not original_relative or not flat_name:
+            continue
+        original_path = source_root / Path(original_relative)
+        if os.path.normcase(os.path.abspath(original_path)) == wanted:
+            return str(DEFAULT_ALL_IMAGE_PNG_ROOT / flat_name)
+    return ""
+
+
 def _preview_sprite_resource_records(scope: dict, sprite_path_id: int) -> list[dict]:
     sprite_entry = _scope_entry(scope, ("Sprite",), sprite_path_id)
     sprite_data = _entry_data(sprite_entry) if sprite_entry else None
@@ -2795,6 +2914,13 @@ def _preview_sprite_resource_records(scope: dict, sprite_path_id: int) -> list[d
             "name": _preview_asset_name(sprite_entry, "Sprite", sprite_path_id),
             "source": str(scope.get("source", "")),
             "bundle_entry": str(scope.get("bundle_entry", "")),
+            "export_path": _preview_entry_path(sprite_entry),
+            "image_path": _preview_split_image_path(
+                item_type="sprite",
+                path_id=sprite_path_id,
+                source=str(scope.get("source", "")),
+                bundle_entry=str(scope.get("bundle_entry", "")),
+            ),
         }
     ]
     render_data, render_scope = _sprite_render_data_with_scope(sprite_data, scope)
@@ -2808,6 +2934,7 @@ def _preview_sprite_resource_records(scope: dict, sprite_path_id: int) -> list[d
     if texture_scope is None or not texture_path_id:
         return records
     texture_entry = _scope_entry(texture_scope, ("Texture2D",), texture_path_id)
+    texture_export_path = _preview_entry_path(texture_entry)
     records.append(
         {
             "type": "Texture2D",
@@ -2815,6 +2942,8 @@ def _preview_sprite_resource_records(scope: dict, sprite_path_id: int) -> list[d
             "name": _preview_asset_name(texture_entry, "Texture2D", texture_path_id),
             "source": str(texture_scope.get("source", "")),
             "bundle_entry": str(texture_scope.get("bundle_entry", "")),
+            "export_path": texture_export_path,
+            "image_path": _preview_allpng_path(texture_export_path),
         }
     )
     return records
@@ -2825,6 +2954,7 @@ def _preview_ngui_resource_records(
     atlas_path_id: int,
     sprite_name: str,
 ) -> list[dict]:
+    atlas_entry = _scope_entry(scope, ("MonoBehaviour",), atlas_path_id)
     records = [
         {
             "type": "NGUI Sprite",
@@ -2832,6 +2962,14 @@ def _preview_ngui_resource_records(
             "name": sprite_name,
             "source": str(scope.get("source", "")),
             "bundle_entry": str(scope.get("bundle_entry", "")),
+            "export_path": _preview_entry_path(atlas_entry),
+            "image_path": _preview_split_image_path(
+                item_type="ngui_sprite",
+                path_id=atlas_path_id,
+                source=str(scope.get("source", "")),
+                bundle_entry=str(scope.get("bundle_entry", "")),
+                sprite_name=sprite_name,
+            ),
         }
     ]
     resolved = _resolve_ngui_atlas(scope, atlas_path_id)
@@ -2839,6 +2977,7 @@ def _preview_ngui_resource_records(
         return records
     texture_scope = resolved["texture_scope"]
     texture_path_id = int(resolved["texture_path_id"])
+    texture_export_path = _preview_entry_path(resolved["texture_entry"])
     records.append(
         {
             "type": "Texture2D",
@@ -2848,6 +2987,8 @@ def _preview_ngui_resource_records(
             ),
             "source": str(texture_scope.get("source", "")),
             "bundle_entry": str(texture_scope.get("bundle_entry", "")),
+            "export_path": texture_export_path,
+            "image_path": _preview_allpng_path(texture_export_path),
         }
     )
     return records
@@ -2857,6 +2998,7 @@ def _preview_texture_resource_records(scope: dict, texture_path_id: int) -> list
     texture_entry = _scope_entry(scope, ("Texture2D",), texture_path_id)
     if texture_entry is None:
         return []
+    texture_export_path = _preview_entry_path(texture_entry)
     return [
         {
             "type": "Texture2D",
@@ -2864,6 +3006,8 @@ def _preview_texture_resource_records(scope: dict, texture_path_id: int) -> list
             "name": _preview_asset_name(texture_entry, "Texture2D", texture_path_id),
             "source": str(scope.get("source", "")),
             "bundle_entry": str(scope.get("bundle_entry", "")),
+            "export_path": texture_export_path,
+            "image_path": _preview_allpng_path(texture_export_path),
         }
     ]
 
@@ -2896,14 +3040,69 @@ def _preview_resource_name_text(region: dict) -> str:
         type_name = str(resource.get("type", ""))
         name = str(resource.get("name", ""))
         path_id = int(resource.get("path_id", 0) or 0)
-        lines.append(f"{type_name}: {name} (PathID={path_id})")
+        lines.append(f"{type_name} Unity 资源名: {name} (PathID={path_id})")
         source = str(resource.get("source", ""))
         bundle_entry = str(resource.get("bundle_entry", ""))
+        export_path = str(resource.get("export_path", ""))
+        image_path = str(resource.get("image_path", ""))
         if source:
-            lines.append(f"  来源: {source}")
+            lines.append(f"  来源资源: {source}")
         if bundle_entry:
             lines.append(f"  Bundle entry: {bundle_entry}")
+        if export_path:
+            lines.append(f"  导出文件: {export_path}")
+        if image_path:
+            image_label = "拆分 PNG" if type_name in {"Sprite", "NGUI Sprite"} else "AllPNG 文件"
+            lines.append(f"  {image_label}: {image_path}")
     return "\n".join(lines)
+
+
+def _show_copyable_text_dialog(parent, title: str, text: str) -> None:
+    import tkinter as tk
+    from tkinter import ttk
+
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.transient(parent)
+    dialog.minsize(680, 320)
+    dialog.geometry("900x480")
+
+    body = ttk.Frame(dialog, padding=12)
+    body.pack(fill="both", expand=True)
+    body.columnconfigure(0, weight=1)
+    body.rowconfigure(0, weight=1)
+
+    text_box = tk.Text(body, wrap="none", font=("Consolas", 10), undo=False)
+    vertical = ttk.Scrollbar(body, orient="vertical", command=text_box.yview)
+    horizontal = ttk.Scrollbar(body, orient="horizontal", command=text_box.xview)
+    text_box.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+    text_box.grid(row=0, column=0, sticky="nsew")
+    vertical.grid(row=0, column=1, sticky="ns")
+    horizontal.grid(row=1, column=0, sticky="ew")
+    text_box.insert("1.0", text)
+
+    buttons = ttk.Frame(body)
+    buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+    def copy_all() -> None:
+        dialog.clipboard_clear()
+        dialog.clipboard_append(text)
+        dialog.update_idletasks()
+
+    ttk.Button(buttons, text="复制全部", command=copy_all).pack(side="left", padx=(0, 8))
+    ttk.Button(buttons, text="关闭", command=dialog.destroy).pack(side="left")
+
+    def select_all(_event=None):
+        text_box.tag_add("sel", "1.0", "end-1c")
+        text_box.mark_set("insert", "1.0")
+        return "break"
+
+    text_box.bind("<Control-a>", select_all)
+    text_box.bind("<Control-A>", select_all)
+    dialog.bind("<Escape>", lambda _event: dialog.destroy())
+    text_box.focus_set()
+    dialog.grab_set()
+    dialog.wait_window()
 
 
 def _preview_resource_query_label(region: dict) -> str:
@@ -4535,10 +4734,10 @@ def _show_interactive_object_preview(target: Path) -> dict:
             f"(Object PathID={region.get('path_id', 0)})\033[0m\n{detail}",
             flush=True,
         )
-        messagebox.showinfo(
+        _show_copyable_text_dialog(
+            window,
             "Sprite / NGUI / Texture2D 资源名字",
             f"对象层级: {object_name}\n\n{detail}",
-            parent=window,
         )
 
     def set_zoom(value: float, keep_center: bool = True) -> None:
@@ -9345,7 +9544,10 @@ def run_compatibility_check() -> None:
 
 
 def _default_ai_records_dir() -> Path:
-    return SCRIPT_DIR / "workspace" / "records"
+    try:
+        return load_config(quiet=True).stage_record_dir
+    except Exception:
+        return DEFAULT_RECORD_ROOT
 
 
 def _default_response_path_for_ai_request(request_path: Path) -> Path:
@@ -9961,23 +10163,24 @@ def run_test_tools_menu() -> None:
 
 
 def main() -> int:
-    if len(sys.argv) > 1:
-        command = sys.argv[1].strip().lower()
+    entry_args = _ENTRY_ARGS if _ENTRY_ARGS is not None else _parse_entry_args(sys.argv[1:], activate=False)
+    if entry_args:
+        command = entry_args[0].strip().lower()
         if command in {"resend-ai-batch", "ai-batch-resend"}:
-            if len(sys.argv) < 3:
+            if len(entry_args) < 2:
                 print(f"用法: python {Path(__file__).name} resend-ai-batch <ai_translation_request_batch_XXX.json>")
                 return 1
-            return run_ai_translation_batch_tool("resend", Path(sys.argv[2]))
+            return run_ai_translation_batch_tool("resend", Path(entry_args[1]))
         if command in {"patch-ai-batch", "ai-batch-patch"}:
-            if len(sys.argv) < 3:
+            if len(entry_args) < 2:
                 print(f"用法: python {Path(__file__).name} patch-ai-batch <ai_translation_request_batch_XXX.json>")
                 return 1
-            return run_ai_translation_batch_tool("patch-trans", Path(sys.argv[2]))
+            return run_ai_translation_batch_tool("patch-trans", Path(entry_args[1]))
         if command in {"resend-and-patch-ai-batch", "ai-batch-resend-and-patch"}:
-            if len(sys.argv) < 3:
+            if len(entry_args) < 2:
                 print(f"用法: python {Path(__file__).name} resend-and-patch-ai-batch <ai_translation_request_batch_XXX.json>")
                 return 1
-            return run_ai_translation_batch_tool("resend-and-patch", Path(sys.argv[2]))
+            return run_ai_translation_batch_tool("resend-and-patch", Path(entry_args[1]))
         if command in {"clean-unsupported-ttf-chars", "clean-ttf-chars"}:
             run_clean_unsupported_ttf_chars()
             return 0
@@ -10012,7 +10215,7 @@ def main() -> int:
             return 0
         if command in {"verify-repacked-resources", "verify-resources"}:
             return subprocess.run([sys.executable, str(RESOURCE_REPACK_VALIDATOR)], check=False).returncode
-        print(f"未知命令: {sys.argv[1]}")
+        print(f"未知命令: {entry_args[0]}")
         print(f"用法: python {Path(__file__).name} resend-ai-batch <ai_translation_request_batch_XXX.json>")
         print(f"或: python {Path(__file__).name} patch-ai-batch <ai_translation_request_batch_XXX.json>")
         print(f"或: python {Path(__file__).name} resend-and-patch-ai-batch <ai_translation_request_batch_XXX.json>")
@@ -10022,6 +10225,7 @@ def main() -> int:
         print(f"或: python {Path(__file__).name} block-dynamic-lists")
         return 1
 
+    print(f"当前项目工作区: {DEFAULT_WORKSPACE_ROOT}")
     while True:
         print()
         print("工具菜单")

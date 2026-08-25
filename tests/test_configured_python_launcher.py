@@ -26,7 +26,12 @@ LAUNCHER = _load_launcher()
 
 
 def _args(script: str, *script_args: str) -> argparse.Namespace:
-    return argparse.Namespace(script=script, script_args=list(script_args), print_python=False)
+    return argparse.Namespace(
+        config=LAUNCHER.DEFAULT_CONFIG_PATH,
+        script=script,
+        script_args=list(script_args),
+        print_python=False,
+    )
 
 
 class ConfiguredPythonLauncherTests(unittest.TestCase):
@@ -49,6 +54,7 @@ class ConfiguredPythonLauncherTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(Path(command[0]), Path(sys.executable))
         self.assertEqual(Path(command[2]), LAUNCHER.QUICK_CONFIG_SCRIPT)
+        self.assertEqual(command[3:5], ["--config", str(LAUNCHER.DEFAULT_CONFIG_PATH)])
 
     def test_regular_script_uses_configured_interpreter(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -64,6 +70,10 @@ class ConfiguredPythonLauncherTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertEqual(Path(run.call_args.args[0][0]), configured)
+            self.assertEqual(
+                run.call_args.kwargs["env"][LAUNCHER.ACTIVE_CONFIG_PATH_ENV],
+                str(LAUNCHER.DEFAULT_CONFIG_PATH),
+            )
 
     def test_external_same_named_script_does_not_bypass_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -94,6 +104,58 @@ class ConfiguredPythonLauncherTests(unittest.TestCase):
 
         self.assertEqual(result, 2)
         self.assertIn("选择 0", stderr.getvalue())
+
+    def test_interactive_child_exit_returns_to_launcher_until_launcher_q(self) -> None:
+        completed = SimpleNamespace(returncode=0)
+        interactive_args = _args("")
+        interactive_args.script = None
+        with (
+            patch.object(LAUNCHER, "parse_args", return_value=interactive_args),
+            patch.object(LAUNCHER, "choose_script", side_effect=["resource_menu.py", None]) as choose,
+            patch.object(LAUNCHER, "resolve_configured_python", return_value=Path(sys.executable)),
+            patch.object(LAUNCHER.subprocess, "run", return_value=completed) as run,
+        ):
+            result = LAUNCHER.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(choose.call_count, 2)
+        run.assert_called_once()
+
+    def test_explicit_script_keeps_single_run_return_code(self) -> None:
+        completed = SimpleNamespace(returncode=7)
+        with (
+            patch.object(LAUNCHER, "parse_args", return_value=_args("main.py")),
+            patch.object(LAUNCHER, "resolve_configured_python", return_value=Path(sys.executable)),
+            patch.object(LAUNCHER, "choose_script") as choose,
+            patch.object(LAUNCHER.subprocess, "run", return_value=completed) as run,
+        ):
+            result = LAUNCHER.main()
+
+        self.assertEqual(result, 7)
+        choose.assert_not_called()
+        run.assert_called_once()
+
+    def test_custom_config_is_resolved_and_forwarded_through_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "Game A.json"
+            configured = Path(temporary) / "python.exe"
+            config_path.write_text("{}", encoding="utf-8")
+            configured.touch()
+            args = _args("main.py")
+            args.config = config_path
+            completed = SimpleNamespace(returncode=0)
+            with (
+                patch.object(LAUNCHER, "parse_args", return_value=args),
+                patch.object(LAUNCHER, "load_config", return_value={"python_executable": str(configured)}),
+                patch.object(LAUNCHER.subprocess, "run", return_value=completed) as run,
+            ):
+                result = LAUNCHER.main()
+
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                run.call_args.kwargs["env"][LAUNCHER.ACTIVE_CONFIG_PATH_ENV],
+                str(config_path.resolve()),
+            )
 
 
 if __name__ == "__main__":

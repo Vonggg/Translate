@@ -21,6 +21,14 @@ Builds/
 *.mdb
 AssetPipeline_CLI/.nested_git_backup/
 AssetPipeline_CLI/AssetsTools.NET/build-native/
+/TMP_Font_Generator/Assets/SourceFonts/font-job.json
+/TMP_Font_Generator/Assets/SourceFonts/bundle-crc-job.json
+/TMP_Font_Generator/Assets/SourceFonts/fzkt.ttf
+/TMP_Font_Generator/Assets/SourceFonts/fzkt.ttf.meta
+/TMP_Font_Generator/Assets/GeneratedFonts/generated_tmp_font.asset
+/TMP_Font_Generator/Assets/GeneratedFonts/generated_tmp_font.asset.meta
+/TMP_Font_Generator/.translate-unity.lock
+/requirements.zip
 
 # Local project configuration and private working notes
 /config.json

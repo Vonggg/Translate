@@ -235,9 +235,19 @@ class ObjectHierarchyPreviewLayoutTests(unittest.TestCase):
             "查询 Sprite / Texture2D 资源名字",
         )
         detail = TOOLS._preview_resource_name_text(region)
-        self.assertIn("Sprite: Start Button Sprite (PathID=7)", detail)
-        self.assertIn("Texture2D: Main UI Atlas (PathID=9)", detail)
-        self.assertIn(r"来源: bin\Data\sharedassets0.assets", detail)
+        self.assertIn("Sprite Unity 资源名: Start Button Sprite (PathID=7)", detail)
+        self.assertIn("Texture2D Unity 资源名: Main UI Atlas (PathID=9)", detail)
+        self.assertIn(r"来源资源: bin\Data\sharedassets0.assets", detail)
+        self.assertIn(r"导出文件: Sprite\Start Button Sprite_7.json", detail)
+        self.assertIn(r"导出文件: Texture2D\Main UI Atlas_9.png", detail)
+
+    def test_preview_resource_dialog_is_copyable(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "工具脚本.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("def _show_copyable_text_dialog(parent, title: str, text: str)", source)
+        self.assertIn('text="复制全部"', source)
+        self.assertIn("_show_copyable_text_dialog(\n            window,", source)
 
     def test_preview_resource_query_is_hidden_without_image_resource(self) -> None:
         self.assertEqual(TOOLS._preview_resource_query_label({}), "")

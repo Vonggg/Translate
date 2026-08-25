@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from support.config import PipelineConfig
+from support.process_lock import interprocess_file_lock
 from .manifest_index import load_tmp_manifest_index, tmp_manifest_index_path
 from .shared import collect_json_files, is_visible_char, read_json, unique_preserve_order, write_json
 
@@ -1291,7 +1292,7 @@ def prepare_generated_tmp_import_replacements(
         shutil.rmtree(cfg.import_overlay_dir)
     cfg.import_overlay_dir.mkdir(parents=True, exist_ok=True)
 
-    material_work_dir = cfg.root_dir / "workspace" / "temp" / "sdf_material_work"
+    material_work_dir = cfg.workspace_root / "temp" / "sdf_material_work"
     if material_work_dir.exists():
         shutil.rmtree(material_work_dir)
     material_work_dir.mkdir(parents=True, exist_ok=True)
@@ -1770,6 +1771,22 @@ def launch_unity_tmp_generator(
     output_name: str | None = None,
     prepare_import: bool = False,
 ) -> int:
+    lock_path = cfg.unity_font_project / ".translate-unity.lock"
+    with interprocess_file_lock(lock_path, label="TMP排队"):
+        return _launch_unity_tmp_generator_locked(
+            cfg,
+            characters_file=characters_file,
+            output_name=output_name,
+            prepare_import=prepare_import,
+        )
+
+
+def _launch_unity_tmp_generator_locked(
+    cfg: PipelineConfig,
+    characters_file: Path | None = None,
+    output_name: str | None = None,
+    prepare_import: bool = False,
+) -> int:
     import sys
 
     if not cfg.unity_exe.is_file():
@@ -1823,6 +1840,8 @@ def launch_unity_tmp_generator(
         str(cfg.unity_font_project),
         "--unity-exe",
         str(cfg.unity_exe),
+        "--log-file",
+        str(cfg.log_dir / "tmp_font_unity.log"),
     ]
     if "point_size" in tmp_settings:
         cmd.extend(["--point-size", str(tmp_settings["point_size"])])

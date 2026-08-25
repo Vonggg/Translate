@@ -25,12 +25,37 @@ def _line_ending(text: str) -> str:
     return "\n"
 
 
+def _effective_doublequote(dialect: csv.Dialect) -> bool:
+    """Normalize an otherwise unwritable quoted CSV dialect.
+
+    Sniffer only sees a prefix of large TextAssets, so a standard doubled quote
+    may first occur outside its sample and leave ``doublequote`` set to False.
+    With no escape character there is no other valid way to preserve a quote in
+    a quoted field; both the reader and writer must therefore use CSV's standard
+    doubled-quote handling.
+    """
+    return bool(
+        dialect.doublequote
+        or (
+            dialect.quotechar
+            and dialect.quoting != csv.QUOTE_NONE
+            and dialect.escapechar is None
+        )
+    )
+
+
 def _detect_csv(text: str) -> tuple[list[list[str]], csv.Dialect] | None:
     if not text or "\n" not in text and "\r" not in text:
         return None
     try:
         dialect = csv.Sniffer().sniff(text[:32768], delimiters=",\t;")
-        rows = list(csv.reader(io.StringIO(text, newline=""), dialect))
+        rows = list(
+            csv.reader(
+                io.StringIO(text, newline=""),
+                dialect,
+                doublequote=_effective_doublequote(dialect),
+            )
+        )
     except (csv.Error, UnicodeError):
         return None
     if len(rows) < 2 or len(rows[0]) < 2:
@@ -187,7 +212,7 @@ def apply_textasset_csv_translations(
         delimiter=dialect.delimiter,
         quotechar=dialect.quotechar or '"',
         escapechar=dialect.escapechar,
-        doublequote=dialect.doublequote,
+        doublequote=_effective_doublequote(dialect),
         skipinitialspace=dialect.skipinitialspace,
         quoting=dialect.quoting,
         lineterminator=line_ending,

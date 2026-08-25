@@ -19,6 +19,7 @@ namespace UnityResourceCLI
         public List<string> ExportedProfiles { get; set; } = new();
         public List<ExportManifestAssetsFile> AssetsFiles { get; set; } = new();
         public List<ExportManifestMonoBehaviourSummary> MonoBehaviourSummaries { get; set; } = new();
+        public List<ExportManifestMonoBehaviourFailure> MonoBehaviourFailures { get; set; } = new();
         public List<ExportManifestItem> Items { get; set; } = new();
     }
 
@@ -45,7 +46,29 @@ namespace UnityResourceCLI
         public int Total { get; set; }
         public int BaseOnly { get; set; }
         public int WithCustomFields { get; set; }
+        public int Preserved { get; set; }
         public int Failed { get; set; }
+    }
+
+    internal sealed class ExportManifestMonoBehaviourFailure
+    {
+        public string RelativeBase { get; set; } = "";
+        public string BundleEntryName { get; set; } = "";
+        public string SourceFile { get; set; } = "";
+        public long PathId { get; set; }
+        public int TypeIdOrIndex { get; set; }
+        public ushort ScriptIndex { get; set; } = ushort.MaxValue;
+        public int ScriptFileId { get; set; }
+        public long ScriptPathId { get; set; }
+        public string AssemblyName { get; set; } = "";
+        public string Namespace { get; set; } = "";
+        public string ClassName { get; set; } = "";
+        public string ReasonCode { get; set; } = "";
+        public string ExceptionType { get; set; } = "";
+        public string Reason { get; set; } = "";
+        public bool BaseHeaderReadable { get; set; }
+        public bool RawObjectRangeChecked { get; set; }
+        public bool RawObjectRangeValid { get; set; }
     }
 
     internal sealed class ExportManifestItem

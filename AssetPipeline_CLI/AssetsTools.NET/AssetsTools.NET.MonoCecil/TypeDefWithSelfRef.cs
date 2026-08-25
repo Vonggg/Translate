@@ -14,8 +14,19 @@ namespace AssetsTools.NET.Extra
 
         public TypeDefWithSelfRef(TypeReference typeRef)
         {
+            if (typeRef == null)
+            {
+                throw new TypeLoadException("Cannot resolve a null managed type reference.");
+            }
+
             this.typeRef = typeRef;
             typeDef = typeRef.Resolve();
+            if (typeDef == null && !typeRef.ContainsGenericParameter)
+            {
+                throw new TypeLoadException(
+                    $"Unable to resolve managed type '{typeRef.FullName}' from scope '{typeRef.Scope}'."
+                );
+            }
             typeParamToArg = new Dictionary<string, TypeDefWithSelfRef>();
 
             TypeReference tRef = typeRef;
@@ -27,6 +38,12 @@ namespace AssetsTools.NET.Extra
 
             if (tRef is GenericInstanceType genType)
             {
+                if (typeDef == null)
+                {
+                    throw new TypeLoadException(
+                        $"Unable to resolve generic managed type '{typeRef.FullName}'."
+                    );
+                }
                 if (genType.HasGenericArguments)
                 {
                     for (int i = 0; i < genType.GenericArguments.Count; i++)

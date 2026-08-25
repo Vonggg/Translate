@@ -314,7 +314,12 @@ def _localization_binding_report_path(cfg: PipelineConfig) -> Path:
         if translated_root is not None:
             record_root = Path(translated_root).parent / "records"
         else:
-            record_root = Path.cwd() / "workspace" / "records"
+            workspace_root = getattr(cfg, "workspace_root", None)
+            record_root = (
+                Path(workspace_root) / "records"
+                if workspace_root is not None
+                else Path.cwd() / "workspace" / "records"
+            )
     return Path(record_root) / LOCALIZATION_BINDING_REPORT_FILENAME
 
 
@@ -3582,9 +3587,17 @@ def _i2_bound_game_objects_for_translations(
     translations: dict[str, str],
 ) -> set[tuple[str, int]]:
     """Find GameObjects whose I2 term contains text translated by trans.json."""
-    translated_source_texts = set(translations)
-    translated_terms: set[str] = set()
-    translated_terms_folded: set[str] = set()
+    translated_source_texts = {
+        value for value in translations if isinstance(value, str) and value
+    }
+    # Some exports expose the Localize mTerm itself as the translated source,
+    # while others expose only a language value from the I2 table. Support both
+    # representations so a missing/export-incomplete language table does not
+    # hide an otherwise exact Localize binding.
+    translated_terms: set[str] = set(translated_source_texts)
+    translated_terms_folded: set[str] = {
+        value.casefold() for value in translated_source_texts
+    }
 
     _log(f"[I2材质阴影描边] 正在枚举 JSON: {cfg.resource_input_root}")
     json_files = collect_json_files(cfg.resource_input_root)
@@ -5091,7 +5104,7 @@ def repoint_i2_text_effect_materials(cfg: PipelineConfig) -> None:
             "_",
             Path(effect_relative).stem,
         ).strip("._") or "material"
-        sample_dir = cfg.root_dir / "样本" / f"I2MaterialMissing_{safe_name}"
+        sample_dir = cfg.sample_root / f"I2MaterialMissing_{safe_name}"
         if sample_dir.exists():
             shutil.rmtree(sample_dir)
         sample_dir.mkdir(parents=True, exist_ok=True)

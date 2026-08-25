@@ -21,13 +21,23 @@ def resolve_managed_root(source_root: Path, managed_root: str | None) -> Path:
     return (source_root / "Managed").resolve()
 
 
+def resolve_artifacts_root(work_root: Path) -> Path:
+    for candidate in (work_root, *work_root.parents):
+        if candidate.name.casefold().startswith("workspace"):
+            return candidate / "temp" / "dotnet_artifacts"
+    return work_root.parent / ".dotnet_artifacts"
+
+
 def build_command(args: argparse.Namespace, repo_root: Path) -> list[str]:
     cli_project = resolve_cli_project(repo_root)
+    artifacts_root = resolve_artifacts_root(Path(args.work))
     command = [
         "dotnet",
         "run",
         "--project",
         str(cli_project),
+        "--artifacts-path",
+        str(artifacts_root),
         "--",
         args.mode,
         "--source",
@@ -51,6 +61,8 @@ def build_command(args: argparse.Namespace, repo_root: Path) -> list[str]:
         command.extend(["--replacement-root", str(args.replacement_root)])
     if args.result_root:
         command.extend(["--result-root", str(args.result_root)])
+    if args.sample_root:
+        command.extend(["--sample-root", str(args.sample_root)])
     if args.mode == "import":
         command.extend(["--import-workers", str(args.import_workers)])
         command.extend(["--save-samples", str(args.save_samples).lower()])
@@ -67,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--work",
-        default=r"D:\CG\Translate\workspace\input",
+        required=True,
         help="Working directory used to store exports and import results.",
     )
     parser.add_argument(
@@ -84,6 +96,11 @@ def parse_args() -> argparse.Namespace:
         "--result-root",
         default=None,
         help="Output folder for imported result files. Defaults to <work>\\result.",
+    )
+    parser.add_argument(
+        "--sample-root",
+        default=None,
+        help="Project-isolated directory used when diagnostic sample collection is enabled.",
     )
     parser.add_argument(
         "--mode",
@@ -151,17 +168,20 @@ def main() -> int:
     managed_root = resolve_managed_root(source_root, args.managed)
     replacement_root = Path(args.replacement_root).expanduser().resolve() if args.replacement_root else None
     result_root = Path(args.result_root).expanduser().resolve() if args.result_root else None
+    sample_root = Path(args.sample_root).expanduser().resolve() if args.sample_root else None
 
     args.source = source_root
     args.work = work_root
     args.managed = managed_root
     args.replacement_root = replacement_root
     args.result_root = result_root
+    args.sample_root = sample_root
 
     repo_root = resolve_repo_root()
     command = build_command(args, repo_root)
 
     work_root.mkdir(parents=True, exist_ok=True)
+    print(f"[UnityResourceCLI] 独立 .NET 构建目录: {resolve_artifacts_root(work_root)}", flush=True)
     return subprocess.call(command, cwd=str(repo_root))
 
 

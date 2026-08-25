@@ -12,6 +12,7 @@ namespace UnityResourceCLI
         public string ManagedRoot { get; init; } = "";
         public string ReplacementRoot { get; init; } = "";
         public string ResultRoot { get; init; } = "";
+        public string SampleRoot { get; init; } = "";
         public string ReportPath { get; init; } = "";
         public string DumpFormat { get; init; } = "json";
         public string ImageFormat { get; init; } = "png";
@@ -63,6 +64,7 @@ namespace UnityResourceCLI
             string managedRoot = GetOptional(dict, "managed", Path.Combine(sourceRoot, "Managed"));
             string replacementRoot = GetOptional(dict, "replacement-root", "");
             string resultRoot = GetOptional(dict, "result-root", "");
+            string sampleRoot = GetOptional(dict, "sample-root", "");
             string reportPath = GetOptional(dict, "report", "");
             string dumpFormat = GetOptional(dict, "dump-format", "json").ToLowerInvariant();
             string imageFormat = GetOptional(dict, "image-format", "png").ToLowerInvariant();
@@ -97,6 +99,7 @@ namespace UnityResourceCLI
                 ManagedRoot = Path.GetFullPath(managedRoot),
                 ReplacementRoot = string.IsNullOrWhiteSpace(replacementRoot) ? "" : Path.GetFullPath(replacementRoot),
                 ResultRoot = string.IsNullOrWhiteSpace(resultRoot) ? "" : Path.GetFullPath(resultRoot),
+                SampleRoot = string.IsNullOrWhiteSpace(sampleRoot) ? "" : Path.GetFullPath(sampleRoot),
                 ReportPath = string.IsNullOrWhiteSpace(reportPath) ? "" : Path.GetFullPath(reportPath),
                 DumpFormat = dumpFormat,
                 ImageFormat = imageFormat,
@@ -114,7 +117,7 @@ namespace UnityResourceCLI
             Console.WriteLine("UnityResourceCLI");
             Console.WriteLine("Usage:");
             Console.WriteLine("  UnityResourceCLI export --source <game_root> --work <work_root> [--managed <managed_dir>] [--export-profile basic|objects|mesh|all] [--export-workers 0]");
-            Console.WriteLine("  UnityResourceCLI import --source <game_root> --work <work_root> [--replacement-root <overlay_root>] [--result-root <result_root>] [--managed <managed_dir>] [--import-workers 0] [--save-samples false]");
+            Console.WriteLine("  UnityResourceCLI import --source <game_root> --work <work_root> [--replacement-root <overlay_root>] [--result-root <result_root>] [--managed <managed_dir>] [--import-workers 0] [--save-samples false] [--sample-root <project_sample_dir>]");
             Console.WriteLine("  UnityResourceCLI verify --source <original_root> --work <work_root> --result-root <candidate_root> [--managed <managed_dir>] [--report <report.json>]");
             Console.WriteLine();
             Console.WriteLine("Notes:");

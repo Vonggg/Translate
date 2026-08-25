@@ -90,6 +90,7 @@ DEFAULT_TEXT_KEYS = [
 
 
 DEFAULT_CONFIG_FILE = "config.json"
+ACTIVE_CONFIG_PATH_ENV = "TRANSLATE_CONFIG_PATH"
 DEFAULT_STRING_FIELD_BLACKLIST = [
     "m_Script",
     "m_EditorClassIdentifier",
@@ -130,6 +131,50 @@ def _default_home() -> Path:
 def _resolve(base: Path, value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else (base / path).resolve()
+
+
+def resolve_config_path(config_path: str | Path | None = None) -> Path:
+    """Resolve the config selected for the current Translate process.
+
+    An explicit function argument always wins.  Otherwise the launcher can
+    select a config for the whole child-process tree through the environment;
+    direct invocations keep using the legacy ``config.json`` default.
+    """
+    root_dir = _default_home()
+    selected = config_path
+    if selected is None:
+        selected = os.environ.get(ACTIVE_CONFIG_PATH_ENV) or DEFAULT_CONFIG_FILE
+    return _resolve(root_dir, selected)
+
+
+def activate_config_path(config_path: str | Path | None = None) -> Path:
+    """Select an absolute config path for this process and its children."""
+    resolved = resolve_config_path(config_path)
+    os.environ[ACTIVE_CONFIG_PATH_ENV] = str(resolved)
+    return resolved
+
+
+def _normalize_project_name(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _workspace_dir_name(project_name: str) -> str:
+    return f"workspace{_normalize_project_name(project_name)}"
+
+
+def _resolve_workspace_path(base: Path, value: str | Path, project_name: str) -> Path:
+    """Resolve configured workspace paths into the selected project's workspace.
+
+    Config files deliberately keep portable paths such as ``workspace/input``.
+    A non-empty project name changes only that leading directory name, for
+    example ``workspaceGameA/input``. Absolute/custom paths remain untouched.
+    """
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    if path.parts and path.parts[0].casefold() == "workspace":
+        path = Path(_workspace_dir_name(project_name), *path.parts[1:])
+    return (base / path).resolve()
 
 
 UNITY_VERSION_PART_RE = re.compile(r"^\d+(?:\.\d+){2,3}[a-z]\d+(?:c\d+)?$", re.IGNORECASE)
@@ -376,6 +421,14 @@ class PipelineConfig:
         return (self.project_root_dir / self.project_name).resolve()
 
     @property
+    def workspace_root(self) -> Path:
+        return (self.root_dir / _workspace_dir_name(self.project_name)).resolve()
+
+    @property
+    def sample_root(self) -> Path:
+        return (self.root_dir / "样本" / self.workspace_root.name).resolve()
+
+    @property
     def resource_source_root(self) -> Path:
         return (self.project_dir / self.resource_source_subpath).resolve()
 
@@ -428,13 +481,18 @@ class PipelineConfig:
 
 def load_config(config_path: str | Path | None = None, quiet: bool = False) -> PipelineConfig:
     root_dir = _default_home()
-    config_file = _resolve(root_dir, config_path or DEFAULT_CONFIG_FILE)
+    config_file = resolve_config_path(config_path)
     raw: dict[str, Any] = {}
     if config_file.is_file():
         raw = json.loads(config_file.read_text(encoding="utf-8-sig"))
 
     def get_value(key: str, default: Any) -> Any:
         return raw.get(key, default)
+
+    project_name = _normalize_project_name(get_value("project_name", ""))
+
+    def resolve_workspace_value(key: str, default: Any) -> Path:
+        return _resolve_workspace_path(root_dir, get_value(key, default), project_name)
 
     unity_font_project = _resolve(root_dir, get_value("unity_font_project", "TMP_Font_Generator"))
     raw_unity_exe = str(get_value("unity_exe", str(PipelineConfig.unity_exe)) or "").strip()
@@ -459,25 +517,26 @@ def load_config(config_path: str | Path | None = None, quiet: bool = False) -> P
     cfg = PipelineConfig(
         root_dir=root_dir,
         project_root_dir=_resolve(root_dir, get_value("project_root_dir", r"D:\user\von\MyWorkbench\Works\APK\VS\0_Projects")),
-        project_name=get_value("project_name", "融合大作战"),
+        project_name=project_name,
         resource_source_subpath=Path(get_value("resource_source_subpath", "game-name/game/app/src/main/assets/bin/Data")),
         resource_managed_subpath=Path(get_value("resource_managed_subpath", "game-name/game/app/src/main/assets/bin/Data/Managed")),
         catalog_source_subpath=Path(get_value("catalog_source_subpath", "game-name/game/assets/aa/catalog.json")),
         stringliteral_json_subpath=Path(get_value("stringliteral_json_subpath", "game-name/bak/64/stringliteral.json")),
-        resource_input_root=_resolve(
+        resource_input_root=_resolve_workspace_path(
             root_dir,
             get_value(
                 "resource_input_root",
                 get_value("resource_work_root", get_value("uabea_dump_json_dir", "workspace/input")),
             ),
+            project_name,
         ),
-        log_dir=_resolve(root_dir, get_value("log_dir", "workspace/logs")),
-        result_dir=_resolve(root_dir, get_value("result_dir", "workspace/output")),
-        record_dir=_resolve(root_dir, get_value("record_dir", "workspace/records")),
-        import_overlay_dir=_resolve(root_dir, get_value("import_overlay_dir", "workspace/output/Font/SDF/ToImport")),
-        image_import_dir=_resolve(root_dir, get_value("image_import_dir", "workspace/output/Image/ToImport")),
-        object_import_dir=_resolve(root_dir, get_value("object_import_dir", "workspace/output/Object/ToImport")),
-        resource_staging_root=_resolve(root_dir, get_value("resource_staging_root", "workspace/input_sources")),
+        log_dir=resolve_workspace_value("log_dir", "workspace/logs"),
+        result_dir=resolve_workspace_value("result_dir", "workspace/output"),
+        record_dir=resolve_workspace_value("record_dir", "workspace/records"),
+        import_overlay_dir=resolve_workspace_value("import_overlay_dir", "workspace/output/Font/SDF/ToImport"),
+        image_import_dir=resolve_workspace_value("image_import_dir", "workspace/output/Image/ToImport"),
+        object_import_dir=resolve_workspace_value("object_import_dir", "workspace/output/Object/ToImport"),
+        resource_staging_root=resolve_workspace_value("resource_staging_root", "workspace/input_sources"),
         addressables_download_workers=max(1, int(get_value("addressables_download_workers", 5) or 5)),
         addressables_download_timeout=max(1, int(get_value("addressables_download_timeout", 60) or 60)),
         translation_mode=get_value("translation_mode", "translate"),
@@ -515,13 +574,13 @@ def load_config(config_path: str | Path | None = None, quiet: bool = False) -> P
         font_keys=list(get_value("font_keys", [])),
         ignore_text=list(get_value("ignore_text", [])),
         ttf_template_path=_resolve(root_dir, get_value("ttf_template_path", "templates/fzkt.ttf")),
-        ttf_old_dir=_resolve(root_dir, get_value("ttf_old_dir", "workspace/output/Font/TTF/source")),
-        ttf_new_dir=_resolve(root_dir, get_value("ttf_new_dir", "workspace/output/Font/TTF/ToImport")),
+        ttf_old_dir=resolve_workspace_value("ttf_old_dir", "workspace/output/Font/TTF/source"),
+        ttf_new_dir=resolve_workspace_value("ttf_new_dir", "workspace/output/Font/TTF/ToImport"),
         tmp_template_json_path=_resolve(root_dir, get_value("tmp_template_json_path", "templates/templates.json")),
         tmp_template_atlas_path=_resolve(root_dir, get_value("tmp_template_atlas_path", "templates/Atlasa-templates.png")),
         tmp_max_atlas_size=int(get_value("tmp_max_atlas_size", 8192) or 8192),
-        ngui_generated_dir=_resolve(root_dir, get_value("ngui_generated_dir", "workspace/output/Font/NGUI/generated")),
-        ngui_import_dir=_resolve(root_dir, get_value("ngui_import_dir", "workspace/output/Font/NGUI/ToImport")),
+        ngui_generated_dir=resolve_workspace_value("ngui_generated_dir", "workspace/output/Font/NGUI/generated"),
+        ngui_import_dir=resolve_workspace_value("ngui_import_dir", "workspace/output/Font/NGUI/ToImport"),
         ngui_max_atlas_size=max(1, int(get_value("ngui_max_atlas_size", 4096) or 4096)),
         ngui_glyph_padding=max(0, int(get_value("ngui_glyph_padding", 2) or 0)),
         include_old_sdf_template_chars=bool(get_value("include_old_sdf_template_chars", False)),

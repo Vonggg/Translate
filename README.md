@@ -1,6 +1,8 @@
 # Translate
 
-Unity 游戏资源汉化工具链。主要流程是：导出资源到 `workspace/input`，扫描并翻译文本，生成待导入的文本/字体/图片替换文件，最后重新导入并输出到 `workspace/FinalResult`。
+Translate 是一套 Unity 游戏资源汉化工具链。本文只说明本仓库自身的安装、配置和操作；目标游戏仅作为 Translate 处理的输入与输出。主要流程是：导出目标游戏资源，扫描并翻译文本，生成待导入的文本、字体和图片替换文件，最后重新导入并输出到当前工作区的 `FinalResult`。
+
+工作区目录名直接由 `workspace` 和 `project_name` 拼接：`project_name` 为空时是 `workspace`，填写 `<游戏名>` 时是 `workspace<游戏名>`。切换 `project_name` 会同时切换目标游戏目录和整套工作区；本文其余位置为简洁而写的 `workspace/...`，均表示当前配置实际选中的工作区。
 
 ## 首次安装环境
 
@@ -31,7 +33,7 @@ python -m venv .venv
 dotnet --version
 ```
 
-第一次运行时，`dotnet` 还可能需要还原 NuGet 依赖。公司电脑可通过公司软件中心或内部安装源安装；普通电脑可使用 Microsoft 提供的 .NET SDK 安装包。
+第一次运行时，`dotnet` 还可能需要还原 NuGet 依赖。请通过可用的软件源或 Microsoft 提供的 .NET SDK 安装包完成安装。
 
 ### 3. Visual Studio C++ 与 CMake
 
@@ -63,7 +65,7 @@ Rename-Item '.\config（删除括弧后缀后运行快速配置）.json' 'config
 python .\快速配置.py
 ```
 
-快速配置会设置 adbuybox 根目录和可选的虚拟 Python 环境，并询问 Unity 与可选翻译方式。资源、Managed、Addressables catalog 和 IL2CPP stringliteral 使用固定的项目相对路径，不会扫描或选择资源目录。仓库自带的 `templates/fzkt.ttf` 会直接使用，无需配置。写入前会显示检查结果；已有 `config.json` 会按时间生成备份。
+快速配置会设置目标游戏路径基准目录和可选的虚拟 Python 环境，并询问 Unity 与可选翻译方式。资源、Managed、Addressables catalog 和 IL2CPP stringliteral 使用固定的游戏相对路径，不会扫描或选择资源目录。仓库自带的 `templates/fzkt.ttf` 会直接使用，无需配置。写入前会显示检查结果；已有 `config.json` 会按时间生成备份。
 
 快速配置不会检查这些固定资源相对路径当前是否存在；具体资源流程运行时再按需检查。
 
@@ -75,22 +77,52 @@ python .\run_with_config_python.py
 
 快速配置入口固定使用启动器当前的 Python，因此旧 `config.json` 中失效的 `python_executable` 不会阻止配置。`python_executable` 是可选的虚拟 Python 环境配置：快速配置接受环境目录或具体 Python 可执行文件，留空时 `run_with_config_python.py` 使用启动器自身的当前 Python；填写时会检查 Python 版本及 `requirements.txt` 对应依赖。
 
+启动器也支持为一次会话指定独立配置。传入的文件就是一份普通的完整 Translate JSON 配置，内容结构与 `config.json` 相同，可以保存在 Translate 目录之外。推荐从完整配置模板复制一份，仅按处理目标修改 `project_root_dir` 和 `project_name`，其余翻译、字体和工作目录设置继续保留模板值。例如完整副本中的两个项目定位字段可以是：
+
+```json
+{
+    "project_root_dir": "<目标游戏共同父目录>",
+    "project_name": "<目标游戏目录名>"
+}
+```
+
+上面只展示需要按目标修改的字段，不表示配置文件只能包含这两个字段。配置文件自身所在的目录不参与路径计算；配置中的普通相对路径仍按 Translate 根目录解析。因此从其他程序调用时建议传配置文件的绝对路径。配置参数必须放在脚本名之前；启动器会把它传给资源菜单、主菜单、工具脚本以及它们创建的 Python 子进程，因此多个 Translate 终端可以同时使用不同配置：
+
+```powershell
+python .\run_with_config_python.py --config '<配置文件路径>'
+python .\run_with_config_python.py --config '<配置文件路径>' main.py
+```
+
+也可以直接调用入口脚本：
+
+```powershell
+python .\resource_menu.py --config '<配置文件路径>'
+python .\main.py --config '<配置文件路径>'
+python .\工具脚本.py --config '<配置文件路径>'
+```
+
+交互启动器会在子菜单结束后重新显示上一级菜单；只有在 `Translate Project Launcher` 中输入 `q` 才会结束启动器。资源菜单中的导出/导入二级选择输入 `q` 只取消当前选择并返回资源菜单。
+
+只要各配置最终解析出的 workspace 不同，诊断样本和 UnityResourceCLI 的 .NET 构建目录也会随之隔离，可以同时执行；两份配置若解析到同一个 workspace，则不应并发运行。多个会话共享同一个 `unity_font_project` 时，TMP 字体生成与 catalog CRC 计算会自动跨进程排队，并定时打印等待时间；取得执行权后会继续运行，不会覆盖另一个会话的 job 或输出。
+
 可用以下命令检查当前配置：
 
 ```powershell
 python .\快速配置.py --check
+python .\快速配置.py --config '<配置文件路径>' --check
 ```
 
 ## 先配置什么
 
-配置文件是 `config.json`。换游戏、换电脑或换 Unity 环境时，优先检查下面这些字段。
+默认配置文件是 `config.json`。切换处理目标、运行电脑或 Unity 环境时，优先检查下面这些字段。
 
 ### 游戏路径
 
 - `project_root_dir`
-  - 完整 `adbuybox` 目录，通常是 `game-name` 的上一级目录；快速配置只检查目录是否存在。
+  - 目标游戏路径的基准目录；实际游戏目录由它和可选的 `project_name` 组成。`project_name` 为空时，该目录本身应是 `game-name` 的上一级目录。快速配置只检查基准目录是否存在。
 - `project_name`
-  - 可留空；快速配置默认留空。旧配置仍可填写项目目录名，并与 `project_root_dir` 拼接。
+  - 可留空；快速配置默认留空。填写后既会与 `project_root_dir` 拼出游戏目录，也会把工作区切换为同级命名规则 `workspace<project_name>`（直接拼接，没有中间斜杠）。
+  - 例如 `project_name=<游戏目录名>` 时，游戏目录是 `project_root_dir/<游戏目录名>`，工作区是 Translate 目录下的 `workspace<游戏目录名>`；改回空值时直接使用 `project_root_dir` 和 `workspace`。
 - `resource_source_subpath`
   - 游戏资源目录相对路径，一般是 `game-name/game/assets/bin/Data`。
 - `resource_managed_subpath`
@@ -100,6 +132,7 @@ python .\快速配置.py --check
   - 即使模板填写 `catalog.json`，运行时也会读取同目录 `settings.json` 并自动选择实际存在的 `catalog.bin`/`catalog.json`。
 - `resource_staging_root`
   - 一键导出使用的统一原始资源暂存目录，默认 `workspace/input_sources`。
+  - 配置文件继续保留这个通用写法；加载配置时会自动映射到当前配置的实际工作区，例如 `workspace<游戏目录名>/input_sources`。
   - 源文件指纹没有变化时会直接复用；源文件变化或用户明确清空 workspace 时才会重建。不要在其中保存手工文件。
 - `addressables_download_workers` / `addressables_download_timeout`
   - 远程 Addressables 下载线程数和单次请求超时，默认 `5` 和 `60` 秒。
@@ -197,7 +230,16 @@ project_root_dir/[project_name/]game-name/bak/64/DummyDll
 
 ### 工作目录
 
-通常不用改：
+通常不用改。配置文件中的相对路径继续统一写成 `workspace/...`；程序加载时会根据 `project_name` 将首段为 `workspace` 的相对路径自动改为实际目录名。绝对路径以及不以 `workspace` 开头的自定义路径不会自动改写，需要自行保证不同配置之间不共用目录。使用默认写法时，切换处理目标只需修改 `project_name`，不需要逐项修改下面这些路径。
+
+目录规则：
+
+```text
+project_name = ""         -> workspace
+project_name = "<游戏名>" -> workspace<游戏名>
+```
+
+配置值：
 
 - `resource_input_root`: `workspace/input`
 - `record_dir`: `workspace/records`
@@ -205,7 +247,7 @@ project_root_dir/[project_name/]game-name/bak/64/DummyDll
 - `log_dir`: `workspace/logs`
 - `image_import_dir`: `workspace/output/Image/ToImport`
 
-重要输出：
+重要输出（以下 `workspace` 表示当前实际工作区）：
 
 - 文本待导入：`workspace/output/Text`
 - TTF 待导入：`workspace/output/Font/TTF/ToImport`
@@ -218,12 +260,11 @@ project_root_dir/[project_name/]game-name/bak/64/DummyDll
 
 ## 常规使用顺序
 
-下面优先使用统一启动器调用各脚本，这样 `config.json` 中配置的 `python_executable` 才会生效。若直接执行 `python .\main.py` 等命令，则使用当前终端的 Python。
+以下命令均在 Translate 仓库根目录执行。下面优先使用统一启动器调用各脚本，这样 `config.json` 中配置的 `python_executable` 才会生效。若直接执行 `python .\main.py` 等命令，则使用当前终端的 Python。
 
 ### 1. 一键导出资源
 
 ```powershell
-Set-Location 'D:\path\to\Translate'
 python .\run_with_config_python.py resource_menu.py
 ```
 
@@ -608,8 +649,8 @@ workspace/FinalResult/Data
 
 导入完成后会再次用绿色日志提醒替换顺序：
 
-1. 先把已下载资源和本地化 catalog 所在的 `game/assets/aa` 同步到实际项目的 `assets/aa`。
-2. 再用 `workspace/FinalResult` 中的修改资源覆盖实际项目对应文件。
+1. 先把已下载资源和本地化 catalog 所在的 `game/assets/aa` 同步到目标游戏的 `assets/aa`。
+2. 再用 `workspace/FinalResult` 中的修改资源覆盖目标游戏对应文件。
 
 ## 工具脚本.py 菜单说明
 
@@ -756,5 +797,5 @@ Unity Localization 里有两类资源最容易混：
   - Unity TMP/SDF 字体生成辅助工程。
 - `templates/`
   - 字体模板和 SDF 模板资源。
-- `workspace/`
-  - 当前项目工作区。
+- `workspace*/`
+  - 不同配置会话相互隔离的工作区；空 `project_name` 使用 `workspace`，非空时使用 `workspace<project_name>`。

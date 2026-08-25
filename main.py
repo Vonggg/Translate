@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 import os
 import shutil
 import subprocess
 import sys
 
-from support.config import load_config
+from support.config import activate_config_path, load_config
 from support.menu_selection import parse_number_ranges
 from pipeline.font_ttf import build_ttf_replacements
 from pipeline.manifest_index import tmp_manifest_index_path
@@ -38,7 +39,6 @@ from pipeline.translation import (
 )
 
 
-CONFIG_PATH = Path("config.json")
 SDF_FINALIZE_ARGUMENT = "--finish-sdf"
 RUN_STEP_ARGUMENT = "--run-step"
 UNITY_NATIVE_CRASH_CODES = {0xC0000005, 0xFFFFFFFF}
@@ -47,6 +47,15 @@ UNITY_GENERATOR_ENTRY_MARKER = "[TMP] Generator entry reached"
 
 def prompt_input(message: str) -> str:
     return input(f"\033[38;5;208m{message}\033[0m")
+
+
+def _parse_entry_args(argv: list[str]) -> list[str]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", type=Path)
+    options, remaining = parser.parse_known_args(argv)
+    if options.config is not None:
+        activate_config_path(options.config)
+    return remaining
 
 
 def log_step_completed(step: str) -> None:
@@ -126,7 +135,7 @@ def existing_tmp_chars_path(cfg) -> Path | None:
 
 
 def _unity_log_path(cfg) -> Path:
-    return cfg.root_dir / "workspace" / "logs" / "tmp_font_unity.log"
+    return cfg.log_dir / "tmp_font_unity.log"
 
 
 def _is_unity_startup_crash(cfg, return_code: int) -> bool:
@@ -393,12 +402,14 @@ def print_menu() -> None:
 
 
 def main() -> int:
-    cfg = load_config(CONFIG_PATH)
-    if len(sys.argv) > 1 and sys.argv[1] == SDF_FINALIZE_ARGUMENT:
+    entry_args = _parse_entry_args(sys.argv[1:])
+    cfg = load_config()
+    if entry_args and entry_args[0] == SDF_FINALIZE_ARGUMENT:
         return _run_sdf_finalize_in_fresh_process(cfg)
-    if len(sys.argv) > 2 and sys.argv[1] == RUN_STEP_ARGUMENT:
-        return _run_noninteractive_step(cfg, sys.argv[2])
+    if len(entry_args) > 1 and entry_args[0] == RUN_STEP_ARGUMENT:
+        return _run_noninteractive_step(cfg, entry_args[1])
 
+    print(f"当前项目工作区: {cfg.workspace_root}")
     print(f"资源输入目录: {cfg.resource_input_root}")
 
     while True:

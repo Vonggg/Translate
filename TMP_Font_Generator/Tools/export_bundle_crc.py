@@ -13,6 +13,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Output JSON path.")
     parser.add_argument("--unity-exe", default=r"D:\user\von\Program\Develop\Unity\Editor\6000.5.1f1\Editor\Unity.exe")
     parser.add_argument("--project-root", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument("--log-file", default="", help="Unity batch-mode log path.")
     return parser.parse_args()
 
 
@@ -44,11 +45,12 @@ def main() -> int:
     job_path = source_fonts_dir / "bundle-crc-job.json"
     job_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    log_dir = project_root.parent / "workspace" / "logs"
-    if not log_dir.is_dir():
-        log_dir = project_root.parent / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "bundle_crc_unity.log"
+    log_file = (
+        Path(args.log_file).resolve()
+        if args.log_file
+        else project_root.parent / "logs" / "bundle_crc_unity.log"
+    )
+    log_file.parent.mkdir(parents=True, exist_ok=True)
     if log_file.exists():
         try:
             log_file.unlink()

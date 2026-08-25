@@ -89,6 +89,60 @@ class EmbeddedTextCsvTests(unittest.TestCase):
             self.assertEqual(rows[0]["JA"], "日本語")
             self.assertEqual(rows[0]["KO"], "한국어")
 
+    def test_export_handles_doubled_quotes_beyond_csv_sniffer_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cfg = self._cfg(root)
+            json_path = cfg.resource_input_root / "bundle" / "TextAsset" / "Localization_1.json"
+            json_path.parent.mkdir(parents=True)
+            filler_rows = [
+                f'filler.{index},,"Filler text {index}, {"x" * 80}",日本語,한국어'
+                for index in range(400)
+            ]
+            script = "\r\n".join(
+                [
+                    "Key,Comments,EN,JA,KO",
+                    "menu.start,,Start,開始,시작",
+                    *filler_rows,
+                    'vehicle.repair,,"Press the ""repair"" button.","「""修理""」",수리',
+                ]
+            )
+            self.assertGreater(script.index('""repair""'), 32768)
+            json_path.write_text(
+                json.dumps({"m_Name": "Localization", "m_Script": script}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            scan_result = _scan_one_translation_json(cfg, json_path, {}, {}, {})
+
+            self.assertIsNone(scan_result["error"])
+            repair_record = next(
+                record
+                for record in scan_result["records"]
+                if record.embedded_locator["row_key"] == "vehicle.repair"
+            )
+            self.assertEqual(repair_record.source_text, 'Press the "repair" button.')
+
+            translated_text = '点击 "修理" 按钮, 然后继续。'
+            _export_translated_files(
+                cfg,
+                {repair_record.source_text: translated_text},
+                [json_path],
+                [repair_record],
+            )
+
+            output_path = cfg.translated_dump_dir / json_path.relative_to(cfg.resource_input_root)
+            output = json.loads(output_path.read_text(encoding="utf-8"))
+            rows = list(csv.DictReader(io.StringIO(output["m_Script"], newline="")))
+            repair_row = next(row for row in rows if row["Key"] == "vehicle.repair")
+            self.assertEqual(repair_row["EN"], translated_text)
+            self.assertEqual(repair_row["JA"], '「"修理"」')
+            self.assertEqual(repair_row["KO"], "수리")
+            expected_columns = {"Key", "Comments", "EN", "JA", "KO"}
+            self.assertTrue(
+                all(set(row) == expected_columns and None not in row.values() for row in rows)
+            )
+
     def test_ngui_csv_uses_unnamed_first_column_as_localization_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
