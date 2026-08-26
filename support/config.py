@@ -357,6 +357,16 @@ class PipelineConfig:
     ai_field_review_timeout: int = 60
     ai_field_review_proxy_http: str = ""
     ai_field_review_proxy_https: str = ""
+    enable_ai_dynamic_list_review: bool = False
+    ai_dynamic_list_transport: str = "codex_cli"
+    ai_dynamic_list_codex_model: str = "gpt-5.3-codex-spark"
+    ai_dynamic_list_codex_reasoning_effort: str = "medium"
+    ai_dynamic_list_base_url: str = ""
+    ai_dynamic_list_api_key: str = ""
+    ai_dynamic_list_model: str = ""
+    ai_dynamic_list_timeout: int = 300
+    ai_dynamic_list_proxy_http: str = ""
+    ai_dynamic_list_proxy_https: str = ""
     string_field_blacklist: list[str] = field(default_factory=lambda: list(DEFAULT_STRING_FIELD_BLACKLIST))
     font_keys: list[str] = field(default_factory=list)
     ignore_text: list[str] = field(default_factory=list)
@@ -570,6 +580,48 @@ def load_config(config_path: str | Path | None = None, quiet: bool = False) -> P
         ai_field_review_timeout=int(get_value("ai_field_review_timeout", 60) or 60),
         ai_field_review_proxy_http=get_value("ai_field_review_proxy_http", ""),
         ai_field_review_proxy_https=get_value("ai_field_review_proxy_https", ""),
+        enable_ai_dynamic_list_review=bool(
+            get_value("enable_ai_dynamic_list_review", False)
+        ),
+        ai_dynamic_list_transport=(
+            get_value("ai_dynamic_list_transport", "")
+            or get_value("ai_field_review_transport", "codex_cli")
+        ),
+        ai_dynamic_list_codex_model=(
+            get_value("ai_dynamic_list_codex_model", "")
+            or get_value("ai_field_review_codex_model", "gpt-5.3-codex-spark")
+        ),
+        ai_dynamic_list_codex_reasoning_effort=(
+            get_value("ai_dynamic_list_codex_reasoning_effort", "")
+            or get_value("ai_field_review_codex_reasoning_effort", "medium")
+        ),
+        ai_dynamic_list_base_url=(
+            get_value("ai_dynamic_list_base_url", "")
+            or get_value("ai_field_review_base_url", "")
+        ),
+        ai_dynamic_list_api_key=(
+            get_value("ai_dynamic_list_api_key", "")
+            or get_value("ai_field_review_api_key", "")
+        ),
+        ai_dynamic_list_model=(
+            get_value("ai_dynamic_list_model", "")
+            or get_value("ai_field_review_model", "")
+        ),
+        ai_dynamic_list_timeout=max(
+            1,
+            int(get_value(
+                "ai_dynamic_list_timeout",
+                get_value("ai_field_review_timeout", 300),
+            ) or 300),
+        ),
+        ai_dynamic_list_proxy_http=(
+            get_value("ai_dynamic_list_proxy_http", "")
+            or get_value("ai_field_review_proxy_http", "")
+        ),
+        ai_dynamic_list_proxy_https=(
+            get_value("ai_dynamic_list_proxy_https", "")
+            or get_value("ai_field_review_proxy_https", "")
+        ),
         string_field_blacklist=list(get_value("string_field_blacklist", DEFAULT_STRING_FIELD_BLACKLIST)),
         font_keys=list(get_value("font_keys", [])),
         ignore_text=list(get_value("ignore_text", [])),

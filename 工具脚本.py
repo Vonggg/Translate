@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import hashlib
 import math
@@ -27,6 +28,10 @@ from support.script_output_cleanup import (
     target_size,
 )
 from pipeline.ai_translation_strategy import get_strategy
+from pipeline.codex_cli_provider import (
+    codex_cli_available,
+    request_structured_output,
+)
 from pipeline.shared import atomic_write_json
 
 
@@ -82,6 +87,9 @@ DEFAULT_BLOCK_RECORD = DEFAULT_RECORD_ROOT / "blocked_image_objects.json"
 DEFAULT_STORE_PRODUCT_BLOCK_RECORD = (
     DEFAULT_RECORD_ROOT / "blocked_store_products.json"
 )
+DEFAULT_DYNAMIC_LIST_AI_REVIEW = (
+    DEFAULT_RECORD_ROOT / "dynamic_list_ai_review.json"
+)
 DEFAULT_IMAGE_OBJECT_INDEX = DEFAULT_RECORD_ROOT / "image_object_index.json"
 DEFAULT_OBJECT_GRAPH_CACHE = DEFAULT_RECORD_ROOT / "object_graph_cache.pkl"
 DEFAULT_FILE_ID_MAP = DEFAULT_RECORD_ROOT / "file_id_map.json"
@@ -114,11 +122,17 @@ OBJECT_INDEX_DIR_NAMES = {
     "skinnedmeshrenderer",
 }
 OBJECT_GRAPH_CACHE_VERSION = 3
-DYNAMIC_STORE_SCAN_VERSION = 7
+DYNAMIC_STORE_SCAN_VERSION = 11
 RUNTIME_LAYOUT_RENDER_VERSION = 1
 _OBJECT_GRAPH_CACHE_STATE: dict | None = None
-_UNITY_HORIZONTAL_LAYOUT_SCRIPT_PATH_IDS = {-3229211799126679632}
-_UNITY_VERTICAL_LAYOUT_SCRIPT_PATH_IDS = {-4621643977240678714}
+_UNITY_HORIZONTAL_LAYOUT_SCRIPT_PATH_IDS = {
+    -3229211799126679632,
+    664,  # Unity 6000.4 globalgamemanagers MonoScript
+}
+_UNITY_VERTICAL_LAYOUT_SCRIPT_PATH_IDS = {
+    -4621643977240678714,
+    1227,  # Unity 6000.4 globalgamemanagers MonoScript
+}
 
 
 def prompt_input(message: str) -> str:
@@ -822,15 +836,25 @@ def run_split_sprite_atlases() -> None:
                 skipped += 1
                 continue
             own_render_data = _sprite_render_data(sprite_data)
-            render_data = _sprite_render_data(sprite_data, scope)
+            render_data, render_scope = _sprite_render_data_with_scope(
+                sprite_data, scope
+            )
             render_data_source = (
                 "sprite_atlas" if render_data is not own_render_data else "sprite"
             )
-            file_id, texture_path_id = _pptr(render_data.get("texture") or render_data.get("m_Texture"))
-            if file_id != 0 or not texture_path_id:
+            file_id, texture_path_id = _pptr(
+                render_data.get("texture") or render_data.get("m_Texture")
+            )
+            texture_scope = (
+                _resolve_pointer_scope(render_scope, file_id)
+                if render_scope is not None else None
+            )
+            if texture_scope is None or not texture_path_id:
                 skipped += 1
                 continue
-            texture_entry = _scope_entry(scope, ("Texture2D",), texture_path_id)
+            texture_entry = _scope_entry(
+                texture_scope, ("Texture2D",), texture_path_id
+            )
             texture_path = texture_entry["path"] if texture_entry else None
             rect = render_data.get("textureRect") or render_data.get("m_TextureRect")
             if not texture_path or not texture_path.is_file() or not isinstance(rect, dict):
@@ -2539,6 +2563,155 @@ def _preview_horizontal_layout_child_rects(
     return result, True
 
 
+def _preview_vertical_layout_child_rects(
+    scope: dict,
+    parent_game_object_data: dict,
+    parent_rect: tuple[float, float, float, float],
+    world_scale: tuple[float, float],
+    child_nodes: list[tuple[int, dict]],
+) -> tuple[dict[int, tuple[float, float, float, float]], bool]:
+    """Evaluate a stable Unity VerticalLayoutGroup from top to bottom.
+
+    Some prefabs serialize mutually exclusive runtime states as overlapping
+    children.  When their combined preferred height cannot fit the parent, the
+    safer cross-axis-only fallback remains in use instead of inventing a stack.
+    """
+    layout = _preview_vertical_layout_data(scope, parent_game_object_data)
+    if layout is None or not child_nodes:
+        return {}, False
+    padding = layout.get("m_Padding")
+    if not isinstance(padding, dict):
+        padding = {}
+    scale_x, scale_y = abs(world_scale[0]), abs(world_scale[1])
+    padding_left = _number(padding.get("m_Left")) * scale_x
+    padding_right = _number(padding.get("m_Right")) * scale_x
+    padding_top = _number(padding.get("m_Top")) * scale_y
+    padding_bottom = _number(padding.get("m_Bottom")) * scale_y
+    spacing = _number(layout.get("m_Spacing")) * scale_y
+    control_width = bool(layout.get("m_ChildControlWidth", False))
+    control_height = bool(layout.get("m_ChildControlHeight", False))
+    force_width = bool(layout.get("m_ChildForceExpandWidth", False))
+    force_height = bool(layout.get("m_ChildForceExpandHeight", False))
+    inner_width = max(0.0, parent_rect[2] - padding_left - padding_right)
+    inner_height = max(0.0, parent_rect[3] - padding_top - padding_bottom)
+    if inner_height <= 2.0:
+        return {}, False
+
+    rows: list[dict] = []
+    for object_id, transform_data in child_nodes:
+        object_entry = _scope_entry(scope, ("GameObject",), object_id)
+        object_data = _entry_data(object_entry) if object_entry else None
+        if not isinstance(object_data, dict) or not bool(object_data.get("m_IsActive", True)):
+            continue
+        base_rect = _rect_transform_child_rect(transform_data, parent_rect, world_scale)
+        layout_element = _preview_layout_element_data(scope, object_data)
+        if layout_element and bool(layout_element.get("m_IgnoreLayout", False)):
+            continue
+        width, height = base_rect[2], base_rect[3]
+        preferred_width = (
+            _number(layout_element.get("m_PreferredWidth"), -1.0) * scale_x
+            if layout_element else -1.0
+        )
+        preferred_height = (
+            _number(layout_element.get("m_PreferredHeight"), -1.0) * scale_y
+            if layout_element else -1.0
+        )
+        flexible_height = (
+            _number(layout_element.get("m_FlexibleHeight"), -1.0)
+            if layout_element else -1.0
+        )
+        if control_width:
+            if force_width:
+                width = inner_width
+            elif preferred_width >= 0:
+                width = min(inner_width, preferred_width)
+        if control_height and preferred_height >= 0:
+            height = preferred_height
+        provisional, _used_aspect = _preview_aspect_fitted_rect(
+            scope,
+            object_data,
+            transform_data,
+            (base_rect[0], base_rect[1], max(1.0, width), max(1.0, height)),
+        )
+        rows.append(
+            {
+                "path_id": object_id,
+                "transform": transform_data,
+                "object_data": object_data,
+                "width": provisional[2],
+                "height": provisional[3],
+                "flexible_height": max(
+                    flexible_height,
+                    1.0 if force_height else 0.0,
+                ),
+            }
+        )
+    if not rows:
+        return {}, True
+
+    total_spacing = spacing * max(0, len(rows) - 1)
+    preferred_total_height = sum(row["height"] for row in rows) + total_spacing
+    # A stable menu/list container has room for its serialized children.  If
+    # not, it is commonly a holder for mutually exclusive runtime states.
+    if len(rows) > 1 and preferred_total_height > inner_height + max(2.0, inner_height * 0.05):
+        return {}, False
+
+    for row in rows:
+        row["cell_height"] = row["height"]
+    remaining = inner_height - preferred_total_height
+    total_flexible = sum(row["flexible_height"] for row in rows)
+    if remaining > 0 and total_flexible > 0:
+        for row in rows:
+            row["cell_height"] += (
+                remaining * row["flexible_height"] / total_flexible
+            )
+
+    alignment = int(layout.get("m_ChildAlignment", 0) or 0)
+    horizontal_alignment = alignment % 3
+    vertical_alignment = max(0, min(2, alignment // 3))
+    ordered_rows = (
+        list(reversed(rows))
+        if bool(layout.get("m_ReverseArrangement", False)) else rows
+    )
+    total_height = sum(row["cell_height"] for row in ordered_rows) + total_spacing
+    inner_bottom = parent_rect[1] + padding_bottom
+    inner_top = parent_rect[1] + parent_rect[3] - padding_top
+    group_bottom = (
+        inner_bottom
+        + max(0.0, inner_height - total_height) * ((2 - vertical_alignment) / 2.0)
+    )
+    cursor_top = group_bottom + total_height
+    result: dict[int, tuple[float, float, float, float]] = {}
+    for row in ordered_rows:
+        cell_height = max(1.0, row["cell_height"])
+        cell_bottom = cursor_top - cell_height
+        child_height = cell_height if control_height else min(row["height"], cell_height)
+        fitted, _used_aspect = _preview_aspect_fitted_rect(
+            scope,
+            row["object_data"],
+            row["transform"],
+            (0.0, 0.0, row["width"], max(1.0, child_height)),
+        )
+        child_width = min(fitted[2], inner_width) if control_width else fitted[2]
+        child_height = min(fitted[3], cell_height)
+        x = (
+            parent_rect[0] + padding_left
+            + (inner_width - child_width) * (horizontal_alignment / 2.0)
+        )
+        y = (
+            cell_bottom
+            + (cell_height - child_height) * ((2 - vertical_alignment) / 2.0)
+        )
+        result[int(row["path_id"])] = (
+            x,
+            y,
+            max(1.0, child_width),
+            max(1.0, child_height),
+        )
+        cursor_top = cell_bottom - spacing
+    return result, True
+
+
 def _preview_vertical_layout_cross_axis_rects(
     scope: dict,
     parent_game_object_data: dict,
@@ -3208,6 +3381,12 @@ def _create_object_hierarchy_preview(match: dict, root_level: int, scopes: dict)
         raise ValueError("预览起始对象没有可用的 Transform/RectTransform")
     root_object_entry = _scope_entry(scope, ("GameObject",), root_object_id)
     root_object_data = _entry_data(root_object_entry) if root_object_entry else None
+    serialized_object_order = {
+        path_id: index
+        for index, path_id in enumerate(
+            _game_object_subtree_path_ids(scope, root_object_id, max_objects=4000)
+        )
+    }
     ui_root_size = (
         _preview_ui_root_reference_size(scope, root_object_data)
         if isinstance(root_object_data, dict) else None
@@ -3338,10 +3517,15 @@ def _create_object_hierarchy_preview(match: dict, root_level: int, scopes: dict)
             label_data = _entry_data(label_entry) if label_entry else None
             if not isinstance(label_data, dict):
                 continue
-            label_text = label_data.get("mText")
+            label_text = next(
+                (
+                    value for key in ("mText", "m_Text", "m_text")
+                    if isinstance((value := label_data.get(key)), str)
+                    and value.strip()
+                ),
+                None,
+            )
             if not isinstance(label_text, str):
-                label_text = label_data.get("m_Text")
-            if not isinstance(label_text, str) or not label_text.strip():
                 continue
             label_rect = _preview_ngui_component_rect(
                 label_data, transform_data, rect, world_scale
@@ -3453,7 +3637,7 @@ def _create_object_hierarchy_preview(match: dict, root_level: int, scopes: dict)
             missing_sprites += 1
             tree_records[object_id]["preview_warning"] = "image_reference_unresolved"
 
-        child_nodes: list[tuple[int, dict]] = []
+        serialized_child_nodes: list[tuple[int, dict]] = []
         for pointer in _array_value(transform_data.get("m_Children")):
             file_id, child_transform_id = _pptr(pointer)
             child_transform_entry = (
@@ -3466,37 +3650,48 @@ def _create_object_hierarchy_preview(match: dict, root_level: int, scopes: dict)
             child_file_id, child_object_id = _pptr(child_transform.get("m_GameObject"))
             if child_file_id != 0 or not child_object_id:
                 continue
-            child_nodes.append((child_object_id, child_transform))
+            serialized_child_nodes.append((child_object_id, child_transform))
 
         preferred_child_id = chain_child_by_parent.get(object_id)
+        traversal_child_nodes = list(serialized_child_nodes)
         if preferred_child_id:
-            child_nodes.sort(
+            traversal_child_nodes.sort(
                 key=lambda item: 0 if item[0] == preferred_child_id else 1
             )
         layout_child_rects, used_horizontal_layout = (
             _preview_horizontal_layout_child_rects(
-                scope, object_data, rect, world_scale, child_nodes
+                scope, object_data, rect, world_scale, serialized_child_nodes
             )
         )
         if used_horizontal_layout:
             tree_records[object_id]["layout_note"] = "horizontal_layout_group"
-        elif child_nodes:
-            layout_child_rects, used_vertical_cross_layout = (
-                _preview_vertical_layout_cross_axis_rects(
-                    scope, object_data, rect, world_scale, child_nodes
+        elif serialized_child_nodes:
+            layout_child_rects, used_vertical_layout = (
+                _preview_vertical_layout_child_rects(
+                    scope, object_data, rect, world_scale,
+                    serialized_child_nodes,
                 )
             )
-            if used_vertical_cross_layout:
-                tree_records[object_id]["layout_note"] = (
-                    "vertical_layout_cross_axis_runtime_states"
+            if used_vertical_layout:
+                tree_records[object_id]["layout_note"] = "vertical_layout_group"
+            else:
+                layout_child_rects, used_vertical_cross_layout = (
+                    _preview_vertical_layout_cross_axis_rects(
+                        scope, object_data, rect, world_scale,
+                        serialized_child_nodes,
+                    )
                 )
-        for child_object_id, child_transform in child_nodes:
+                if used_vertical_cross_layout:
+                    tree_records[object_id]["layout_note"] = (
+                        "vertical_layout_cross_axis_runtime_states"
+                    )
+        rendered_child_ids: set[int] = set()
+        for child_object_id, child_transform in traversal_child_nodes:
             if (
                 limited_hierarchy_path_ids is not None
                 and child_object_id not in limited_hierarchy_path_ids
             ):
                 continue
-            tree_records[object_id]["children"].append(child_object_id)
             child_rect = layout_child_rects.get(
                 child_object_id,
                 _rect_transform_child_rect(child_transform, rect, world_scale),
@@ -3518,6 +3713,13 @@ def _create_object_hierarchy_preview(match: dict, root_level: int, scopes: dict)
                 child_object_id, child_rect, rect, active, hierarchy_chain,
                 child_world_scale, child_world_rotation,
             )
+            if child_object_id in tree_records:
+                rendered_child_ids.add(child_object_id)
+        tree_records[object_id]["children"] = [
+            child_object_id
+            for child_object_id, _child_transform in serialized_child_nodes
+            if child_object_id in rendered_child_ids
+        ]
 
     root_world_scale = _preview_root_world_scale(
         root_transform,
@@ -3620,7 +3822,10 @@ def _create_object_hierarchy_preview(match: dict, root_level: int, scopes: dict)
         )
 
     rendered_images.sort(
-        key=lambda row: int(row[5].get("mDepth", row[5].get("m_Depth", 0)) or 0)
+        key=lambda row: (
+            int(row[5].get("mDepth", row[5].get("m_Depth", 0)) or 0),
+            serialized_object_order.get(int(row[0]), 1_000_000),
+        )
     )
     for (
         _object_id,
@@ -3659,15 +3864,22 @@ def _create_object_hierarchy_preview(match: dict, root_level: int, scopes: dict)
         world_font_scale = math.sqrt(
             abs(float(text_world_scale[0]) * float(text_world_scale[1]))
         )
+        serialized_font_size = label_data.get("mFontSize")
+        if serialized_font_size is None:
+            serialized_font_size = label_data.get("m_fontSize")
         requested_size = max(6, round(
-            _number(label_data.get("mFontSize"), 16)
+            _number(serialized_font_size, 16)
             * _number(label_data.get("mFontScale"), 1.0)
             * world_font_scale
             * scale
         ))
         font_size = max(8, min(requested_size, max(8, target_height - 2), 64))
         font = _preview_font(font_size)
-        color_data = label_data.get("mColor") or label_data.get("m_Color")
+        color_data = (
+            label_data.get("mColor")
+            or label_data.get("m_Color")
+            or label_data.get("m_fontColor")
+        )
         rgba = tuple(
             max(0, min(255, round(_number(color_data.get(key), 1.0) * 255)))
             if isinstance(color_data, dict) else 255
@@ -3675,11 +3887,19 @@ def _create_object_hierarchy_preview(match: dict, root_level: int, scopes: dict)
         )
         if not active:
             rgba = (rgba[0], rgba[1], rgba[2], rgba[3] // 3)
-        # NGUI's ShrinkContent mode (mOverflow=0) reduces the glyph size until
-        # the label fits.  Ignoring mFontScale/mOverflow made labels overlap
-        # adjacent buttons even when their serialized rectangles were correct.
-        if int(label_data.get("mOverflow", 0) or 0) == 0:
-            while font_size > 6:
+        # NGUI ShrinkContent and TMP auto-sizing both reduce glyph size until
+        # the label fits the serialized rectangle.
+        overflow_mode = label_data.get("mOverflow")
+        if overflow_mode is None:
+            overflow_mode = label_data.get("m_overflowMode", 0)
+        auto_sizing = bool(label_data.get("m_enableAutoSizing", False))
+        minimum_size = max(6, round(
+            _number(label_data.get("m_fontSizeMin"), 6)
+            * world_font_scale
+            * scale
+        ))
+        if auto_sizing or int(overflow_mode or 0) == 0:
+            while font_size > minimum_size:
                 probe = text_draw.multiline_textbbox(
                     (0, 0), cleaned_text, font=font, spacing=1
                 )
@@ -3697,15 +3917,43 @@ def _create_object_hierarchy_preview(match: dict, root_level: int, scopes: dict)
         text_height = text_box[3] - text_box[1]
         pivot = int(label_data.get("mPivot", 4) or 0)
         alignment = int(label_data.get("mAlignment", 0) or 0)
-        if alignment == 1 or (alignment == 0 and pivot in {0, 3, 6}):
+        tmp_horizontal = label_data.get("m_HorizontalAlignment")
+        if tmp_horizontal is not None:
+            tmp_horizontal = int(tmp_horizontal or 0)
+        if (
+            (tmp_horizontal is not None and bool(tmp_horizontal & 1))
+            or (tmp_horizontal is None and alignment == 1)
+            or (
+                tmp_horizontal is None
+                and alignment == 0
+                and pivot in {0, 3, 6}
+            )
+        ):
             text_left = 0
-        elif alignment == 3 or (alignment == 0 and pivot in {2, 5, 8}):
+        elif (
+            (tmp_horizontal is not None and bool(tmp_horizontal & 4))
+            or (tmp_horizontal is None and alignment == 3)
+            or (
+                tmp_horizontal is None
+                and alignment == 0
+                and pivot in {2, 5, 8}
+            )
+        ):
             text_left = max(0, target_width - text_width)
         else:
             text_left = max(0, (target_width - text_width) // 2)
-        if pivot in {0, 1, 2}:
+        tmp_vertical = label_data.get("m_VerticalAlignment")
+        if tmp_vertical is not None:
+            tmp_vertical = int(tmp_vertical or 0)
+        if (
+            (tmp_vertical is not None and bool(tmp_vertical & 256))
+            or (tmp_vertical is None and pivot in {0, 1, 2})
+        ):
             text_top = 0
-        elif pivot in {6, 7, 8}:
+        elif (
+            (tmp_vertical is not None and bool(tmp_vertical & 1024))
+            or (tmp_vertical is None and pivot in {6, 7, 8})
+        ):
             text_top = max(0, target_height - text_height)
         else:
             text_top = max(0, (target_height - text_height) // 2)
@@ -3735,7 +3983,7 @@ def _create_object_hierarchy_preview(match: dict, root_level: int, scopes: dict)
         f"静态近似预览 | 起始层级 {root_level} | 对象 {len(visited)} | "
         f"已绘制图片 {len(rendered_images)} | 已绘制文本 {len(rendered_texts)} | "
         f"无法解码/外部图片 {missing_sprites} | "
-        "已还原比例/横向布局 | 不执行动画、脚本、完整 Layout、Mask 和 Shader"
+        "已还原比例/横纵布局 | 不执行动画、脚本、完整 Layout、Mask 和 Shader"
     )
     footer_box = draw.textbbox((0, 0), footer, font=small_font)
     footer_height = footer_box[3] - footer_box[1] + 10
@@ -5563,6 +5811,33 @@ def _store_product_pointer_key(file_id: int, path_id: int) -> str:
     return f"{int(file_id)}:{int(path_id)}"
 
 
+def _is_serialized_pointer(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    keys = {str(key) for key in value}
+    return bool(keys & {"m_PathID", "PathID"}) and keys <= {
+        "m_FileID", "m_PathID", "FileID", "PathID",
+    }
+
+
+def _store_inline_product_key(value: object, index: int) -> str:
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+    return f"inline:{int(index)}:{digest}"
+
+
+def _store_array_item_key(value: object, index: int) -> str:
+    if _is_serialized_pointer(value):
+        file_id, path_id = _pptr(value)
+        return f"pointer:{int(index)}:{int(file_id)}:{int(path_id)}"
+    return _store_inline_product_key(value, index)
+
+
 def _store_product_config_key(
     source_json: object,
     path_id: int,
@@ -5635,10 +5910,11 @@ def _serialized_pointer_assets(value: object, scope: dict, path: tuple[str, ...]
 
 STORE_ARRAY_HINTS = (
     "product", "offer", "goods", "item", "skin", "shop", "store",
-    "bundle", "package", "catalog", "iap", "purchase",
+    "bundle", "package", "catalog", "iap", "purchase", "trade", "sell", "buy",
 )
 STORE_CONTEXT_HINTS = (
     "shop", "store", "market", "bank", "goods", "iap", "purchase", "offer",
+    "trade", "trader", "merchant", "vendor",
 )
 TASK_LIST_HINTS = (
     "task", "quest", "mission", "achievement", "challenge", "objective",
@@ -5652,7 +5928,9 @@ TASK_ENTRY_FIELD_HINTS = (
 DYNAMIC_LIST_ARRAY_HINTS = tuple(dict.fromkeys((*STORE_ARRAY_HINTS, *TASK_LIST_HINTS)))
 DYNAMIC_LIST_CONTEXT_HINTS = tuple(dict.fromkeys((*STORE_CONTEXT_HINTS, *TASK_LIST_HINTS)))
 STORE_COMMERCE_FIELD_HINTS = (
-    "productid", "itemid", "offerid", "sku", "price", "_cost", ".cost", "currency",
+    "productid", "itemid", "templateid", "offerid", "sku", "price", "stock",
+    "gemprice", "adamount",
+    "_cost", ".cost", "currency",
     "purchase", "iap", "reward", "quantity", "discount", "ads",
     "unlock", "owned", "billing", "receipt", "realmoney", "softcurrency",
 )
@@ -5713,7 +5991,14 @@ def _best_product_image(data: dict, scope: dict) -> dict | None:
         atlas_path_id = int(asset["path_id"])
         referenced_data = _entry_data(asset.get("entry"))
         if isinstance(referenced_data, dict):
-            sprite_file_id, sprite_path_id = _pptr(referenced_data.get("m_Sprite"))
+            sprite_pointer = referenced_data.get("m_Sprite")
+            if sprite_pointer is None:
+                sprite_pointer = referenced_data.get("m_sprite")
+            if sprite_pointer is None:
+                sprite_pointer = referenced_data.get("sprite")
+            if sprite_pointer is None:
+                sprite_pointer = referenced_data.get("icon")
+            sprite_file_id, sprite_path_id = _pptr(sprite_pointer)
             sprite_scope = _resolve_pointer_scope(atlas_scope, sprite_file_id)
             sprite_entry = (
                 _scope_entry(sprite_scope, ("Sprite",), sprite_path_id)
@@ -5851,6 +6136,180 @@ def _best_product_image(data: dict, scope: dict) -> dict | None:
 
     candidates.sort(key=score)
     return candidates[0]
+
+
+def _dynamic_product_image_name_forms(value: object) -> set[str]:
+    """Return conservative comparable forms for a product ID or image asset name."""
+    normalized = re.sub(r"[^a-z0-9]", "", str(value).casefold())
+    if not normalized:
+        return set()
+    forms = {normalized}
+    prefixes = (
+        "producticon", "product", "itemicon", "itemsprite", "item",
+        "shopicon", "storeicon", "icon",
+    )
+    suffixes = ("sprite", "texture", "thumbnail", "thumb", "preview", "icon")
+    changed = True
+    while changed:
+        changed = False
+        for current in tuple(forms):
+            for prefix in prefixes:
+                if current.startswith(prefix) and len(current) - len(prefix) >= 4:
+                    candidate = current[len(prefix):]
+                    if candidate not in forms:
+                        forms.add(candidate)
+                        changed = True
+            for suffix in suffixes:
+                if current.endswith(suffix) and len(current) - len(suffix) >= 4:
+                    candidate = current[:-len(suffix)]
+                    if candidate not in forms:
+                        forms.add(candidate)
+                        changed = True
+    return forms
+
+
+def _named_product_image_index(scopes: dict) -> dict:
+    """Index Sprite/Texture2D assets for rows that store a string template ID.
+
+    Unity data frequently keeps only an ItemTemplateId in a trade table.  That
+    is not a PPtr, so the normal reference walker cannot reach the icon even
+    though an exported Sprite with the same semantic name exists elsewhere.
+    """
+    rows: list[dict] = []
+    exact: dict[str, list[dict]] = {}
+    for scope_key, scope in scopes.items():
+        for (type_name, path_id), entry in scope.get("items", {}).items():
+            if type_name not in {"Sprite", "Texture2D"}:
+                continue
+            name = str(
+                _manifest_value(
+                    entry.get("item", {}), "AssetName", "assetName", default=""
+                )
+            ).strip()
+            if not name:
+                asset_data = _entry_data(entry)
+                name = str(asset_data.get("m_Name", "")).strip() if asset_data else ""
+            forms = _dynamic_product_image_name_forms(name)
+            if not forms:
+                continue
+            row = {
+                "scope_key": scope_key,
+                "scope": scope,
+                "entry": entry,
+                "type_name": type_name,
+                "path_id": int(path_id),
+                "name": name,
+                "forms": forms,
+            }
+            rows.append(row)
+            for form in forms:
+                exact.setdefault(form, []).append(row)
+    return {"rows": rows, "exact": exact}
+
+
+def _best_named_product_image(data: dict, image_index: dict | None) -> dict | None:
+    """Resolve an icon from ItemTemplateId-like strings without inventing a link."""
+    if not isinstance(image_index, dict):
+        return None
+    identity_fields = {
+        "itemtemplateid", "templateid", "productid", "itemid", "offerid", "sku",
+    }
+    identities: list[tuple[str, str, set[str]]] = []
+    for path, value in _walk_serialized_strings(data):
+        if not path:
+            continue
+        field = re.sub(r"[^a-z0-9]", "", str(path[-1]).casefold())
+        if not any(field == hint or field.endswith(hint) for hint in identity_fields):
+            continue
+        forms = _dynamic_product_image_name_forms(value)
+        if forms:
+            identities.append((".".join(path), value, forms))
+    if not identities:
+        return None
+
+    rows = image_index.get("rows", [])
+    exact_index = image_index.get("exact", {})
+    ranked: list[tuple[float, float, int, str, dict, str, str]] = []
+    seen: set[tuple[object, str, int, str]] = set()
+    for field_path, value, wanted_forms in identities:
+        exact_rows = [
+            row
+            for form in wanted_forms
+            for row in exact_index.get(form, [])
+        ]
+        candidates = exact_rows or rows
+        for row in candidates:
+            key = (
+                row.get("scope_key"), str(row.get("type_name", "")),
+                int(row.get("path_id", 0) or 0), field_path,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            asset_forms = row.get("forms", set())
+            if not isinstance(asset_forms, set) or not asset_forms:
+                continue
+            exact_match = bool(wanted_forms & asset_forms)
+            similarity = 1.0 if exact_match else max(
+                difflib.SequenceMatcher(None, wanted, asset).ratio()
+                for wanted in wanted_forms
+                for asset in asset_forms
+            )
+            shortest = min(
+                min((len(form) for form in wanted_forms), default=0),
+                min((len(form) for form in asset_forms), default=0),
+            )
+            if not exact_match and (shortest < 7 or similarity < 0.86):
+                continue
+            kind_priority = 2 if row.get("type_name") == "Sprite" else 1
+            item_asset_bonus = (
+                0.015
+                if re.sub(r"[^a-z0-9]", "", str(row.get("name", "")).casefold())
+                .startswith("item")
+                else 0.0
+            )
+            combined = similarity + (0.06 if kind_priority == 2 else 0.0) + item_asset_bonus
+            ranked.append(
+                (
+                    combined, similarity, kind_priority,
+                    str(row.get("name", "")).casefold(), row, field_path, value,
+                )
+            )
+    if not ranked:
+        return None
+    ranked.sort(
+        key=lambda item: (
+            -item[0], -item[1], -item[2], item[3],
+            str(item[4].get("scope", {}).get("source", "")).casefold(),
+            int(item[4].get("path_id", 0) or 0),
+        )
+    )
+    _combined, similarity, _kind_priority, _name_key, best, field_path, value = ranked[0]
+    if similarity < 1.0:
+        distinct_runner = next(
+            (
+                row for row in ranked[1:]
+                if row[4].get("forms") != best.get("forms")
+            ),
+            None,
+        )
+        if distinct_runner is not None and distinct_runner[1] >= similarity - 0.025:
+            return None
+    image_kind = "sprite" if best.get("type_name") == "Sprite" else "texture"
+    return {
+        "field_path": f"{field_path} -> 资源名匹配",
+        "field_name": field_path.rsplit(".", 1)[-1],
+        "type_name": str(best.get("type_name", "")),
+        "file_id": 0,
+        "path_id": int(best.get("path_id", 0) or 0),
+        "scope": best.get("scope"),
+        "entry": best.get("entry"),
+        "name": str(best.get("name", "")),
+        "image_kind": image_kind,
+        "image_name": str(best.get("name", "")),
+        "identity_value": value,
+        "identity_similarity": round(similarity, 4),
+    }
 
 
 def _best_product_sprite(data: dict, scope: dict) -> dict | None:
@@ -6024,13 +6483,225 @@ def _store_product_descriptor(
     }
 
 
+def _reward_pet_catalog_item(scope: dict, pet_id: int) -> dict | None:
+    if pet_id < 0:
+        return None
+    catalogs: list[tuple[int, list[dict]]] = []
+    for (type_name, _path_id), entry in scope.get("items", {}).items():
+        if type_name != "MonoBehaviour":
+            continue
+        container = _entry_data(entry)
+        if not isinstance(container, dict):
+            continue
+        container_name = str(container.get("m_Name", "")).casefold()
+        if "pet" not in container_name:
+            continue
+        for array_path, values in _walk_serialized_arrays(container):
+            path_label = ".".join(array_path).casefold()
+            if "pet" not in path_label or "item" not in path_label:
+                continue
+            if not values or not all(isinstance(value, dict) for value in values):
+                continue
+            score = (
+                (20 if "shop" in container_name else 0)
+                + (10 if "data" in container_name else 0)
+                + len(values)
+            )
+            catalogs.append((score, values))
+    for _score, values in sorted(catalogs, key=lambda row: -row[0]):
+        explicit = next(
+            (
+                value for value in values
+                if int(_number(value.get("m_id", value.get("id", -1)), -1)) == pet_id
+                and int(_number(value.get("m_id", value.get("id", -1)), -1)) != 0
+            ),
+            None,
+        )
+        if explicit is not None:
+            return explicit
+        if 0 <= pet_id < len(values):
+            return values[pet_id]
+    return None
+
+
+def _store_inline_product_descriptor(
+    scope: dict,
+    data: dict,
+    index: int,
+    named_image_index: dict | None = None,
+) -> dict:
+    """Describe a product serialized directly inside its owner's array.
+
+    A large number of Unity games use arrays of serializable structs rather
+    than PPtrs to standalone MonoBehaviours.  Those rows are just as safe to
+    remove from the owning array, but they do not have their own PathID.
+    """
+    assets = _serialized_pointer_assets(data, scope)
+    linked_type_name = next(
+        (
+            str(linked_data.get("m_Name", "")).strip()
+            for asset in assets
+            if asset.get("type_name") == "MonoBehaviour"
+            and any(
+                hint in str(asset.get("field_path", "")).casefold()
+                for hint in ("infotype", "rewardtype", "currencytype")
+            )
+            for linked_data in [_entry_data(asset.get("entry"))]
+            if isinstance(linked_data, dict)
+            and str(linked_data.get("m_Name", "")).strip()
+        ),
+        "",
+    )
+    best_image = _best_product_image(data, scope)
+    if best_image is None:
+        best_image = _best_named_product_image(data, named_image_index)
+    reward_pet_name = ""
+    try:
+        reward_pet_id = int(float(data.get("m_petId", data.get("petId", -1))))
+    except (TypeError, ValueError):
+        reward_pet_id = -1
+    if "pet" in linked_type_name.casefold() and reward_pet_id >= 0:
+        reward_pet_data = _reward_pet_catalog_item(scope, reward_pet_id)
+        if isinstance(reward_pet_data, dict):
+            reward_pet_image = _best_product_image(reward_pet_data, scope)
+            if reward_pet_image is not None:
+                best_image = reward_pet_image
+            reward_pet_name = str(
+                reward_pet_data.get("m_itemName")
+                or reward_pet_data.get("itemName")
+                or reward_pet_data.get("m_Name")
+                or ""
+            ).strip()
+    prefab = next(
+        (
+            asset for asset in assets
+            if asset.get("type_name") == "GameObject"
+            and any(
+                hint in str(asset.get("field_path", "")).casefold()
+                for hint in ("prefab", "template", "view", "button", "card", "entry")
+            )
+        ),
+        None,
+    )
+    back_file_id, back_path_id = _pptr(
+        data.get("_backSprite")
+        or data.get("m_backSprite")
+        or data.get("backgroundSprite")
+    )
+    back_scope = _resolve_pointer_scope(scope, back_file_id)
+    image_kind = str(best_image.get("image_kind", "")) if best_image else ""
+    image_scope = best_image.get("scope") if best_image else None
+    image_path_id = int(best_image.get("path_id", 0) or 0) if best_image else 0
+    sprite_path_id = image_path_id if image_kind == "sprite" else 0
+    texture_path_id = image_path_id if image_kind == "texture" else 0
+    ngui_atlas_path_id = (
+        int(best_image.get("ngui_atlas_path_id", image_path_id) or 0)
+        if best_image and image_kind == "ngui_sprite" else 0
+    )
+    signal_fields = _product_signal_fields(data)
+    signal_hints = {
+        hint
+        for hint in (*STORE_COMMERCE_FIELD_HINTS, *TASK_ENTRY_FIELD_HINTS)
+        if any(hint in field for field in signal_fields)
+    }
+    evidence_score = (
+        (2 if best_image else 0)
+        + min(4, len(signal_hints))
+        + (1 if prefab else 0)
+    )
+
+    def first_value(*names: str) -> object:
+        for name in names:
+            value = data.get(name)
+            if value not in (None, ""):
+                return value
+        return ""
+
+    def as_int(value: object) -> int:
+        try:
+            return int(float(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    name = str(first_value(
+        "m_itemName", "itemName", "m_Name", "name", "title", "displayName",
+        "ItemTemplateId", "itemTemplateId", "itemTemplateID", "TemplateId",
+        "templateId", "productId", "itemId", "m_id", "id",
+    )).strip()
+    if not name:
+        amount = as_int(first_value("m_amount", "amount", "quantity", "m_quantity"))
+        pet_id = as_int(first_value("m_petId", "petId"))
+        if linked_type_name:
+            name = linked_type_name
+            if amount:
+                name += f" ×{amount}"
+            if reward_pet_name:
+                name += f" ({reward_pet_name})"
+            elif pet_id:
+                name += f" (Pet {pet_id})"
+    if not name:
+        name = f"<内嵌条目 #{index + 1}>"
+    pointer_key = _store_inline_product_key(data, index)
+    prefab_path_id = int(prefab.get("path_id", 0) or 0) if prefab else 0
+    return {
+        "index": index,
+        "file_id": 0,
+        "path_id": 0,
+        "pointer_key": pointer_key,
+        "entry_kind": "inline",
+        "inline_hash": pointer_key.rsplit(":", 1)[-1],
+        "name": name,
+        "source_json": "",
+        "resolved": True,
+        "product_scope": scope,
+        "product_object_path_id": 0,
+        "product_object_scope": None,
+        "image_kind": image_kind,
+        "image_name": str(best_image.get("image_name", "")) if best_image else "",
+        "image_scope": image_scope,
+        "image_path_id": image_path_id,
+        "image_field": str(best_image.get("field_path", "")) if best_image else "",
+        "texture_path_id": texture_path_id,
+        "ngui_atlas_path_id": ngui_atlas_path_id,
+        "ngui_sprite_name": (
+            str(best_image.get("ngui_sprite_name", "")) if best_image else ""
+        ),
+        "sprite_file_id": int(best_image.get("file_id", 0) or 0) if best_image else 0,
+        "sprite_path_id": sprite_path_id,
+        "sprite_scope": image_scope if image_kind == "sprite" else None,
+        "sprite_field": (
+            str(best_image.get("field_path", ""))
+            if best_image and image_kind == "sprite" else ""
+        ),
+        "sprite_name": str(best_image.get("image_name", "")) if best_image else "",
+        "back_sprite_path_id": back_path_id,
+        "back_sprite_name": _asset_name(back_scope, "Sprite", back_path_id),
+        "prefab_path_id": prefab_path_id,
+        "prefab_object_path_id": prefab_path_id,
+        "prefab_name": str(prefab.get("name", "")) if prefab else "",
+        "reward_ads": as_int(first_value(
+            "_rewardADS", "m_rewardADS", "m_itemAdAmount", "itemAdAmount",
+        )),
+        "reward_ads_to_show": as_int(first_value(
+            "_rewardADSToShow", "m_rewardADSToShow", "m_itemAdAmount", "itemAdAmount",
+        )),
+        "signal_fields": signal_fields,
+        "evidence_score": evidence_score,
+        "field_signature": sorted(
+            str(key).casefold()
+            for key in data
+            if str(key) not in {"m_GameObject", "m_Enabled", "m_Script", "m_Name"}
+        ),
+    }
+
+
 def _store_product_config_entries(scopes: dict) -> list[tuple[object, dict, int, dict]]:
     prefilter_hints = tuple(dict.fromkeys(
         (
-            *DYNAMIC_LIST_ARRAY_HINTS,
-            *DYNAMIC_LIST_CONTEXT_HINTS,
-            *STORE_COMMERCE_FIELD_HINTS,
-            *TASK_ENTRY_FIELD_HINTS,
+            *STORE_ARRAY_HINTS,
+            *STORE_CONTEXT_HINTS,
+            "task", "quest", "mission", "achievement", "challenge",
+            "objective", "daily", "reward", "price", "currency",
         )
     ))
     entries = [
@@ -6039,26 +6710,78 @@ def _store_product_config_entries(scopes: dict) -> list[tuple[object, dict, int,
         for (type_name, path_id), entry in scope.get("items", {}).items()
         if type_name == "MonoBehaviour"
     ]
+    technical_array_names = {
+        "m_component", "m_children", "m_materials", "materials", "m_calls",
+        "m_persistentcalls", "m_modifications", "m_addedcomponents",
+        "m_addedgameobjects", "m_removedcomponents", "m_removedgameobjects",
+        "m_exposedreferences", "m_animationclips", "m_events",
+    }
+
+    def has_structural_inline_array(data: dict) -> bool:
+        for array_path, values in _walk_serialized_arrays(data):
+            if not (2 <= len(values) <= 500):
+                continue
+            if not values or not all(isinstance(value, dict) for value in values):
+                continue
+            if all(_is_serialized_pointer(value) for value in values):
+                continue
+            if any(str(part).casefold() in technical_array_names for part in array_path):
+                continue
+            signatures = [
+                tuple(sorted(str(key).casefold() for key in value))
+                for value in values[:20]
+            ]
+            if not signatures or len(set(signatures)) > max(2, len(signatures) // 3):
+                continue
+            common_fields = set(signatures[0])
+            if len(common_fields) < 2:
+                continue
+            if any(
+                not isinstance(child, (dict, list))
+                for value in values[:5]
+                for child in value.values()
+            ):
+                return True
+        return False
+
+    def has_candidate_array(data: dict) -> bool:
+        container_name = str(data.get("m_Name", "")).casefold()
+        named_context = any(
+            hint in container_name
+            for hint in (*DYNAMIC_LIST_CONTEXT_HINTS, "reward")
+        )
+        for array_path, values in _walk_serialized_arrays(data):
+            if not (1 <= len(values) <= 500):
+                continue
+            if not values or not all(isinstance(value, dict) for value in values):
+                continue
+            if any(str(part).casefold() in technical_array_names for part in array_path):
+                continue
+            path_label = ".".join(array_path).casefold()
+            if named_context or any(
+                hint in path_label
+                for hint in (*DYNAMIC_LIST_ARRAY_HINTS, "reward")
+            ):
+                return True
+        return bool(container_name) and has_structural_inline_array(data)
+
     preloaded = [
         row for row in entries
         if isinstance(row[3].get("data"), dict)
-        and any(
-            hint in field
-            for field in _serialized_field_paths(row[3]["data"])
-            for hint in prefilter_hints
-        )
+        and has_candidate_array(row[3]["data"])
     ]
+    if entries and all(isinstance(row[3].get("data"), dict) for row in entries):
+        return preloaded
     entry_by_path = {
         str(row[3]["path"].resolve()).casefold(): row
         for row in entries
         if row[3].get("path")
     }
-    search_dirs = sorted({str(row[3]["path"].parent) for row in entries})
     try:
         command = [
-            "rg", "-l", "-i", "--glob", "*.json", "-e",
+            "rg", "-l", "-i", "--glob", "**/MonoBehaviour/*.json", "-e",
             '"[^\"]*(' + "|".join(prefilter_hints) + ')[^\"]*"\\s*:\\s*\\{',
-            *search_dirs,
+            str(DEFAULT_SOURCE_ROOT),
         ]
         result = subprocess.run(
             command, capture_output=True, text=True, encoding="utf-8",
@@ -6067,22 +6790,35 @@ def _store_product_config_entries(scopes: dict) -> list[tuple[object, dict, int,
         if result.returncode not in {0, 1}:
             raise RuntimeError(result.stderr.strip() or f"rg 返回码 {result.returncode}")
         matched = [
-            entry_by_path[key]
+            row
             for line in result.stdout.splitlines()
             if (key := str(Path(line.strip()).resolve()).casefold()) in entry_by_path
+            for row in [entry_by_path[key]]
+            if isinstance((data := _entry_data(row[3])), dict)
+            and has_candidate_array(data)
         ]
-        unique = {str(row[3]["path"].resolve()).casefold(): row for row in preloaded + matched}
+        unique = {
+            str(row[3]["path"].resolve()).casefold(): row
+            for row in preloaded + matched
+        }
         return list(unique.values())
     except (FileNotFoundError, OSError, RuntimeError):
         pass
-    result: list[tuple[object, dict, int, dict]] = list(preloaded)
-    preloaded_paths = {str(row[3]["path"]) for row in preloaded}
+    result: list[tuple[object, dict, int, dict]] = list({
+        str(row[3]["path"]): row for row in preloaded
+    }.values())
+    preloaded_paths = {str(row[3]["path"]) for row in result}
     for row in entries:
         if str(row[3]["path"]) in preloaded_paths:
             continue
         try:
             text = row[3]["path"].read_text(encoding="utf-8-sig").casefold()
-            if any(hint in text for hint in prefilter_hints):
+            data = _entry_data(row[3])
+            if (
+                any(hint in text for hint in prefilter_hints)
+                and isinstance(data, dict)
+                and has_candidate_array(data)
+            ):
                 result.append(row)
         except (OSError, UnicodeError):
             continue
@@ -6096,7 +6832,10 @@ def _store_array_classification(
 ) -> dict:
     path_label = ".".join(array_path).casefold()
     container_name = str(container_data.get("m_Name", "")).casefold()
-    strong_array_hints = ("product", "offer", "goods", "bundle", "package", "iap", "purchase")
+    strong_array_hints = (
+        "product", "offer", "goods", "bundle", "package", "iap", "purchase",
+        "trade", "sell", "buy",
+    )
     medium_array_hints = ("item", "skin", "shop", "store", "catalog")
     commerce_context = any(
         hint in path_label or hint in container_name
@@ -6120,12 +6859,30 @@ def _store_array_classification(
     )
     signatures = [tuple(product.get("field_signature", [])) for product in products]
     consistency_score = 1 if signatures and len(set(signatures)) == 1 else 0
+    signature_blob = " ".join(
+        str(field)
+        for product in products[:3]
+        for field in product.get("field_signature", [])
+    ).casefold()
+    image_count = sum(bool(product.get("image_kind")) for product in products)
+    strong_inline_product_structure = (
+        products[0].get("entry_kind") == "inline"
+        and "item" in path_label
+        and average_evidence >= 4
+        and image_count >= max(1, len(products) // 2)
+        and any(
+            hint in signature_blob
+            for hint in ("price", "cost", "currency", "adamount", "displayicon")
+        )
+    )
+    if strong_inline_product_structure:
+        commerce_context = True
     total_score = array_score + context_score + average_evidence + consistency_score
     accepted = (
         total_score >= 7
         and max(evidence_scores, default=0) >= 2
         and (array_score >= 3 or context_score >= 3)
-        and (commerce_context or task_context)
+        and (commerce_context or task_context or strong_inline_product_structure)
     )
     confidence = "高" if total_score >= 11 else "中" if total_score >= 8 else "低"
     list_kind = "任务/活动" if task_context and not commerce_context else "商店/商品"
@@ -6138,41 +6895,98 @@ def _store_array_classification(
         "context_score": context_score,
         "average_evidence": average_evidence,
         "consistency_score": consistency_score,
+        "strong_inline_product_structure": strong_inline_product_structure,
     }
 
 
-def _find_store_product_configs(scopes: dict) -> list[dict]:
+def _find_store_product_configs(
+    scopes: dict,
+    ai_accepted_ids: set[str] | None = None,
+    rejected_candidates: list[dict] | None = None,
+) -> list[dict]:
     """Find structurally scored serialized shop lists pointing at product data."""
     result: list[dict] = []
+    named_image_index: dict | None = None
+    ai_kind_map = _dynamic_list_ai_accepted_kind_map() if ai_accepted_ids else {}
     candidates = _store_product_config_entries(scopes)
     print(f"[动态列表] 数据数组配置预筛选: {len(candidates)} 个", flush=True)
     for scope_key, scope, path_id, entry in candidates:
         data = _entry_data(entry)
         if not isinstance(data, dict):
             continue
-        for array_path, pointers in _walk_serialized_arrays(data):
-            if not pointers:
+        for array_path, array_values in _walk_serialized_arrays(data):
+            if not array_values:
                 continue
             products: list[dict] = []
-            for index, pointer in enumerate(pointers):
-                file_id, product_path_id = _pptr(pointer)
-                if not product_path_id:
-                    products = []
-                    break
-                descriptor = _store_product_descriptor(
-                    scope, file_id, product_path_id, index
-                )
-                if not descriptor.get("resolved"):
-                    products = []
-                    break
-                products.append(descriptor)
+            if all(_is_serialized_pointer(value) for value in array_values):
+                for index, pointer in enumerate(array_values):
+                    file_id, product_path_id = _pptr(pointer)
+                    if not product_path_id:
+                        products = []
+                        break
+                    descriptor = _store_product_descriptor(
+                        scope, file_id, product_path_id, index
+                    )
+                    if not descriptor.get("resolved"):
+                        products = []
+                        break
+                    descriptor["legacy_pointer_key"] = descriptor["pointer_key"]
+                    descriptor["pointer_key"] = _store_array_item_key(pointer, index)
+                    products.append(descriptor)
+            elif all(isinstance(value, dict) for value in array_values):
+                if named_image_index is None:
+                    named_image_index = _named_product_image_index(scopes)
+                products = [
+                    _store_inline_product_descriptor(
+                        scope, value, index, named_image_index
+                    )
+                    for index, value in enumerate(array_values)
+                ]
             if not products:
                 continue
             source_json = str(entry["path"])
             path_label = ".".join(array_path)
             classification = _store_array_classification(data, array_path, products)
-            if not classification["accepted"]:
+            candidate_id = _store_product_config_key(source_json, path_id, array_path)
+            accepted_by_ai = bool(
+                ai_accepted_ids and candidate_id in ai_accepted_ids
+            )
+            if not classification["accepted"] and not accepted_by_ai:
+                if rejected_candidates is not None:
+                    rejected_candidates.append(
+                        {
+                            "candidate_id": candidate_id,
+                            "path_id": int(path_id),
+                            "_scope": scope,
+                            "_all_scopes": scopes,
+                            "name": str(data.get("m_Name", "")),
+                            "source": str(scope.get("source", "")),
+                            "bundle_entry": str(scope.get("bundle_entry", "")),
+                            "array_label": path_label,
+                            "item_count": len(products),
+                            "entry_kind": products[0].get("entry_kind", "pointer"),
+                            "field_signature": products[0].get("field_signature", []),
+                            "sample_names": [
+                                str(product.get("name", ""))
+                                for product in products[:5]
+                            ],
+                            "image_count": sum(
+                                bool(product.get("image_kind")) for product in products
+                            ),
+                            "classification": classification,
+                        }
+                    )
                 continue
+            if accepted_by_ai:
+                classification = {
+                    **classification,
+                    "accepted": True,
+                    "confidence": "AI复核",
+                    "ai_reviewed": True,
+                    "kind": ai_kind_map.get(
+                        candidate_id, classification.get("kind", "其他动态列表")
+                    ),
+                }
             config_object_file_id, config_object_path_id = _pptr(
                 data.get("m_GameObject")
             )
@@ -6197,7 +7011,7 @@ def _find_store_product_configs(scopes: dict) -> list[dict]:
                     "array_path": list(array_path),
                     "array_label": path_label,
                     "source_json": source_json,
-                    "config_key": _store_product_config_key(source_json, path_id, array_path),
+                    "config_key": candidate_id,
                     "products": products,
                     "classification": classification,
                 }
@@ -6211,6 +7025,455 @@ def _find_store_product_configs(scopes: dict) -> list[dict]:
         )
     )
     return result
+
+
+def _dynamic_list_ai_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "accepted": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "candidate_id": {"type": "string"},
+                        "kind": {
+                            "type": "string",
+                            "enum": ["商店/商品", "任务/活动", "其他动态列表"],
+                        },
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["candidate_id", "kind", "reason"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["accepted"],
+        "additionalProperties": False,
+    }
+
+
+def _dynamic_list_ai_candidates(rejected_candidates: list[dict]) -> list[dict]:
+    def is_reward_semantic_candidate(candidate: dict) -> bool:
+        label = (
+            str(candidate.get("name", ""))
+            + " "
+            + str(candidate.get("array_label", ""))
+        ).casefold()
+        fields = {
+            str(value).casefold()
+            for value in candidate.get("field_signature", [])
+        }
+        return (
+            "reward" in label
+            and any("infotype" in field for field in fields)
+            and any("amount" in field for field in fields)
+        )
+
+    candidates = [
+        candidate for candidate in rejected_candidates
+        if candidate.get("entry_kind") == "inline"
+        and str(candidate.get("name", "")).strip()
+        and int(candidate.get("item_count", 0) or 0) >= 2
+        and (
+            int(candidate.get("classification", {}).get("score", 0) or 0) >= 3
+            or is_reward_semantic_candidate(candidate)
+        )
+    ]
+    candidates.sort(
+        key=lambda candidate: (
+            -int(candidate.get("classification", {}).get("score", 0) or 0),
+            str(candidate.get("source", "")).casefold(),
+            str(candidate.get("name", "")).casefold(),
+            str(candidate.get("array_label", "")).casefold(),
+        )
+    )
+    # AI is a reviewer of locally bounded candidates, not an unrestricted
+    # project scanner.  Keeping the batch finite also makes failure/fallback
+    # predictable on very large exports.
+    return candidates[:120]
+
+
+def _parse_dynamic_list_ai_json(content: str) -> dict:
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.IGNORECASE)
+    try:
+        value = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        if start < 0:
+            raise ValueError("AI 动态列表复核没有返回 JSON 对象")
+        value, _end = json.JSONDecoder().raw_decode(cleaned[start:])
+    if not isinstance(value, dict):
+        raise ValueError("AI 动态列表复核结果不是 JSON 对象")
+    return value
+
+
+def _dynamic_list_ai_transport_chain(cfg) -> list[str]:
+    transport = str(
+        getattr(cfg, "ai_dynamic_list_transport", "codex_cli") or "codex_cli"
+    ).strip().lower()
+    http_ready = bool(
+        str(getattr(cfg, "ai_dynamic_list_base_url", "")).strip()
+        and str(getattr(cfg, "ai_dynamic_list_api_key", "")).strip()
+        and str(getattr(cfg, "ai_dynamic_list_model", "")).strip()
+    )
+    if transport == "http":
+        return ["http"] if http_ready else []
+    if transport != "codex_cli":
+        return []
+    chain: list[str] = []
+    if (
+        str(getattr(cfg, "ai_dynamic_list_codex_model", "gpt-5.3-codex-spark")).strip()
+        and codex_cli_available()
+    ):
+        chain.append("codex_cli")
+    if http_ready:
+        chain.append("http")
+    return chain
+
+
+def _dynamic_list_ai_cache_signature() -> str:
+    cfg = load_config(quiet=True)
+    payload = {
+        "prompt_version": 4,
+        "enabled": bool(getattr(cfg, "enable_ai_dynamic_list_review", False)),
+        "transport": str(getattr(cfg, "ai_dynamic_list_transport", "")),
+        "codex_model": str(getattr(cfg, "ai_dynamic_list_codex_model", "")),
+        "codex_reasoning": str(getattr(
+            cfg, "ai_dynamic_list_codex_reasoning_effort", ""
+        )),
+        "http_model": str(getattr(cfg, "ai_dynamic_list_model", "")),
+        "http_configured": bool(
+            str(getattr(cfg, "ai_dynamic_list_base_url", "")).strip()
+            and str(getattr(cfg, "ai_dynamic_list_api_key", "")).strip()
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _dynamic_list_candidate_reference_context(
+    candidates: list[dict],
+) -> dict[str, list[str]]:
+    all_scopes = next(
+        (
+            candidate.get("_all_scopes")
+            for candidate in candidates
+            if isinstance(candidate.get("_all_scopes"), dict)
+        ),
+        None,
+    )
+    if not isinstance(all_scopes, dict):
+        return {}
+    target_ids = {
+        int(candidate.get("path_id", 0) or 0)
+        for candidate in candidates
+        if int(candidate.get("path_id", 0) or 0)
+    }
+    if not target_ids:
+        return {}
+    targets = {
+        (id(candidate.get("_scope")), int(candidate.get("path_id", 0) or 0)):
+        str(candidate.get("candidate_id", ""))
+        for candidate in candidates
+        if isinstance(candidate.get("_scope"), dict)
+        and int(candidate.get("path_id", 0) or 0)
+    }
+    references: dict[str, set[str]] = {}
+    # These config assets are normally assigned through a top-level serialized
+    # field on a UI controller.  Walking the already-loaded object graph is far
+    # faster than launching a disk-wide PathID search, and identity-checking the
+    # resolved scope prevents collisions between bundles.
+    rows = [
+        (scope_key, scope, "MonoBehaviour", component_path_id, entry)
+        for scope_key, scope in all_scopes.items()
+        for (type_name, component_path_id), entry in scope.get("items", {}).items()
+        if type_name == "MonoBehaviour"
+    ]
+    for _scope_key, scope, _type_name, component_path_id, entry in rows:
+        data = _entry_data(entry)
+        if not isinstance(data, dict):
+            continue
+        matched_pointers: list[tuple[str, str]] = []
+        for field_name, pointer in data.items():
+            file_id, path_id = _pptr(pointer)
+            if not path_id:
+                continue
+            target_scope = _resolve_pointer_scope(scope, file_id)
+            candidate_id = targets.get((id(target_scope), int(path_id)))
+            if not candidate_id:
+                continue
+            field_label = str(field_name)
+            if any(
+                token in field_label.casefold()
+                for token in ("onclick", "persistentcalls", "event", "callback")
+            ):
+                continue
+            matched_pointers.append((candidate_id, field_label))
+        if not matched_pointers:
+            continue
+        _object_file_id, object_path_id = _pptr(data.get("m_GameObject"))
+        chain = _object_chain_direct(scope, object_path_id, 6) if object_path_id else []
+        owner_path = "/".join(
+            str(node.get("name", ""))
+            for node in reversed(chain)
+            if str(node.get("name", "")).strip()
+        )
+        component_name = str(data.get("m_Name", "")).strip()
+        owner_label = owner_path or component_name or f"MonoBehaviour#{component_path_id}"
+        for candidate_id, field_label in matched_pointers:
+            references.setdefault(candidate_id, set()).add(
+                f"{owner_label} -> {field_label or '<direct>'}"
+            )
+    return {
+        candidate_id: sorted(values)[:8]
+        for candidate_id, values in references.items()
+    }
+
+
+def _dynamic_list_ai_review_context(
+    rejected_candidates: list[dict],
+    cfg,
+) -> tuple[list[dict], dict[str, str], list[dict], str]:
+    candidates = _dynamic_list_ai_candidates(rejected_candidates)
+    public_id_to_candidate_id = {
+        "candidate_" + hashlib.sha256(
+            str(candidate["candidate_id"]).encode("utf-8")
+        ).hexdigest()[:16]: str(candidate["candidate_id"])
+        for candidate in candidates
+    }
+    candidate_id_to_public_id = {
+        candidate_id: public_id
+        for public_id, candidate_id in public_id_to_candidate_id.items()
+    }
+    reference_context = _dynamic_list_candidate_reference_context(candidates)
+    compact_candidates = [
+        {
+            "candidate_id": candidate_id_to_public_id[str(candidate["candidate_id"])],
+            "container_name": candidate.get("name", ""),
+            "array_path": candidate.get("array_label", ""),
+            "item_count": candidate.get("item_count", 0),
+            "field_signature": candidate.get("field_signature", []),
+            "sample_names": candidate.get("sample_names", []),
+            "resolved_image_count": candidate.get("image_count", 0),
+            "heuristic_score": candidate.get("classification", {}).get("score", 0),
+            "referenced_by": reference_context.get(
+                str(candidate.get("candidate_id", "")), []
+            ),
+        }
+        for candidate in candidates
+    ]
+    fingerprint_payload = {
+        "version": 4,
+        "candidates": compact_candidates,
+        "codex_model": str(getattr(cfg, "ai_dynamic_list_codex_model", "")),
+        "http_model": str(getattr(cfg, "ai_dynamic_list_model", "")),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return candidates, public_id_to_candidate_id, compact_candidates, fingerprint
+
+
+def _dynamic_list_ai_review_cache_matches(rejected_candidates: list[dict]) -> bool:
+    cfg = load_config(quiet=True)
+    if not bool(getattr(cfg, "enable_ai_dynamic_list_review", False)):
+        return True
+    candidates, _id_map, _compact, fingerprint = _dynamic_list_ai_review_context(
+        rejected_candidates, cfg
+    )
+    if not candidates:
+        return True
+    cached = _safe_read_json(DEFAULT_DYNAMIC_LIST_AI_REVIEW)
+    return bool(
+        isinstance(cached, dict)
+        and cached.get("fingerprint") == fingerprint
+        and isinstance(cached.get("accepted_candidate_ids"), list)
+        and isinstance(cached.get("accepted_kinds"), dict)
+    )
+
+
+def _dynamic_list_ai_accepted_kind_map() -> dict[str, str]:
+    cached = _safe_read_json(DEFAULT_DYNAMIC_LIST_AI_REVIEW)
+    values = cached.get("accepted_kinds") if isinstance(cached, dict) else None
+    if not isinstance(values, dict):
+        return {}
+    allowed = {"商店/商品", "任务/活动", "其他动态列表"}
+    return {
+        str(candidate_id): str(kind)
+        for candidate_id, kind in values.items()
+        if str(kind) in allowed
+    }
+
+
+def _request_dynamic_list_ai_review(rejected_candidates: list[dict]) -> set[str]:
+    cfg = load_config(quiet=True)
+    if not bool(getattr(cfg, "enable_ai_dynamic_list_review", False)):
+        return set()
+    (
+        candidates,
+        public_id_to_candidate_id,
+        compact_candidates,
+        fingerprint,
+    ) = _dynamic_list_ai_review_context(rejected_candidates, cfg)
+    if not candidates:
+        return set()
+    transports = _dynamic_list_ai_transport_chain(cfg)
+    if not transports:
+        print("[动态列表][AI] 未找到可用的 Codex CLI 或 DeepSeek HTTP 配置，跳过困难候选复核。")
+        return set()
+
+    cached = _safe_read_json(DEFAULT_DYNAMIC_LIST_AI_REVIEW)
+    if isinstance(cached, dict) and cached.get("fingerprint") == fingerprint:
+        cached_ids = cached.get("accepted_candidate_ids")
+        if isinstance(cached_ids, list) and isinstance(cached.get("accepted_kinds"), dict):
+            print(
+                f"[动态列表][AI] 已复用困难候选复核缓存："
+                f"候选={len(candidates)}，接受={len(cached_ids)}"
+            )
+            return {str(value) for value in cached_ids}
+
+    system_prompt = (
+        "你是 Unity 序列化动态列表审查助手。输入候选均由本地脚本从 MonoBehaviour "
+        "或 ScriptableObject 的内嵌结构体数组中提取。请只接受确实表示玩家可见且可按条目"
+        "增删的商店商品、任务、成就、活动奖励选项等动态列表。不要接受 UnityEvent、"
+        "Transform、材质、动画、渲染配置、调试初始化、坐标或纯技术缓存数组。"
+        "referenced_by 是本地解析出的真实组件/Object 引用链；若它明确来自 ShopPopup、"
+        "RewardShop、LuckySpin、任务页等玩家界面，应作为强证据。只能从输入 candidate_id "
+        "中选择，禁止创造路径。宁可不接受也不要误删运行时技术数据。"
+    )
+    user_content = json.dumps(
+        {"candidates": compact_candidates}, ensure_ascii=False, indent=2
+    )
+    allowed_public_ids = set(public_id_to_candidate_id)
+    failures: list[str] = []
+    result: dict | None = None
+    used_transport = ""
+    for transport in transports:
+        display_name = "Codex 5.3" if transport == "codex_cli" else "DeepSeek"
+        attempts = 1 if transport == "codex_cli" else 4
+        for attempt in range(1, attempts + 1):
+            try:
+                print(
+                    f"[动态列表][AI] {display_name} 复核困难候选："
+                    f"{len(candidates)} 个"
+                    + (f"，重试 {attempt}/{attempts}" if attempt > 1 else ""),
+                    flush=True,
+                )
+                if transport == "codex_cli":
+                    result, _usage = request_structured_output(
+                        model=str(getattr(
+                            cfg, "ai_dynamic_list_codex_model", "gpt-5.3-codex-spark"
+                        )),
+                        reasoning_effort=str(getattr(
+                            cfg, "ai_dynamic_list_codex_reasoning_effort", "medium"
+                        )),
+                        system_prompt=system_prompt,
+                        user_content=user_content,
+                        output_schema=_dynamic_list_ai_schema(),
+                        timeout=int(getattr(cfg, "ai_dynamic_list_timeout", 300)),
+                        working_directory=cfg.root_dir,
+                    )
+                else:
+                    import requests
+
+                    session = requests.Session()
+                    session.trust_env = False
+                    proxies = {
+                        key: value
+                        for key, value in {
+                            "http": str(getattr(cfg, "ai_dynamic_list_proxy_http", "")).strip(),
+                            "https": str(getattr(cfg, "ai_dynamic_list_proxy_https", "")).strip(),
+                        }.items()
+                        if value
+                    }
+                    response = session.post(
+                        str(getattr(cfg, "ai_dynamic_list_base_url", "")).strip().rstrip("/")
+                        + "/chat/completions",
+                        headers={
+                            "Authorization": "Bearer "
+                            + str(getattr(cfg, "ai_dynamic_list_api_key", "")).strip(),
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": str(getattr(cfg, "ai_dynamic_list_model", "")).strip(),
+                            "messages": [
+                                {"role": "system", "content": system_prompt + "只返回 JSON。"},
+                                {"role": "user", "content": user_content},
+                            ],
+                            "temperature": 0,
+                        },
+                        proxies=proxies or None,
+                        timeout=int(getattr(cfg, "ai_dynamic_list_timeout", 300)),
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    result = _parse_dynamic_list_ai_json(
+                        str(payload["choices"][0]["message"]["content"])
+                    )
+                used_transport = transport
+                break
+            except Exception as exc:
+                failures.append(f"{display_name}: {exc}")
+                print(f"[动态列表][AI] {display_name} 请求失败: {exc}")
+                if transport == "codex_cli":
+                    print("[动态列表][AI] Codex 5.3 不可用，立即回退 DeepSeek。")
+                    break
+        if result is not None:
+            break
+    if result is None:
+        print("[动态列表][AI] 自动复核失败，继续使用确定性扫描结果：" + "；".join(failures))
+        return set()
+
+    accepted_rows = result.get("accepted")
+    if not isinstance(accepted_rows, list):
+        print("[动态列表][AI] 返回缺少 accepted 数组，忽略 AI 结果。")
+        return set()
+    accepted_public_ids = {
+        str(row.get("candidate_id", ""))
+        for row in accepted_rows
+        if isinstance(row, dict)
+        and str(row.get("candidate_id", "")) in allowed_public_ids
+    }
+    accepted_ids = {
+        public_id_to_candidate_id[public_id]
+        for public_id in accepted_public_ids
+    }
+    accepted_kinds = {
+        public_id_to_candidate_id[str(row.get("candidate_id", ""))]:
+        str(row.get("kind", "其他动态列表"))
+        for row in accepted_rows
+        if isinstance(row, dict)
+        and str(row.get("candidate_id", "")) in accepted_public_ids
+    }
+    DEFAULT_DYNAMIC_LIST_AI_REVIEW.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        DEFAULT_DYNAMIC_LIST_AI_REVIEW,
+        {
+            "version": 4,
+            "fingerprint": fingerprint,
+            "transport": used_transport,
+            "candidate_count": len(candidates),
+            "accepted_candidate_ids": sorted(accepted_ids),
+            "accepted_kinds": accepted_kinds,
+            "accepted": [
+                row for row in accepted_rows
+                if isinstance(row, dict)
+                and str(row.get("candidate_id", "")) in accepted_public_ids
+            ],
+        },
+    )
+    print(
+        f"[动态列表][AI] 复核完成：候选={len(candidates)}，"
+        f"接受={len(accepted_ids)}，结果={DEFAULT_DYNAMIC_LIST_AI_REVIEW}"
+    )
+    return accepted_ids
 
 
 def _store_product_image_label(product: dict) -> str:
@@ -6262,12 +7525,19 @@ def _write_store_product_records(records: dict) -> None:
 
 def _store_blocked_keys(config: dict, records: dict | None = None) -> set[str]:
     records = records or _load_store_product_records()
-    return {
+    blocked = {
         str(item.get("pointer_key", ""))
         for item in records.get("items", [])
         if isinstance(item, dict)
         and item.get("config_key") == config.get("config_key")
     }
+    for product in config.get("products", []):
+        if not isinstance(product, dict):
+            continue
+        legacy_key = str(product.get("legacy_pointer_key", ""))
+        if legacy_key and legacy_key in blocked:
+            blocked.add(str(product.get("pointer_key", "")))
+    return blocked
 
 
 def _rebuild_store_product_replacement(config: dict, records: dict) -> Path | None:
@@ -6287,11 +7557,16 @@ def _rebuild_store_product_replacement(config: dict, records: dict) -> Path | No
     original_products = _nested_value(original, array_path)
     if not isinstance(original_products, list):
         raise ValueError(f"动态列表数组路径无效: {'.'.join(array_path)}")
-    kept_products = [
-        pointer
-        for pointer in original_products
-        if _store_product_pointer_key(*_pptr(pointer)) not in blocked_keys
-    ]
+    kept_products = []
+    for index, item in enumerate(original_products):
+        entry_key = _store_array_item_key(item, index)
+        legacy_key = (
+            _store_product_pointer_key(*_pptr(item))
+            if _is_serialized_pointer(item) else ""
+        )
+        if entry_key in blocked_keys or (legacy_key and legacy_key in blocked_keys):
+            continue
+        kept_products.append(item)
     target_parent: object = patched
     for key in array_path[:-1]:
         if not isinstance(target_parent, dict):
@@ -6317,7 +7592,19 @@ def _set_store_product_blocked(config: dict, product: dict, blocked: bool) -> bo
     records = _load_store_product_records()
     items = [item for item in records["items"] if isinstance(item, dict)]
     record_key = f"{config['config_key']}|{product['pointer_key']}"
-    existed = any(item.get("record_key") == record_key for item in items)
+    product_keys = {
+        str(product.get("pointer_key", "")),
+        str(product.get("legacy_pointer_key", "")),
+    } - {""}
+    matched_record_keys = {
+        str(item.get("record_key", ""))
+        for item in items
+        if item.get("config_key") == config.get("config_key")
+        and str(item.get("pointer_key", "")) in product_keys
+    }
+    existed = bool(matched_record_keys) or any(
+        item.get("record_key") == record_key for item in items
+    )
     if blocked and not existed:
         items.append(
             {
@@ -6333,6 +7620,9 @@ def _set_store_product_blocked(config: dict, product: dict, blocked: bool) -> bo
                 "product_file_id": product.get("file_id", 0),
                 "product_path_id": product.get("path_id", 0),
                 "pointer_key": product.get("pointer_key", ""),
+                "legacy_pointer_key": product.get("legacy_pointer_key", ""),
+                "entry_kind": product.get("entry_kind", "pointer"),
+                "inline_hash": product.get("inline_hash", ""),
                 "original_index": product.get("index", 0),
                 "sprite_name": product.get("sprite_name", ""),
                 "sprite_path_id": product.get("sprite_path_id", 0),
@@ -6362,7 +7652,11 @@ def _set_store_product_blocked(config: dict, product: dict, blocked: bool) -> bo
             }
         )
     elif not blocked and existed:
-        items = [item for item in items if item.get("record_key") != record_key]
+        items = [
+            item for item in items
+            if item.get("record_key") != record_key
+            and str(item.get("record_key", "")) not in matched_record_keys
+        ]
     else:
         return False
     records["items"] = items
@@ -6371,7 +7665,11 @@ def _set_store_product_blocked(config: dict, product: dict, blocked: bool) -> bo
     action = "屏蔽" if blocked else "恢复"
     print(
         f"[动态列表][{action}] {config['name']} -> {product['name']} "
-        f"(PathID={product['path_id']})"
+        + (
+            f"(内嵌索引={int(product.get('index', 0)) + 1})"
+            if product.get("entry_kind") == "inline"
+            else f"(PathID={product['path_id']}, 原始索引={int(product.get('index', 0)) + 1})"
+        )
     )
     if target:
         print(f"[动态列表] 待导入 JSON: {target}")
@@ -6584,6 +7882,21 @@ def _grid_layout_settings(scope: dict, game_object_path_id: int) -> dict | None:
     return None
 
 
+def _rect_transform_reference_size(transform: dict | None) -> tuple[float, float]:
+    """Return fixed RectTransform axes and mark stretch-anchored axes as zero."""
+    if not isinstance(transform, dict):
+        return (0.0, 0.0)
+    width, height = _vec2(transform.get("m_SizeDelta"), (0.0, 0.0))
+    anchor_min = transform.get("m_AnchorMin")
+    anchor_max = transform.get("m_AnchorMax")
+    if isinstance(anchor_min, dict) and isinstance(anchor_max, dict):
+        if abs(_number(anchor_max.get("x")) - _number(anchor_min.get("x"))) > 0.001:
+            width = 0.0
+        if abs(_number(anchor_max.get("y")) - _number(anchor_min.get("y"))) > 0.001:
+            height = 0.0
+    return (width, height)
+
+
 def _store_layout_root(chain: list[dict]) -> tuple[int, dict, int]:
     def score(node: dict) -> int:
         name = str(node.get("name", "")).casefold()
@@ -6597,6 +7910,10 @@ def _store_layout_root(chain: list[dict]) -> tuple[int, dict, int]:
             return 70
         if "market panel" in name:
             return 55
+        if any(hint in name for hint in ("trade", "trader", "merchant", "vendor")):
+            return 100
+        if any(hint in name for hint in ("luckyspin", "lucky spin", "spin popup", "wheel")):
+            return 105
         if any(hint in name for hint in ("task window", "quest window", "mission window")):
             return 110
         if any(hint in name for hint in ("achievement", "challenge", "objective")):
@@ -6680,10 +7997,265 @@ def _find_instantiated_list_layout(config: dict) -> dict | None:
     }
 
 
+def _runtime_shell_layout(
+    shell: dict,
+    scopes: dict,
+    score: int,
+    config: dict | None = None,
+) -> dict | None:
+    scope = _runtime_shell_scope(shell, scopes)
+    if scope is None:
+        return None
+    component_path_id = int(shell.get("component_path_id", 0) or 0)
+    component_entry = _scope_entry(scope, ("MonoBehaviour",), component_path_id)
+    data = _entry_data(component_entry) if component_entry else None
+    if not isinstance(data, dict):
+        return None
+    _object_file_id, component_object_id = _pptr(data.get("m_GameObject"))
+    chain = _object_chain_direct(scope, component_object_id, 64)
+    if not chain:
+        return None
+    root_index, root_node, root_score = _store_layout_root(chain)
+    pointers = list(_walk_serialized_pointers(data))
+    config_leaf = ""
+    if isinstance(config, dict):
+        config_parts = [
+            str(part) for part in config.get("array_path", [])
+            if str(part).casefold() != "array"
+        ]
+        if config_parts:
+            config_leaf = re.sub(r"[^a-z0-9]", "", config_parts[-1].casefold())
+    content_candidates: list[tuple[int, int, tuple[dict, int]]] = []
+    template_candidates: list[tuple[int, int, tuple[dict, int]]] = []
+    for pointer_index, (path, file_id, path_id) in enumerate(pointers):
+        field = ".".join(path).casefold()
+        target = _pointer_game_object(scope, file_id, path_id)
+        if not target:
+            continue
+        content_score = 0
+        if any(
+            hint in field
+            for hint in ("content", "grid", "list", "container", "scroll", "itemsroot")
+        ):
+            content_score += 30
+        normalized_field = re.sub(r"[^a-z0-9]", "", field)
+        if config_leaf and (
+            config_leaf in normalized_field or normalized_field in config_leaf
+        ):
+            content_score += 240
+        if content_score:
+            content_candidates.append((content_score, -pointer_index, target))
+        if any(
+            hint in field
+            for hint in (
+                "buttonprefab", "itemaddonprefab", "template", "prefab",
+                "itemview", "entry", "card", "row",
+            )
+        ):
+            template_candidates.append((30, -pointer_index, target))
+    content = max(content_candidates, default=None, key=lambda row: row[:2])
+    template = max(template_candidates, default=None, key=lambda row: row[:2])
+    content_target = content[2] if content is not None else None
+    template_target = template[2] if template is not None else None
+    if content_target is None or template_target is None:
+        return None
+    grid = _grid_layout_settings(*content_target)
+    content_transform = _find_game_object_transform(
+        content_target[0], content_target[1]
+    )
+    content_size = _rect_transform_reference_size(content_transform)
+    panel_transform = _find_game_object_transform(scope, component_object_id)
+    panel_size = _rect_transform_reference_size(panel_transform)
+    reference_size = (
+        content_size
+        if abs(content_size[0]) > 0.01 or abs(content_size[1]) > 0.01
+        else panel_size
+    )
+    return {
+        "score": int(score) + root_score + (30 if grid else 0),
+        "mode": "grid" if grid else "runtime_template",
+        "scope": scope,
+        "component_path_id": component_path_id,
+        "component_object_id": component_object_id,
+        "root_path_id": int(root_node["path_id"]),
+        "root_name": str(root_node["name"]),
+        "root_source_json": str(root_node.get("source_json", "")),
+        "force_active_path_ids": _game_object_subtree_path_ids(
+            scope, int(root_node["path_id"])
+        ),
+        "content_scope": content_target[0],
+        "content_path_id": content_target[1],
+        "template_scope": template_target[0],
+        "template_path_id": template_target[1],
+        "grid": grid,
+        "reference_size": reference_size,
+        "reference_field": "语义匹配运行时界面",
+        "runtime_shell": shell,
+    }
+
+
+def _store_config_shell_score(
+    config: dict,
+    shell: dict,
+    reference_bundle_entries: set[str],
+    scopes: dict,
+) -> int:
+    config_blob = " ".join(
+        [
+            str(config.get("name", "")),
+            str(config.get("array_label", "")),
+            *[
+                str(value)
+                for product in config.get("products", [])[:1]
+                for value in product.get("field_signature", [])
+            ],
+        ]
+    ).casefold()
+    shell_blob = str(shell.get("name", "")).casefold()
+    score = 0
+    layout = _runtime_shell_layout(shell, scopes, 0, config)
+    if layout is None:
+        return 0
+    shell_scope = layout.get("scope")
+    shell_entry = _scope_entry(
+        shell_scope,
+        ("MonoBehaviour",),
+        int(shell.get("component_path_id", 0) or 0),
+    ) if isinstance(shell_scope, dict) else None
+    shell_data = _entry_data(shell_entry) if shell_entry else None
+    direct_reference = bool(
+        isinstance(shell_data, dict)
+        and any(
+            path_id == int(config.get("path_id", 0) or 0)
+            and _resolve_pointer_scope(shell_scope, file_id) is config.get("scope")
+            for _path, file_id, path_id in _walk_serialized_pointers(shell_data)
+        )
+    )
+    semantic_matched = direct_reference
+    if direct_reference:
+        score += 320
+    semantic_groups = (
+        (("trade", "trader", "merchant", "vendor", "sell", "buy"),
+         ("trade", "trader", "merchant", "vendor")),
+        (("spin", "lucky"), ("spin", "lucky", "wheel")),
+        (("skin",), ("skin",)),
+        (("wing", "float", "glove"), ("wing",)),
+        (("reward", "gift"), ("reward", "gift")),
+        (("pet",), ("pet",)),
+        (("task", "quest", "mission"), ("task", "quest", "mission")),
+    )
+    config_has_domain = False
+    for config_hints, shell_hints in semantic_groups:
+        if not any(hint in config_blob for hint in config_hints):
+            continue
+        config_has_domain = True
+        if any(hint in shell_blob for hint in shell_hints):
+            semantic_matched = True
+            score += 180
+        elif not direct_reference:
+            # A same-level bundle is not proof that two distinct shop domains
+            # share a view.  In particular, do not draw pet data in a reward or
+            # wing shop merely because both live in sharedassets2.
+            return 0
+        break
+    if not config_has_domain and (
+        any(hint in config_blob for hint in ("shop", "store", "product", "item"))
+        and any(hint in shell_blob for hint in ("shop", "store"))
+    ):
+        semantic_matched = True
+        score += 35
+    if not semantic_matched:
+        return 0
+    shell_bundle = str(shell.get("bundle_entry", "")).casefold()
+    if shell_bundle and shell_bundle in reference_bundle_entries:
+        score += 120
+    if layout.get("template_scope") is config.get("scope"):
+        score += 90
+    return score
+
+
+def _component_instantiated_item_layout(
+    config: dict,
+    scope: dict,
+    component_path_id: int,
+    component_object_id: int,
+    data: dict,
+    chain: list[dict],
+    root_index: int,
+    root_node: dict,
+    root_score: int,
+) -> dict | None:
+    product_count = len(config.get("products", []))
+    if product_count <= 0:
+        return None
+
+    def normalized_leaf(path: tuple[str, ...] | list[str]) -> str:
+        parts = [str(part) for part in path if str(part).casefold() != "array"]
+        value = re.sub(r"[^a-z0-9]", "", parts[-1].casefold() if parts else "")
+        return value[1:] if value.startswith("m") else value
+
+    config_leaf = normalized_leaf(config.get("array_path", []))
+    ranked: list[tuple[int, str, list[int]]] = []
+    for array_path, values in _walk_serialized_arrays(data):
+        if len(values) != product_count or not values:
+            continue
+        if not all(_is_serialized_pointer(value) for value in values):
+            continue
+        object_ids: list[int] = []
+        valid = True
+        for pointer in values:
+            file_id, path_id = _pptr(pointer)
+            target = _pointer_game_object(scope, file_id, path_id)
+            if target is None or target[0] is not scope or not target[1]:
+                valid = False
+                break
+            object_ids.append(int(target[1]))
+        if not valid or len(set(object_ids)) != len(object_ids):
+            continue
+        array_leaf = normalized_leaf(array_path)
+        semantic_score = 220 if config_leaf and array_leaf == config_leaf else 0
+        path_label = ".".join(array_path)
+        if any(
+            hint in path_label.casefold()
+            for hint in ("item", "reward", "offer", "product", "slot", "entry")
+        ):
+            semantic_score += 60
+        if semantic_score:
+            ranked.append((semantic_score, path_label, object_ids))
+    if not ranked:
+        return None
+    semantic_score, path_label, object_ids = max(
+        ranked, key=lambda row: (row[0], row[1])
+    )
+    root_path_id = int(root_node.get("path_id", 0) or 0)
+    root_entry = _scope_entry(scope, ("GameObject",), root_path_id)
+    return {
+        "score": 300 + root_score + semantic_score,
+        "mode": "instantiated",
+        "scope": scope,
+        "component_path_id": int(component_path_id),
+        "component_object_id": int(component_object_id),
+        "root_path_id": root_path_id,
+        "root_name": str(root_node.get("name", "")),
+        "root_source_json": str(root_entry["path"]) if root_entry else "",
+        "force_active_path_ids": _game_object_subtree_path_ids(scope, root_path_id),
+        "content_scope": scope,
+        "content_path_id": component_object_id,
+        "template_scope": scope,
+        "template_path_id": object_ids[0],
+        "item_path_ids": object_ids,
+        "overlay_product_images": True,
+        "grid": None,
+        "reference_size": (0.0, 0.0),
+        "reference_field": path_label,
+    }
+
+
 def _find_store_layout(
     config: dict,
     scopes: dict,
     candidates: list[tuple[tuple[str, str], dict, str, int, dict]] | None = None,
+    runtime_shells: list[dict] | None = None,
 ) -> dict | None:
     config_scope = config["scope"]
     config_path_id = int(config.get("path_id", 0) or 0)
@@ -6692,6 +8264,7 @@ def _find_store_layout(
             scopes, {"MonoBehaviour"}, {config_path_id}
         )
     layouts: list[dict] = []
+    reference_bundle_entries: set[str] = set()
     for _scope_key, scope, _type_name, component_path_id, entry in candidates:
         data = _entry_data(entry)
         if not isinstance(data, dict):
@@ -6700,10 +8273,17 @@ def _find_store_layout(
         exact_reference = any(
             path_id == config_path_id
             and _resolve_pointer_scope(scope, file_id) is config_scope
+            and not any(
+                token in ".".join(_path).casefold()
+                for token in ("onclick", "persistentcalls", "event", "callback")
+            )
             for _path, file_id, path_id in pointers
         )
         if not exact_reference:
             continue
+        reference_bundle_entries.add(
+            str(scope.get("bundle_entry", "")).casefold()
+        )
         _object_file_id, component_object_id = _pptr(data.get("m_GameObject"))
         if not component_object_id:
             continue
@@ -6728,11 +8308,33 @@ def _find_store_layout(
                 )
             ):
                 template = target
+        instantiated_layout = _component_instantiated_item_layout(
+            config,
+            scope,
+            component_path_id,
+            component_object_id,
+            data,
+            chain,
+            root_index,
+            root_node,
+            root_score,
+        )
+        if instantiated_layout is not None:
+            layouts.append(instantiated_layout)
         grid = _grid_layout_settings(*content) if content else None
+        # A data-holder MonoBehaviour often references the config but has no
+        # visual list of its own.  Keep its bundle as linkage evidence, but do
+        # not mistake that holder for a shop layout.
+        if content is None or template is None:
+            continue
+        content_transform = _find_game_object_transform(content[0], content[1])
+        content_size = _rect_transform_reference_size(content_transform)
         panel_transform = _find_game_object_transform(scope, component_object_id)
-        panel_size = _vec2(
-            panel_transform.get("m_SizeDelta") if panel_transform else None,
-            (0.0, 0.0),
+        panel_size = _rect_transform_reference_size(panel_transform)
+        reference_size = (
+            content_size
+            if abs(content_size[0]) > 0.01 or abs(content_size[1]) > 0.01
+            else panel_size
         )
         score = (
             100 + root_score + (35 if content else 0)
@@ -6755,7 +8357,8 @@ def _find_store_layout(
                 "template_scope": template[0] if template else None,
                 "template_path_id": template[1] if template else 0,
                 "grid": grid,
-                "reference_size": panel_size,
+                "mode": "grid" if grid else "runtime_template",
+                "reference_size": reference_size,
                 "reference_field": next(
                     (".".join(path) for path, file_id, path_id in pointers
                      if path_id == config_path_id
@@ -6764,8 +8367,22 @@ def _find_store_layout(
                 ),
             }
         )
+    instantiated = _find_instantiated_list_layout(config)
+    if instantiated is not None:
+        layouts.append(instantiated)
+    for shell in runtime_shells or []:
+        semantic_score = _store_config_shell_score(
+            config, shell, reference_bundle_entries, scopes
+        )
+        if semantic_score < 150:
+            continue
+        semantic_layout = _runtime_shell_layout(
+            shell, scopes, semantic_score, config
+        )
+        if semantic_layout is not None:
+            layouts.append(semantic_layout)
     if not layouts:
-        return _find_instantiated_list_layout(config)
+        return None
     layouts.sort(
         key=lambda row: (
             -int(row["score"]),
@@ -6785,11 +8402,25 @@ def _grid_layout_slots(
     if count <= 0:
         return []
     x, y, width, height = rect
-    reference_width = abs(reference_size[0]) or width
-    reference_height = abs(reference_size[1]) or height
-    scale_x, scale_y = width / reference_width, height / reference_height
     cell_width, cell_height = settings.get("cell_size", (200.0, 200.0))
     spacing_x, spacing_y = settings.get("spacing", (0.0, 0.0))
+    serialized_width = abs(reference_size[0])
+    serialized_height = abs(reference_size[1])
+    if serialized_width > 0.01 and serialized_height > 0.01:
+        stretch_fallback = False
+        reference_width = serialized_width
+        reference_height = serialized_height
+        scale_x, scale_y = width / reference_width, height / reference_height
+    else:
+        stretch_fallback = True
+        # Stretch-anchored runtime Content commonly serializes one SizeDelta
+        # axis as zero while an empty preview reports the other axis as 1 px.
+        # Scaling each axis from those degenerate values collapses every card.
+        # In that case use the GridLayout's Unity units directly and let the
+        # scrollable preview canvas expand to contain every generated row.
+        reference_width = max(width, cell_width)
+        reference_height = max(height, cell_height)
+        scale_x = scale_y = 1.0
     padding = settings.get("padding") if isinstance(settings.get("padding"), dict) else {}
     left = float(padding.get("m_Left", 0) or 0)
     right = float(padding.get("m_Right", 0) or 0)
@@ -6814,6 +8445,9 @@ def _grid_layout_slots(
         columns = math.ceil(count / rows)
     total_width = columns * cell_width + max(0, columns - 1) * spacing_x
     total_height = rows * cell_height + max(0, rows - 1) * spacing_y
+    if stretch_fallback:
+        available_width = max(available_width, total_width)
+        available_height = max(available_height, total_height)
     alignment = int(settings.get("child_alignment", 0) or 0)
     horizontal_alignment = alignment % 3
     vertical_alignment = alignment // 3
@@ -6841,6 +8475,109 @@ def _grid_layout_slots(
     return result
 
 
+def _runtime_template_size(
+    scope: dict | None,
+    game_object_path_id: int,
+) -> tuple[float, float]:
+    if not isinstance(scope, dict) or not game_object_path_id:
+        return (190.0, 230.0)
+    transform = _find_game_object_transform(scope, game_object_path_id)
+    width, height = _vec2(
+        transform.get("m_SizeDelta") if isinstance(transform, dict) else None,
+        (0.0, 0.0),
+    )
+    width, height = abs(width), abs(height)
+    object_entry = _scope_entry(scope, ("GameObject",), game_object_path_id)
+    object_data = _entry_data(object_entry) if object_entry else None
+    if isinstance(object_data, dict):
+        for component_path_id in _game_object_component_path_ids(object_data):
+            component_entry = _scope_entry(
+                scope, ("MonoBehaviour", "SpriteRenderer"), component_path_id
+            )
+            component_data = _entry_data(component_entry) if component_entry else None
+            if not isinstance(component_data, dict):
+                continue
+            width = max(width, abs(_number(component_data.get("mWidth"), 0.0)))
+            height = max(height, abs(_number(component_data.get("mHeight"), 0.0)))
+    return (
+        width if width > 8.0 else 190.0,
+        height if height > 8.0 else 230.0,
+    )
+
+
+def _template_dynamic_image_object_ids(
+    scope: dict | None,
+    template_path_id: int,
+) -> list[int]:
+    """Find template image objects that a runtime item controller replaces."""
+    if not isinstance(scope, dict) or not template_path_id:
+        return []
+    template_entry = _scope_entry(scope, ("GameObject",), template_path_id)
+    template_data = _entry_data(template_entry) if template_entry else None
+    if not isinstance(template_data, dict):
+        return []
+    result: list[int] = []
+    for component_path_id in _game_object_component_path_ids(template_data):
+        component_entry = _scope_entry(scope, ("MonoBehaviour",), component_path_id)
+        component_data = _entry_data(component_entry) if component_entry else None
+        if not isinstance(component_data, dict):
+            continue
+        for field_name, pointer in component_data.items():
+            folded = str(field_name).casefold()
+            if folded in {"m_gameobject", "m_script", "m_sprite", "m_texture"}:
+                continue
+            if not any(hint in folded for hint in STORE_IMAGE_FIELD_HINTS):
+                continue
+            file_id, path_id = _pptr(pointer)
+            if not path_id:
+                continue
+            target = _pointer_game_object(scope, file_id, path_id)
+            if target is None or target[0] is not scope or not target[1]:
+                continue
+            object_id = int(target[1])
+            if object_id not in result:
+                result.append(object_id)
+    return result
+
+
+def _runtime_template_slots(
+    count: int,
+    content_rect: tuple[float, float, float, float],
+    template_scope: dict | None,
+    template_path_id: int,
+) -> list[tuple[float, float, float, float]]:
+    if count <= 0:
+        return []
+    x, y, width, height = content_rect
+    cell_width, cell_height = _runtime_template_size(
+        template_scope, template_path_id
+    )
+    gap_x = max(8.0, cell_width * 0.08)
+    gap_y = max(8.0, cell_height * 0.08)
+    horizontal = width >= height * 1.15
+    if horizontal:
+        rows = max(1, math.floor(max(cell_height, height) / (cell_height + gap_y)))
+        rows = min(rows, count)
+        columns = math.ceil(count / rows)
+    else:
+        columns = max(1, math.floor(max(cell_width, width) / (cell_width + gap_x)))
+        columns = min(columns, count)
+        rows = math.ceil(count / columns)
+    slots: list[tuple[float, float, float, float]] = []
+    for index in range(count):
+        if horizontal:
+            column, row = divmod(index, rows)
+        else:
+            row, column = divmod(index, columns)
+        slots.append((
+            x + column * (cell_width + gap_x),
+            y + row * (cell_height + gap_y),
+            cell_width,
+            cell_height,
+        ))
+    return slots
+
+
 def _render_store_layout(config: dict, layout: dict, scopes: dict):
     from PIL import Image, ImageDraw
 
@@ -6863,7 +8600,9 @@ def _render_store_layout(config: dict, layout: dict, scopes: dict):
     metadata = _safe_read_json(preview_path.with_suffix(".regions.json"))
     nodes = metadata.get("tree_nodes", []) if isinstance(metadata, dict) else []
     instantiated_layout = layout.get("mode") == "instantiated"
+    overlay_product_images = bool(layout.get("overlay_product_images"))
     card_image = None
+    template_image_box: tuple[float, float, float, float] | None = None
     if instantiated_layout:
         node_by_id = {
             int(node.get("path_id", 0) or 0): node
@@ -6968,14 +8707,48 @@ def _render_store_layout(config: dict, layout: dict, scopes: dict):
             ),
             None,
         )
-        if not isinstance(content_node, dict) or not layout.get("grid"):
-            raise ValueError("已找到动态列表对象，但缺少 Content 区域或 GridLayout 参数")
+        if not isinstance(content_node, dict):
+            raise ValueError("已找到动态列表对象，但缺少可定位的 Content 区域")
         content_rect = tuple(
             float(content_node[key]) for key in ("x", "y", "width", "height")
         )
-        slots = _grid_layout_slots(
-            len(config["products"]), content_rect, layout["grid"], layout["reference_size"]
-        )
+        if layout.get("grid"):
+            slots = _grid_layout_slots(
+                len(config["products"]), content_rect, layout["grid"], layout["reference_size"]
+            )
+        elif layout.get("mode") == "runtime_template":
+            slots = _runtime_template_slots(
+                len(config["products"]),
+                content_rect,
+                layout.get("template_scope"),
+                int(layout.get("template_path_id", 0) or 0),
+            )
+        else:
+            raise ValueError("已找到动态列表对象，但缺少 GridLayout 或可复用条目模板")
+        if slots:
+            padding = 24
+            left = min(0, math.floor(min(x for x, _y, _width, _height in slots) - padding))
+            top = min(0, math.floor(min(y for _x, y, _width, _height in slots) - padding))
+            right = max(
+                image.width,
+                math.ceil(max(x + width for x, _y, width, _height in slots) + padding),
+            )
+            bottom = max(
+                image.height,
+                math.ceil(max(y + height for _x, y, _width, height in slots) + padding),
+            )
+            if left < 0 or top < 0 or right > image.width or bottom > image.height:
+                expanded = Image.new(
+                    "RGBA",
+                    (right - left, bottom - top),
+                    (28, 31, 38, 255),
+                )
+                expanded.alpha_composite(image, (-left, -top))
+                image = expanded
+                slots = [
+                    (x - left, y - top, width, height)
+                    for x, y, width, height in slots
+                ]
 
     template_scope = layout.get("template_scope")
     template_path_id = int(layout.get("template_path_id", 0) or 0)
@@ -7003,12 +8776,47 @@ def _render_store_layout(config: dict, layout: dict, scopes: dict):
             None,
         )
         if isinstance(root_node, dict):
+            root_x = float(root_node["x"])
+            root_y = float(root_node["y"])
+            root_width = max(1.0, float(root_node["width"]))
+            root_height = max(1.0, float(root_node["height"]))
             with Image.open(template_preview) as template_source:
                 card_image = template_source.convert("RGBA").crop((
-                    round(float(root_node["x"])), round(float(root_node["y"])),
-                    round(float(root_node["x"] + root_node["width"])),
-                    round(float(root_node["y"] + root_node["height"])),
+                    round(root_x), round(root_y),
+                    round(root_x + root_width),
+                    round(root_y + root_height),
                 ))
+            dynamic_image_ids = _template_dynamic_image_object_ids(
+                template_scope, template_path_id
+            )
+            dynamic_node = next(
+                (
+                    node for object_id in dynamic_image_ids
+                    for node in template_nodes
+                    if int(node.get("path_id", 0) or 0) == object_id
+                ),
+                None,
+            )
+            if isinstance(dynamic_node, dict) and card_image is not None:
+                relative_x = float(dynamic_node.get("x", 0.0)) - root_x
+                relative_y = float(dynamic_node.get("y", 0.0)) - root_y
+                dynamic_width = max(1.0, float(dynamic_node.get("width", 1.0)))
+                dynamic_height = max(1.0, float(dynamic_node.get("height", 1.0)))
+                template_image_box = (
+                    relative_x / root_width,
+                    relative_y / root_height,
+                    dynamic_width / root_width,
+                    dynamic_height / root_height,
+                )
+                card_image.paste(
+                    (0, 0, 0, 0),
+                    (
+                        max(0, math.floor(relative_x)),
+                        max(0, math.floor(relative_y)),
+                        min(card_image.width, math.ceil(relative_x + dynamic_width)),
+                        min(card_image.height, math.ceil(relative_y + dynamic_height)),
+                    ),
+                )
 
     blocked_keys = _store_blocked_keys(config)
     draw = ImageDraw.Draw(image, "RGBA")
@@ -7025,19 +8833,29 @@ def _render_store_layout(config: dict, layout: dict, scopes: dict):
     for index, (product, (slot_x, slot_y, slot_width, slot_height)) in enumerate(
         zip(config["products"], slots), start=1
     ):
-        if not instantiated_layout:
+        if not instantiated_layout or overlay_product_images:
             target_size = (max(1, round(slot_width)), max(1, round(slot_height)))
-            if card_image is not None:
+            if not instantiated_layout and card_image is not None:
                 card = card_image.resize(target_size, Image.Resampling.LANCZOS)
                 image.alpha_composite(card, (round(slot_x), round(slot_y)))
             sprite = _store_product_preview_image(product)
             if sprite is not None:
+                if template_image_box is not None and not instantiated_layout:
+                    target_x = slot_x + template_image_box[0] * slot_width
+                    target_y = slot_y + template_image_box[1] * slot_height
+                    target_width = template_image_box[2] * slot_width
+                    target_height = template_image_box[3] * slot_height
+                else:
+                    target_x = slot_x + slot_width * 0.11
+                    target_y = slot_y + slot_height * 0.11
+                    target_width = slot_width * 0.78
+                    target_height = slot_height * 0.78
                 sprite.thumbnail((
-                    max(1, round(slot_width * 0.78)),
-                    max(1, round(slot_height * 0.78)),
+                    max(1, round(target_width)),
+                    max(1, round(target_height)),
                 ))
-                px = round(slot_x + (slot_width - sprite.width) / 2)
-                py = round(slot_y + (slot_height - sprite.height) / 2)
+                px = round(target_x + (target_width - sprite.width) / 2)
+                py = round(target_y + (target_height - sprite.height) / 2)
                 image.alpha_composite(sprite, (px, py))
         blocked = product["pointer_key"] in blocked_keys
         color = (255, 60, 60, 255) if blocked else (35, 220, 105, 255)
@@ -7085,6 +8903,54 @@ def _render_store_layout(config: dict, layout: dict, scopes: dict):
     return image, slots
 
 
+def _open_store_layout_hierarchy(config: dict) -> bool:
+    """Open the verified shop subtree in the existing Object blocking UI."""
+    layout = config.get("layout")
+    scopes = config.get("all_scopes")
+    if not isinstance(layout, dict) or not isinstance(scopes, dict):
+        print("[动态列表][界面层级] 当前列表没有可验证的真实界面层级。")
+        return False
+    runtime_shell = layout.get("runtime_shell")
+    if isinstance(runtime_shell, dict):
+        return _open_dynamic_view_hierarchy(runtime_shell, scopes)
+    scope = layout.get("scope")
+    root_path_id = int(layout.get("root_path_id", 0) or 0)
+    component_object_id = int(layout.get("component_object_id", 0) or 0)
+    if not isinstance(scope, dict) or not root_path_id:
+        print("[动态列表][界面层级] 真实布局缺少可定位的根 Object。")
+        return False
+    chain = _object_chain_direct(scope, component_object_id or root_path_id, 128)
+    root_level = next(
+        (
+            index for index, node in enumerate(chain)
+            if int(node.get("path_id", 0) or 0) == root_path_id
+        ),
+        -1,
+    )
+    if root_level < 0:
+        root_entry = _scope_entry(scope, ("GameObject",), root_path_id)
+        chain = [{
+            "path_id": root_path_id,
+            "name": _game_object_name(scope, root_path_id),
+            "source_json": str(root_entry["path"]) if root_entry else "",
+        }]
+        root_level = 0
+    match = {
+        "source": str(scope.get("source", "")),
+        "bundle_entry": str(scope.get("bundle_entry", "")),
+        "component_type": "MonoBehaviour",
+        "component_path_id": int(layout.get("component_path_id", 0) or 0),
+        "chain": chain,
+        "force_active_path_ids": layout.get("force_active_path_ids", []),
+        "preview_root_level": root_level,
+    }
+    print(
+        f"[动态列表][界面层级] {config.get('name', '')}："
+        "打开真实序列化 Object 子树；树和画面右键均可屏蔽对象。"
+    )
+    return _open_object_hierarchy_preview(match, root_level, scopes)
+
+
 def _show_store_product_window(config: dict) -> bool:
     """Render the runtime product list as a spatial shop layout instead of a field table."""
     import tkinter as tk
@@ -7130,6 +8996,10 @@ def _show_store_product_window(config: dict) -> bool:
                 f"真实实例布局：{layout_state['value']['root_name']}；"
                 "条目位置与范围来自场景中已实例化的 Transform/NGUI Widget 子树。"
                 if layout_state["value"].get("mode") == "instantiated"
+                else
+                f"真实商店模板布局：{layout_state['value']['root_name']}；"
+                "完整界面来自序列化层级，商品卡片由 Content 与条目 Prefab 按原顺序补入。"
+                if layout_state["value"].get("mode") == "runtime_template"
                 else
                 f"真实网格布局：{layout_state['value']['root_name']} / "
                 f"{layout_state['value']['scope'].get('bundle_entry', '')}；"
@@ -7273,6 +9143,17 @@ def _show_store_product_window(config: dict) -> bool:
                 changed = _set_store_product_blocked(config, product, blocked) or changed
         render_shop()
 
+    def open_object_hierarchy() -> None:
+        window.withdraw()
+        try:
+            _open_store_layout_hierarchy(config)
+        finally:
+            try:
+                window.deiconify()
+                window.lift()
+            except tk.TclError:
+                pass
+
     context = tk.Menu(window, tearoff=False)
     context.add_command(label="屏蔽此条目", command=lambda: set_selected(True))
 
@@ -7288,6 +9169,12 @@ def _show_store_product_window(config: dict) -> bool:
     buttons = tk.Frame(window, background="#12151b")
     buttons.pack(fill="x", padx=12, pady=10)
     ttk.Button(buttons, text="屏蔽所选条目", command=lambda: set_selected(True)).pack(side="left")
+    if layout_state["value"] and isinstance(all_scopes, dict):
+        ttk.Button(
+            buttons,
+            text="打开真实商店 Object 层级",
+            command=open_object_hierarchy,
+        ).pack(side="left", padx=8)
     ttk.Button(buttons, text="清除选择", command=lambda: (selected_keys.clear(), render_shop())).pack(side="left", padx=8)
     ttk.Button(buttons, text="完成", command=window.destroy).pack(side="right")
 
@@ -7332,61 +9219,84 @@ def _find_runtime_store_shells(scopes: dict) -> list[dict]:
     shells: list[dict] = []
     seen: set[tuple[str, int]] = set()
     template_hints = ("template", "prefab")
-    store_hints = (*DYNAMIC_LIST_CONTEXT_HINTS, "list", "entries")
-    commerce_hints = ("iap", "offer", "purchase", *TASK_LIST_HINTS)
-    for _scope_key, scope, path_id, entry in _store_product_config_entries(scopes):
-            data = _entry_data(entry)
-            if not isinstance(data, dict):
+    runtime_context_hints = tuple(
+        hint for hint in DYNAMIC_LIST_CONTEXT_HINTS if hint != "event"
+    )
+    store_hints = (
+        *runtime_context_hints,
+        "list", "entries", "spin", "lucky", "wheel",
+    )
+    commerce_hints = (
+        "iap", "offer", "purchase", "trade", "merchant", "vendor",
+        *(hint for hint in TASK_LIST_HINTS if hint != "event"),
+    )
+    candidates = [
+        (scope_key, scope, path_id, entry)
+        for scope_key, scope in scopes.items()
+        for (type_name, path_id), entry in scope.get("items", {}).items()
+        if type_name == "MonoBehaviour"
+    ]
+    for _scope_key, scope, path_id, entry in candidates:
+        data = _entry_data(entry)
+        if not isinstance(data, dict):
+            continue
+        raw_pointer_fields: list[tuple[str, int, int]] = []
+        for field_name, pointer in data.items():
+            folded = str(field_name).casefold()
+            if folded in {"m_gameobject", "m_script"}:
                 continue
-            pointer_fields: list[dict] = []
-            for field_name, pointer in data.items():
-                folded = str(field_name).casefold()
-                if folded in {"m_gameobject", "m_script"}:
-                    continue
-                file_id, target_path_id = _pptr(pointer)
-                if not target_path_id:
-                    continue
-                target = _pointer_game_object(scope, file_id, target_path_id)
-                target_scope, target_object_id = target if target else (None, 0)
-                pointer_fields.append(
-                    {
-                        "field": str(field_name),
-                        "file_id": file_id,
-                        "path_id": target_path_id,
-                        "object_path_id": target_object_id,
-                        "object_name": (
-                            _game_object_name(target_scope, target_object_id)
-                            if target_scope and target_object_id else ""
-                        ),
-                    }
-                )
-            template_fields = [
-                item for item in pointer_fields
-                if any(hint in item["field"].casefold() for hint in template_hints)
-            ]
-            commerce_fields = [
-                item for item in pointer_fields
-                if any(hint in item["field"].casefold() for hint in commerce_hints)
-            ]
-            layout_fields = [
-                item for item in pointer_fields
-                if any(hint in item["field"].casefold() for hint in store_hints)
-            ]
-            _object_file_id, object_path_id = _pptr(data.get("m_GameObject"))
-            object_name = _game_object_name(scope, object_path_id)
-            name_is_store = any(hint in object_name.casefold() for hint in store_hints)
-            strong_template_controller = len(template_fields) >= 2 and bool(commerce_fields)
-            store_template = name_is_store and bool(
-                template_fields or commerce_fields or layout_fields
+            file_id, target_path_id = _pptr(pointer)
+            if target_path_id:
+                raw_pointer_fields.append((str(field_name), file_id, target_path_id))
+        relevant_hints = (*template_hints, *store_hints, *commerce_hints)
+        if not any(
+            any(hint in field.casefold() for hint in relevant_hints)
+            for field, _file_id, _target_path_id in raw_pointer_fields
+        ):
+            continue
+        template_fields = [
+            item for item in raw_pointer_fields
+            if any(hint in item[0].casefold() for hint in template_hints)
+        ]
+        commerce_fields = [
+            item for item in raw_pointer_fields
+            if any(hint in item[0].casefold() for hint in commerce_hints)
+        ]
+        layout_fields = [
+            item for item in raw_pointer_fields
+            if any(hint in item[0].casefold() for hint in store_hints)
+        ]
+        _object_file_id, object_path_id = _pptr(data.get("m_GameObject"))
+        object_name = _game_object_name(scope, object_path_id)
+        name_is_store = any(hint in object_name.casefold() for hint in store_hints)
+        strong_template_controller = len(template_fields) >= 2 and bool(commerce_fields)
+        store_template = name_is_store and bool(
+            template_fields or commerce_fields or layout_fields
+        )
+        if not (strong_template_controller or store_template):
+            continue
+        pointer_fields: list[dict] = []
+        for field_name, file_id, target_path_id in raw_pointer_fields:
+            target = _pointer_game_object(scope, file_id, target_path_id)
+            target_scope, target_object_id = target if target else (None, 0)
+            pointer_fields.append(
+                {
+                    "field": field_name,
+                    "file_id": file_id,
+                    "path_id": target_path_id,
+                    "object_path_id": target_object_id,
+                    "object_name": (
+                        _game_object_name(target_scope, target_object_id)
+                        if target_scope and target_object_id else ""
+                    ),
+                }
             )
-            if not (strong_template_controller or store_template):
-                continue
-            source_json = str(entry.get("path", ""))
-            dedupe_key = (source_json.casefold(), int(path_id))
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            shells.append(
+        source_json = str(entry.get("path", ""))
+        dedupe_key = (source_json.casefold(), int(path_id))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        shells.append(
                 {
                     "name": object_name or f"<运行时列表 PathID={object_path_id}>",
                     "path_id": int(object_path_id),
@@ -7396,7 +9306,7 @@ def _find_runtime_store_shells(scopes: dict) -> list[dict]:
                     "source_json": source_json,
                     "pointers": pointer_fields,
                 }
-            )
+        )
     shells.sort(
         key=lambda row: (
             str(row["source"]).casefold(),
@@ -7419,7 +9329,7 @@ def _print_runtime_store_shells(shells: list[dict]) -> None:
     )
     for index, shell in enumerate(shells, start=1):
         print(
-            f"  {index}. {shell['name']} (GameObject PathID={shell['path_id']}, "
+            f"  R{index}. {shell['name']} (GameObject PathID={shell['path_id']}, "
             f"组件 PathID={shell['component_path_id']}) | "
             f"{shell['source']} / {shell['bundle_entry'] or '<无 Bundle entry>'}"
         )
@@ -7432,7 +9342,7 @@ def _print_runtime_store_shells(shells: list[dict]) -> None:
     )
     print(
         "\033[94m[动态列表][限制] 当前没有可安全删除并保持顺序的序列化条目，"
-        "因此无法列出或选择具体条目，脚本不会把模板误当成数据项进行屏蔽。\033[0m"
+        "因此不能逐商品删除；仍可用 R编号进入真实 Object 层级，屏蔽整个界面层级。\033[0m"
     )
 
 
@@ -7440,8 +9350,8 @@ def _print_additional_runtime_list_shells(shells: list[dict]) -> None:
     if not shells:
         return
     print(
-        f"[动态列表] 另识别到 {len(shells)} 个运行时列表界面/模板控制器；"
-        "没有静态条目数组，暂不可选择性屏蔽:"
+        f"[动态列表] 另识别到 {len(shells)} 个真实界面层级入口；"
+        "R编号用于 Object 层级屏蔽，逐条数据屏蔽请选上方列表编号:"
     )
     for index, shell in enumerate(shells, start=1):
         pointer_fields = ", ".join(
@@ -7454,6 +9364,25 @@ def _print_additional_runtime_list_shells(shells: list[dict]) -> None:
             f"{shell['source']}"
             + (f" | 模板/入口={pointer_fields}" if pointer_fields else "")
         )
+
+
+def _dedupe_runtime_shells(shells: list[dict], configs: list[dict]) -> list[dict]:
+    config_components = {
+        (
+            str(config.get("source", "")).casefold(),
+            str(config.get("bundle_entry", "")).casefold(),
+            int(config.get("path_id", 0) or 0),
+        )
+        for config in configs
+    }
+    return [
+        shell for shell in shells
+        if (
+            str(shell.get("source", "")).casefold(),
+            str(shell.get("bundle_entry", "")).casefold(),
+            int(shell.get("component_path_id", 0) or 0),
+        ) not in config_components
+    ]
 
 
 def _runtime_preview_node(metadata: dict, path_id: int = 0, name: str = "") -> dict | None:
@@ -7955,6 +9884,63 @@ def _preview_runtime_list_shell(shell: dict, scopes: dict) -> Path:
     return target
 
 
+def _runtime_shell_scope(shell: dict, scopes: dict) -> dict | None:
+    return next(
+        (
+            scope for scope in scopes.values()
+            if str(scope.get("source", "")) == str(shell.get("source", ""))
+            and str(scope.get("bundle_entry", ""))
+            == str(shell.get("bundle_entry", ""))
+        ),
+        None,
+    )
+
+
+def _dynamic_view_hierarchy_match(shell: dict, scopes: dict) -> tuple[dict, int] | None:
+    """Build a real serialized hierarchy match for the existing Object UI."""
+    scope = _runtime_shell_scope(shell, scopes)
+    if scope is None:
+        return None
+    anchor_object_id = int(shell.get("path_id", 0) or 0)
+    chain = _object_chain_direct(scope, anchor_object_id, 128)
+    if not chain:
+        return None
+    root_index, _root_node, root_score = _store_layout_root(chain)
+    if not root_score:
+        # A controller name can be opaque while its immediate UI parent still
+        # owns the useful subtree.  Avoid jumping to the global Canvas, which
+        # can exceed the 2,000-node preview cap.
+        root_index = min(len(chain) - 1, 2)
+    root_path_id = int(chain[root_index].get("path_id", 0) or 0)
+    match = {
+        "source": str(scope.get("source", "")),
+        "bundle_entry": str(scope.get("bundle_entry", "")),
+        "component_type": "MonoBehaviour",
+        "component_path_id": int(shell.get("component_path_id", 0) or 0),
+        "chain": chain,
+        "force_active_path_ids": _game_object_subtree_path_ids(scope, root_path_id),
+        "preview_root_level": root_index,
+    }
+    return match, root_index
+
+
+def _open_dynamic_view_hierarchy(shell: dict, scopes: dict) -> bool:
+    prepared = _dynamic_view_hierarchy_match(shell, scopes)
+    if prepared is None:
+        print("[动态列表][界面层级][错误] 无法定位控制器的 GameObject 父子层级。")
+        return False
+    match, root_index = prepared
+    print(
+        f"[动态列表][界面层级] {shell.get('name', '')}："
+        "使用真实序列化 Object 层级；可在树或画面上右键屏蔽。"
+    )
+    print(
+        "[动态列表][界面层级] 为便于检查，预览会强制显示该子树中的静态禁用节点；"
+        "这不代表它们运行时会同时出现。"
+    )
+    return _open_object_hierarchy_preview(match, root_index, scopes)
+
+
 def _game_object_subtree_path_ids(
     scope: dict,
     root_path_id: int,
@@ -8001,8 +9987,11 @@ def run_block_dynamic_store_products() -> None:
     )
     scopes, _textures = _load_object_graph()
     store_cache = _object_graph_cache_bucket("dynamic_store_scan")
+    ai_cache_signature = _dynamic_list_ai_cache_signature()
     if (
         store_cache.get("version") == DYNAMIC_STORE_SCAN_VERSION
+        and store_cache.get("ai_cache_signature") == ai_cache_signature
+        and bool(store_cache.get("ai_review_completed"))
         and "configs" in store_cache
         and isinstance(store_cache.get("configs"), list)
     ):
@@ -8011,9 +10000,24 @@ def run_block_dynamic_store_products() -> None:
         print(f"[动态列表] 已复用扫描缓存：静态列表={len(configs)}")
     else:
         store_cache.clear()
-        configs = _find_store_product_configs(scopes)
+        rejected_candidates: list[dict] = []
+        configs = _find_store_product_configs(
+            scopes,
+            rejected_candidates=rejected_candidates,
+        )
+        ai_accepted_ids = _request_dynamic_list_ai_review(rejected_candidates)
+        if ai_accepted_ids:
+            configs = _find_store_product_configs(
+                scopes,
+                ai_accepted_ids=ai_accepted_ids,
+            )
         runtime_shells = _find_runtime_store_shells(scopes)
+        runtime_shells = _dedupe_runtime_shells(runtime_shells, configs)
         store_cache["version"] = DYNAMIC_STORE_SCAN_VERSION
+        store_cache["ai_cache_signature"] = ai_cache_signature
+        store_cache["ai_review_completed"] = (
+            _dynamic_list_ai_review_cache_matches(rejected_candidates)
+        )
         store_cache["configs"] = configs
         store_cache["runtime_shells"] = runtime_shells
         _write_object_graph_cache()
@@ -8023,24 +10027,26 @@ def run_block_dynamic_store_products() -> None:
             _print_runtime_store_shells(runtime_shells)
         else:
             print("[动态列表][未找到] 没有发现静态数据数组或运行时列表模板控制器。")
-        return
-    records = _load_store_product_records()
-    print(f"[动态列表] 找到 {len(configs)} 个静态列表:")
-    for number, config in enumerate(configs, start=1):
-        blocked_count = len(_store_blocked_keys(config, records))
-        classification = config.get("classification", {})
-        print(
-            f"  {number}. {config['name']} (PathID={config['path_id']}) | "
-            f"类型={classification.get('kind', '动态列表')}，"
-            f"{config.get('array_label', '')}，条目={len(config['products'])}，"
-            f"已屏蔽={blocked_count}，识别={classification.get('confidence', '兼容')}"
-            f"/{classification.get('score', '-')}分 | "
-            f"{config['source']} / {config['bundle_entry'] or '<无 Bundle entry>'}"
-        )
-    _print_additional_runtime_list_shells(runtime_shells)
+            return
+    if configs:
+        records = _load_store_product_records()
+        print(f"[动态列表] 找到 {len(configs)} 个可安全修改的数据列表:")
+        for number, config in enumerate(configs, start=1):
+            blocked_count = len(_store_blocked_keys(config, records))
+            classification = config.get("classification", {})
+            print(
+                f"  {number}. {config['name']} (PathID={config['path_id']}) | "
+                f"类型={classification.get('kind', '动态列表')}，"
+                f"{config.get('array_label', '')}，条目={len(config['products'])}，"
+                f"已屏蔽={blocked_count}，识别={classification.get('confidence', '兼容')}"
+                f"/{classification.get('score', '-')}分 | "
+                f"{config['source']} / {config['bundle_entry'] or '<无 Bundle entry>'}"
+            )
+    if configs:
+        _print_additional_runtime_list_shells(runtime_shells)
     raw = prompt_input(
-        "请选择静态列表编号/范围（例: 2、1,3-5）；"
-        "输入 R编号只读预览运行时模板（例: R8），或 b 返回: "
+        "请选择数据列表编号/范围（例: 2、1,3-5）；"
+        "输入 R编号打开真实界面层级（例: R8），或 b 返回: "
     ).strip().lower()
     if raw in {"b", "q", "back", "quit"}:
         return
@@ -8051,9 +10057,9 @@ def run_block_dynamic_store_products() -> None:
             print(f"[动态列表][错误] 运行时模板编号必须在 1-{len(runtime_shells)} 之间。")
             return
         try:
-            _preview_runtime_list_shell(runtime_shells[runtime_index - 1], scopes)
+            _open_dynamic_view_hierarchy(runtime_shells[runtime_index - 1], scopes)
         except (ImportError, OSError, ValueError) as exc:
-            print(f"[动态列表][模板预览][错误] {exc}")
+            print(f"[动态列表][界面层级][错误] {exc}")
         return
     try:
         selected = parse_number_ranges(raw, set(range(1, len(configs) + 1)))
@@ -8065,32 +10071,60 @@ def run_block_dynamic_store_products() -> None:
         config for config in selected_configs
         if not bool(config.get("_layout_cache_ready"))
     ]
+    pre_resolved_layouts: dict[str, dict] = {}
+    reference_layout_configs: list[dict] = []
+    for config in unresolved_layout_configs:
+        fast_layout = _find_store_layout(
+            config,
+            scopes,
+            [],
+            runtime_shells,
+        )
+        if fast_layout is not None and int(fast_layout.get("score", 0) or 0) >= 260:
+            pre_resolved_layouts[str(config.get("config_key", ""))] = fast_layout
+        else:
+            reference_layout_configs.append(config)
     layout_candidates = (
         _prefilter_reference_entries_across_scopes(
             scopes,
             {"MonoBehaviour"},
             {
                 int(config.get("path_id", 0) or 0)
-                for config in unresolved_layout_configs
+                for config in reference_layout_configs
             },
         )
-        if unresolved_layout_configs
+        if reference_layout_configs
         else []
     )
     for config in selected_configs:
         if bool(config.get("_layout_cache_ready")):
             print(f"[动态列表] 已复用布局链路缓存: {config['name']}")
         else:
-            config["layout"] = _find_store_layout(config, scopes, layout_candidates)
+            config["layout"] = (
+                pre_resolved_layouts.get(str(config.get("config_key", "")))
+                or _find_store_layout(
+                    config,
+                    scopes,
+                    layout_candidates,
+                    runtime_shells,
+                )
+            )
             config["_layout_cache_ready"] = True
             _write_object_graph_cache()
         config["all_scopes"] = scopes
         if config["layout"]:
             layout = config["layout"]
+            mode_label = (
+                "已实例化NGUI/Transform"
+                if layout.get("mode") == "instantiated"
+                else "运行时Prefab+Content"
+                if layout.get("mode") == "runtime_template"
+                else "GridLayout"
+            )
             print(
                 f"[动态列表][真实布局] {config['name']} -> "
                 f"{layout['root_name']} / {layout['scope'].get('bundle_entry', '')}，"
-                f"模式={'已实例化NGUI/Transform' if layout.get('mode') == 'instantiated' else 'GridLayout'}，"
+                f"模式={mode_label}，"
                 f"Content PathID={layout.get('content_path_id', 0)}，"
                 f"Template PathID={layout.get('template_path_id', 0)}"
             )

@@ -35,6 +35,7 @@ SECRET_FIELDS = (
     "baidu_appkey",
     "ai_translation_api_key",
     "ai_field_review_api_key",
+    "ai_dynamic_list_api_key",
 )
 PROXY_FIELDS = (
     "google_proxy_http",
@@ -43,6 +44,8 @@ PROXY_FIELDS = (
     "ai_translation_proxy_https",
     "ai_field_review_proxy_http",
     "ai_field_review_proxy_https",
+    "ai_dynamic_list_proxy_http",
+    "ai_dynamic_list_proxy_https",
 )
 
 

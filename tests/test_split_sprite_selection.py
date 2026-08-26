@@ -244,6 +244,140 @@ class SplitSpriteSelectionTests(unittest.TestCase):
         self.assertIs(data, packed_data)
         self.assertIs(owner_scope, atlas_scope)
 
+    def test_split_sprite_uses_texture_owned_by_external_sprite_atlas_scope(
+        self,
+    ) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "input"
+            texture_path = (
+                source_root
+                / "bin"
+                / "Data"
+                / "atlas"
+                / "Texture2D"
+                / "sactx-items_64.png"
+            )
+            texture_path.parent.mkdir(parents=True)
+            atlas_image = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+            atlas_image.paste((20, 40, 60, 255), (1, 2, 4, 6))
+            atlas_image.save(texture_path)
+
+            allpng_root = root / "AllPNG"
+            allpng_png_root = allpng_root / "PNG"
+            allpng_png_root.mkdir(parents=True)
+            atlas_image.save(allpng_png_root / "sactx-items_2.png")
+            allpng_map = allpng_root / "_allpng_map.json"
+            allpng_map.write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "flat_name": "sactx-items_2.png",
+                                "original_name": "sactx-items_2.png",
+                                "original_relative_path": texture_path.relative_to(
+                                    source_root
+                                ).as_posix(),
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            render_key = {"first": {"data[0]": 9}, "second": 21300000}
+            packed_data = {
+                "texture": {"m_FileID": 0, "m_PathID": 64},
+                "textureRect": {"x": 1, "y": 2, "width": 3, "height": 4},
+                "settingsRaw": 0,
+            }
+            atlas_scope = {
+                "scope_key": ("manifest", "atlas"),
+                "source": "bin\\Data\\atlas",
+                "bundle_entry": "",
+                "items": {
+                    ("SpriteAtlas", 99): {
+                        "data": {
+                            "m_RenderDataMap": {
+                                "Array": [
+                                    {"first": render_key, "second": packed_data}
+                                ]
+                            }
+                        }
+                    },
+                    ("Texture2D", 64): {
+                        "data": {},
+                        "path": texture_path,
+                    },
+                },
+            }
+            sprite_path = (
+                source_root
+                / "bin"
+                / "Data"
+                / "sprite"
+                / "Sprite"
+                / "ItemIcon_7.json"
+            )
+            sprite_scope = {
+                "scope_key": ("manifest", "sprite"),
+                "source": "bin\\Data\\sprite",
+                "bundle_entry": "",
+                "items": {
+                    ("Sprite", 7): {
+                        "data": {
+                            "m_RenderDataKey": render_key,
+                            "m_SpriteAtlas": {"m_FileID": 2, "m_PathID": 99},
+                            "m_RD": {
+                                "texture": {"m_FileID": 0, "m_PathID": 0}
+                            },
+                        },
+                        "item": {"AssetName": "ItemIcon"},
+                        "path": sprite_path,
+                    }
+                },
+            }
+            atlas_scope["pointer_scopes"] = {0: atlas_scope}
+            sprite_scope["pointer_scopes"] = {
+                0: sprite_scope,
+                2: atlas_scope,
+            }
+            scopes = {
+                sprite_scope["scope_key"]: sprite_scope,
+                atlas_scope["scope_key"]: atlas_scope,
+            }
+            sprite_root = allpng_root / "Sprite"
+            sprite_map = sprite_root / "_allsprite_map.json"
+
+            with (
+                patch.object(TOOLS, "DEFAULT_SOURCE_ROOT", source_root),
+                patch.object(TOOLS, "DEFAULT_ALL_IMAGE_MAP", allpng_map),
+                patch.object(TOOLS, "DEFAULT_ALL_IMAGE_PNG_ROOT", allpng_png_root),
+                patch.object(TOOLS, "DEFAULT_ALL_SPRITE_ROOT", sprite_root),
+                patch.object(TOOLS, "DEFAULT_ALL_SPRITE_MAP", sprite_map),
+                patch.object(TOOLS, "_load_object_graph", return_value=(scopes, {})),
+            ):
+                TOOLS.run_split_sprite_atlases()
+
+            result = json.loads(sprite_map.read_text(encoding="utf-8"))
+            self.assertEqual(len(result["items"]), 1)
+            item = result["items"][0]
+            self.assertEqual(item["item_type"], "sprite")
+            self.assertEqual(item["sprite_name"], "ItemIcon")
+            self.assertEqual(item["texture_path_id"], 64)
+            self.assertEqual(item["render_data_source"], "sprite_atlas")
+            self.assertEqual(Path(item["texture_png"]), texture_path)
+            self.assertEqual(
+                item["rect"], {"x": 1, "y": 2, "width": 3, "height": 4}
+            )
+            split_path = sprite_root / "PNG" / "ItemIcon_7.png"
+            self.assertTrue(split_path.is_file())
+            with Image.open(split_path) as split_image:
+                self.assertEqual(split_image.size, (3, 4))
+            self.assertFalse((sprite_root / "PNG" / "sactx-items_2.png").exists())
+
     def test_split_sprite_can_be_selected_without_regular_allpng_map(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

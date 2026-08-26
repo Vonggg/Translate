@@ -91,7 +91,10 @@ python .\run_with_config_python.py
 ```powershell
 python .\run_with_config_python.py --config '<配置文件路径>'
 python .\run_with_config_python.py --config '<配置文件路径>' main.py
+python .\run_with_config_python.py --config '<配置文件路径>' --channel-package-dir-name GAME_hongtu_L
 ```
+
+传入 `--channel-package-dir-name` 后，资源菜单的一键导入成功时可以把最终结果自动覆盖到该渠道包。这个功能只在同时显式传入 `--config` 和有效的单层 `GAME_*` 目录名时启用；渠道包必须位于当前项目的 `game-name` 下，并包含 `assets` 与 `AndroidManifest.xml`。未传参数的普通启动方式仍只生成 `FinalResult`，不会修改渠道包。
 
 也可以直接调用入口脚本：
 
@@ -647,10 +650,12 @@ workspace/FinalResult/Data
 导入处理的合并版资源。`FinalResult` 因此只保留可以按目录覆盖回游戏的最终文件，
 不再生成额外的 `SplitBundles` 目录。
 
-导入完成后会再次用绿色日志提醒替换顺序：
+未启用渠道包自动覆盖时，导入完成后会再次用绿色日志提醒替换顺序：
 
 1. 先把已下载资源和本地化 catalog 所在的 `game/assets/aa` 同步到目标游戏的 `assets/aa`。
 2. 再用 `workspace/FinalResult` 中的修改资源覆盖目标游戏对应文件。
+
+启用渠道包自动覆盖后，上述顺序由资源菜单自动执行：检测到远程资源本地化记录时，先把原游戏的完整 `game/assets/aa` 覆盖到渠道包 `assets/aa`，再用 `FinalResult/Data` 覆盖 `assets/bin/Data`、用 `FinalResult/Bundle/Android` 覆盖 `assets/aa/Android`，最后覆盖 catalog/hash 等 `FinalResult/Bundle` 直属文件。任一渠道路径验证或复制步骤失败都会标红并让本次导入返回失败，不会误报为已完成。
 
 ## 工具脚本.py 菜单说明
 
@@ -678,12 +683,15 @@ workspace/FinalResult/Data
   - 按 GameObject 名称搜索第 2 类对象导出数据，精确匹配优先，无精确结果时自动包含匹配；也可使用 `*关键词*` 强制模糊搜索。
   - 显示每个命中对象的完整父链，可直接选择层级屏蔽，或通过 `p`/`p3` 进入交互预览后右键屏蔽。
 - `8. 动态列表索引与选择性屏蔽（测试阶段）`
-  - 静态分析商店、任务、成就、活动等 MonoBehaviour 数据数组，综合数组名称、控制器语义、条目字段、类型一致性、图片和 Prefab 进行评分，不再把 Unity Sprite 作为硬条件。
-  - 图片统一支持 Unity Sprite、NGUI Atlas+SpriteName、Texture2D，以及条目 Prefab 内的图片组件；没有图片但存在商品 ID/价格或任务 ID/进度/目标等结构证据时仍可识别。
-  - 优先反向查找引用该列表配置的场景组件，并解析列表根对象、Content、公共条目模板及 GridLayout 参数；找到完整链路时，按真实单元格、间距、对齐、起始轴及顺序还原列表布局。
+  - 静态分析商店、任务、成就、活动等 MonoBehaviour 数据数组，同时支持“数组保存 PPtr 引用”和“数组直接内嵌序列化 struct”两种项目结构；综合数组名称、控制器语义、条目字段、类型一致性、图片和 Prefab 评分，不再把 Unity Sprite 作为硬条件。
+  - 图片统一支持 Unity Sprite、NGUI Atlas+SpriteName、Texture2D、条目 Prefab 内的图片组件，以及 `m_infoType -> 类型配置 -> m_sprite` 等二跳资源链；`ItemTemplateId` 等字符串 ID 还会与独立 Sprite/Texture2D 的规范化资源名进行高置信度匹配（容忍大小写、`Item_` 前缀及轻微拼写差异），没有图片但存在商品 ID/价格或任务 ID/进度/目标等结构证据时仍可识别。
+  - 优先反向查找引用该列表配置的场景组件，并解析列表根对象、Content、公共条目模板及 GridLayout 参数；NPC trade/merchant/vendor 的 `SellItems`、`BuyItems` 会分别绑定对应的 ItemsRoot。找到完整链路时，按真实单元格、间距、对齐、起始轴及顺序还原列表布局；Stretch Anchor 轴不会按负 SizeDelta 错误放大。运行时 Content 为空时会按 GridLayout 自动扩展可滚动画布，不再裁掉后续条目；LuckySpin 等已经摆好槽位的界面直接复用真实槽位位置。
+  - 配置与界面按领域语义和真实引用链绑定，避免仅因位于同一个 level 就把宠物、奖励、皮肤或转盘数据套进错误的商店界面。
   - 真实布局解析失败时才使用原来的可滚动顺序画布，并明确标注“回退布局”；两种模式都支持点击多选及右键屏蔽。
-  - 可操作商品显示绿色边框及“编号 + 商品名”，当前选中项叠加橙色边框；已屏蔽商品仍保留原图片，并使用红框和“已屏蔽”标签标记。
-  - 屏蔽只从识别到的数据数组移除引用，不删除可能被其他界面共享的图片、Prefab 或条目源数据；修改结果写入 `workspace/output/Object/ToImport`，旧的商品屏蔽记录保持兼容。
+  - 完整商店预览提供“打开真实商店 Object 层级”按钮；只有运行时容器而没有静态条目数组的界面以 `R1`、`R2` 编号列出，输入 `R编号` 会进入与菜单 5/6/7 相同的真实层级树，可屏蔽整个界面或其子 Object。
+  - 启用 `enable_ai_dynamic_list_review` 后，困难候选先由 `ai_dynamic_list_codex_model`（默认 `gpt-5.3-codex-spark`）复核一次；Codex CLI 报错时回退已有的 OpenAI-compatible/DeepSeek 配置。AI 只会收到匿名候选 ID 和本地提取的结构证据，也只能选择已有候选，不能创建路径或直接修改资源。
+  - 可操作商品显示绿色边框及“编号 + 商品名”，当前选中项叠加橙色边框；运行时条目模板自带的占位图会先清除，再把解析出的商品图片放入真实 Icon 区域。已屏蔽商品仍保留原图片，并使用红框和“已屏蔽”标签标记。
+  - 逐条屏蔽只从识别到的数据数组移除对应原始索引（重复 PPtr 也只移除选中的那一次出现），不删除可能被其他界面共享的图片、Prefab 或条目源数据；修改结果写入 `workspace/output/Object/ToImport`，旧的商品屏蔽记录保持兼容。
 - `9. 统一撤销已记录的 Object/商品屏蔽`
   - 在同一个窗口管理脚本 5/6/7 产生的 GameObject 屏蔽和脚本 8 产生的商品屏蔽记录；支持多选撤销。
   - 新的 GameObject 屏蔽记录会保存父链、屏蔽层级、最多 3 层下级节点和图片引用。撤销预览以目标为中心，最多显示向上 3 层及已记录的向下 3 层，并排除祖先的其他旁支；没有下层记录时只显示目标及上 3 层，避免大型层级树导致卡顿。
@@ -691,7 +699,9 @@ workspace/FinalResult/Data
 
 菜单 5、6、7、8 共用 `workspace/records/object_graph_cache.pkl` 对象图缓存。当前工具进程内会直接复用内存数据，重启工具后也可复用磁盘缓存；manifest、导出根目录或 `file_id_map.json` 变化时缓存自动失效。图片、Mesh、Object 名称、动态列表及布局链路还会分别复用各自的查询结果。
 
-菜单 8 会同时识别两类布局：一类是由 Content/Grid 等字段显式引用的配置型布局；另一类是 NGUI 中已经实例化、依靠 Transform 层级和 Widget 尺寸排列的手工布局。预览会累计父级缩放，并使用真实条目对象、UITexture/UISprite、UILabel 的字号缩放、对齐、pivot、overflow 和 depth，而不是因为没有 GridLayout 字段就回退为空白卡片。只有容器或条目模板、具体数据由运行时代码注入的任务/成就/活动界面也会以 `R1`、`R2` 等编号列出；可输入对应 `R编号` 只读预览其真实 prefab 布局，但由于资源中不存在可安全删除的静态条目引用，暂不提供逐项屏蔽。
+Object 层级静态预览会按序列化 sibling 顺序还原 UGUI 的 Horizontal/VerticalLayoutGroup；当前选择只影响大层级中的优先扫描，不会改变按钮排列。文本同时兼容 NGUI `mText`、UGUI `m_Text` 与 TextMesh Pro `m_text`，并使用对应字号、颜色、对齐和自动缩放参数近似绘制。
+
+菜单 8 会同时识别三类布局：由 Content/Grid 等字段显式引用的配置型布局；NGUI 中已经实例化、依靠 Transform 层级和 Widget 尺寸排列的手工布局；以及 LuckySpin 这类“配置为内嵌数组、场景组件另有等长真实槽位数组”的绑定布局。预览会累计父级缩放，并使用真实条目对象、UITexture/UISprite、UILabel 的字号缩放、对齐、pivot、overflow 和 depth。只有容器或条目模板、具体数据由运行时代码注入的界面不能逐条删除，但仍可通过 `R编号` 进入 Object 层级进行整层或子对象屏蔽。
 - `S. 搜索`
   - 包含字符串、PathID 和资源名搜索工具。
 - `T. 测试`

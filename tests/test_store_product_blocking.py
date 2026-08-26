@@ -88,7 +88,43 @@ class StoreProductBlockingTests(unittest.TestCase):
                 TOOLS.run_block_dynamic_store_products()
                 TOOLS.run_block_dynamic_store_products()
 
-            scan.assert_called_once_with(scopes)
+            scan.assert_called_once_with(scopes, rejected_candidates=[])
+        finally:
+            TOOLS._OBJECT_GRAPH_CACHE_STATE = previous_state
+
+    def test_runtime_only_shell_opens_real_object_hierarchy(self) -> None:
+        previous_state = TOOLS._OBJECT_GRAPH_CACHE_STATE
+        scopes = {("manifest", "level1"): {"items": {}}}
+        shell = {
+            "name": "LuckySpinPopup",
+            "path_id": 20,
+            "component_path_id": 30,
+            "source": "bundle",
+            "bundle_entry": "level1",
+            "source_json": "spin.json",
+            "pointers": [],
+        }
+        try:
+            TOOLS._OBJECT_GRAPH_CACHE_STATE = {
+                "version": TOOLS.OBJECT_GRAPH_CACHE_VERSION,
+                "snapshot": {},
+                "scopes": scopes,
+                "textures": {},
+                "derived": {},
+            }
+            with (
+                patch.object(TOOLS, "_load_object_graph", return_value=(scopes, {})),
+                patch.object(TOOLS, "_find_store_product_configs", return_value=[]),
+                patch.object(TOOLS, "_request_dynamic_list_ai_review", return_value=set()),
+                patch.object(TOOLS, "_find_runtime_store_shells", return_value=[shell]),
+                patch.object(TOOLS, "_dynamic_list_ai_review_cache_matches", return_value=True),
+                patch.object(TOOLS, "_write_object_graph_cache"),
+                patch.object(TOOLS, "prompt_input", return_value="r1"),
+                patch.object(TOOLS, "_open_dynamic_view_hierarchy", return_value=True) as opened,
+            ):
+                TOOLS.run_block_dynamic_store_products()
+
+            opened.assert_called_once_with(shell, scopes)
         finally:
             TOOLS._OBJECT_GRAPH_CACHE_STATE = previous_state
 
@@ -186,7 +222,195 @@ class StoreProductBlockingTests(unittest.TestCase):
         message = output.getvalue()
         self.assertIn("[未找到数据表]", message)
         self.assertIn("静态数据表", message)
-        self.assertIn("无法列出或选择具体条目", message)
+        self.assertIn("不能逐商品删除", message)
+        self.assertIn("真实 Object 层级", message)
+
+    def test_trade_dialog_shell_selects_sell_and_buy_roots_and_ignores_ui_events(self) -> None:
+        trade_root = Path("input/trade_dialog")
+        prefab_root = Path("input/trade_item")
+        trade = {
+            "scope_key": ("manifest-trade", ""),
+            "source": r"bin\Data\trade_dialog",
+            "bundle_entry": "",
+            "items": {},
+        }
+        prefab = {
+            "scope_key": ("manifest-item", ""),
+            "source": r"bin\Data\trade_item",
+            "bundle_entry": "",
+            "items": {},
+        }
+        trade["pointer_scopes"] = {0: trade, 3: prefab}
+        prefab["pointer_scopes"] = {0: prefab}
+        trade["items"] = {
+            ("GameObject", 5): _entry(
+                trade_root / "GameObject/NpcTradeDialog_5.json",
+                {
+                    "m_Name": "NpcTradeDialog",
+                    "m_Component": {"Array": [
+                        {"component": {"m_FileID": 0, "m_PathID": 35}},
+                        {"component": {"m_FileID": 0, "m_PathID": 45}},
+                    ]},
+                },
+            ),
+            ("RectTransform", 35): _entry(
+                trade_root / "RectTransform/224_35_35.json",
+                {
+                    "m_GameObject": {"m_FileID": 0, "m_PathID": 5},
+                    "m_Father": {"m_FileID": 0, "m_PathID": 0},
+                    "m_Children": {"Array": [
+                        {"m_FileID": 0, "m_PathID": 23},
+                        {"m_FileID": 0, "m_PathID": 29},
+                    ]},
+                    "m_SizeDelta": {"x": 900, "y": 600},
+                },
+            ),
+            ("MonoBehaviour", 45): _entry(
+                trade_root / "MonoBehaviour/114_45_45.json",
+                {
+                    "m_GameObject": {"m_FileID": 0, "m_PathID": 5},
+                    "Root": {"m_FileID": 0, "m_PathID": 5},
+                    "_sellItemsRoot": {"m_FileID": 0, "m_PathID": 23},
+                    "_buyItemsRoot": {"m_FileID": 0, "m_PathID": 29},
+                    "_slotWidgetPrefab": {"m_FileID": 3, "m_PathID": 37},
+                },
+            ),
+            ("GameObject", 1): _entry(
+                trade_root / "GameObject/SellItemsRoot_1.json",
+                {
+                    "m_Name": "SellItemsRoot",
+                    "m_Component": {"Array": [
+                        {"component": {"m_FileID": 0, "m_PathID": 23}}
+                    ]},
+                },
+            ),
+            ("RectTransform", 23): _entry(
+                trade_root / "RectTransform/224_23_23.json",
+                {
+                    "m_GameObject": {"m_FileID": 0, "m_PathID": 1},
+                    "m_Father": {"m_FileID": 0, "m_PathID": 35},
+                    "m_Children": {"Array": []},
+                    "m_SizeDelta": {"x": 700, "y": 220},
+                },
+            ),
+            ("GameObject", 12): _entry(
+                trade_root / "GameObject/BuyItemsRoot_12.json",
+                {
+                    "m_Name": "BuyItemsRoot",
+                    "m_Component": {"Array": [
+                        {"component": {"m_FileID": 0, "m_PathID": 29}}
+                    ]},
+                },
+            ),
+            ("RectTransform", 29): _entry(
+                trade_root / "RectTransform/224_29_29.json",
+                {
+                    "m_GameObject": {"m_FileID": 0, "m_PathID": 12},
+                    "m_Father": {"m_FileID": 0, "m_PathID": 35},
+                    "m_Children": {"Array": []},
+                    "m_SizeDelta": {"x": 700, "y": 220},
+                },
+            ),
+            ("GameObject", 50): _entry(
+                trade_root / "GameObject/ui_events_50.json",
+                {
+                    "m_Name": "ui_events",
+                    "m_Component": {"Array": [
+                        {"component": {"m_FileID": 0, "m_PathID": 60}}
+                    ]},
+                },
+            ),
+            ("MonoBehaviour", 60): _entry(
+                trade_root / "MonoBehaviour/ui_events_60.json",
+                {
+                    "m_GameObject": {"m_FileID": 0, "m_PathID": 50},
+                    "m_ScrollWheelAction": {"m_FileID": 0, "m_PathID": 45},
+                },
+            ),
+        }
+        prefab["items"] = {
+            ("GameObject", 8): _entry(
+                prefab_root / "GameObject/TradeItemView_8.json",
+                {
+                    "m_Name": "TradeItemView",
+                    "m_Component": {"Array": [
+                        {"component": {"m_FileID": 0, "m_PathID": 33}},
+                        {"component": {"m_FileID": 0, "m_PathID": 37}},
+                    ]},
+                },
+            ),
+            ("RectTransform", 33): _entry(
+                prefab_root / "RectTransform/224_33_33.json",
+                {
+                    "m_GameObject": {"m_FileID": 0, "m_PathID": 8},
+                    "m_Father": {"m_FileID": 0, "m_PathID": 0},
+                    "m_Children": {"Array": []},
+                    "m_SizeDelta": {"x": 150, "y": 150},
+                },
+            ),
+            ("MonoBehaviour", 37): _entry(
+                prefab_root / "MonoBehaviour/114_37_37.json",
+                {
+                    "m_GameObject": {"m_FileID": 0, "m_PathID": 8},
+                    "_iconSprite": {"m_FileID": 0, "m_PathID": 46},
+                    "_priceLabel": {"m_FileID": 0, "m_PathID": 36},
+                },
+            ),
+            ("GameObject", 7): _entry(
+                prefab_root / "GameObject/ItemIcon_7.json",
+                {
+                    "m_Name": "ItemIcon",
+                    "m_Component": {"Array": [
+                        {"component": {"m_FileID": 0, "m_PathID": 46}}
+                    ]},
+                },
+            ),
+            ("MonoBehaviour", 46): _entry(
+                prefab_root / "MonoBehaviour/114_46_46.json",
+                {
+                    "m_GameObject": {"m_FileID": 0, "m_PathID": 7},
+                    "m_Sprite": {"m_FileID": 4, "m_PathID": 1},
+                },
+            ),
+        }
+        scopes = {trade["scope_key"]: trade, prefab["scope_key"]: prefab}
+
+        shells = TOOLS._find_runtime_store_shells(scopes)
+
+        self.assertEqual([shell["name"] for shell in shells], ["NpcTradeDialog"])
+        shell = shells[0]
+        sell_layout = TOOLS._runtime_shell_layout(
+            shell,
+            scopes,
+            0,
+            {"array_path": ["SellItems", "Array"]},
+        )
+        buy_layout = TOOLS._runtime_shell_layout(
+            shell,
+            scopes,
+            0,
+            {"array_path": ["BuyItems", "Array"]},
+        )
+        self.assertEqual(sell_layout["content_path_id"], 1)
+        self.assertEqual(buy_layout["content_path_id"], 12)
+        self.assertEqual(sell_layout["template_path_id"], 8)
+        self.assertEqual(sell_layout["root_name"], "NpcTradeDialog")
+        self.assertEqual(TOOLS._template_dynamic_image_object_ids(prefab, 8), [7])
+
+        score = TOOLS._store_config_shell_score(
+            {
+                "name": "NpcTradeProfile",
+                "array_label": "SellItems.Array",
+                "array_path": ["SellItems", "Array"],
+                "products": [{"field_signature": ["itemtemplateid", "baseprice"]}],
+                "path_id": 1,
+                "scope": trade,
+            },
+            shell,
+            set(),
+            scopes,
+        )
+        self.assertGreaterEqual(score, 180)
 
     def test_real_layout_grid_uses_serialized_cell_spacing_and_alignment(self) -> None:
         slots = TOOLS._grid_layout_slots(

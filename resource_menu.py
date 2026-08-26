@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import shutil
 from pathlib import Path
 
 from support.config import activate_config_path, load_config
+from support.channel_package_sync import (
+    CHANNEL_PACKAGE_DIR_NAME_ENV,
+    EXPLICIT_CONFIG_ENV,
+    explicit_channel_sync_request,
+    sync_import_result_to_channel_package,
+)
 from support.image_restore import (
     print_not_imported_images,
     restore_edited_images_before_import,
@@ -34,9 +41,13 @@ def prompt_input(message: str) -> str:
 def _activate_entry_config(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--channel-package-dir-name")
     options, _ = parser.parse_known_args(argv)
     if options.config is not None:
         activate_config_path(options.config)
+        os.environ[EXPLICIT_CONFIG_ENV] = "1"
+    if options.channel_package_dir_name is not None:
+        os.environ[CHANNEL_PACKAGE_DIR_NAME_ENV] = options.channel_package_dir_name.strip()
 
 
 def log_source_modified(message: str) -> None:
@@ -916,7 +927,23 @@ def main() -> int:
                     source_root / "aa" / "Android",
                 )
                 prepare_split_sync_outputs(cfg, import_result_root, restored_paths)
-                print_final_addressables_sync_reminder(cfg, import_result_root)
+                explicit_config, channel_name = explicit_channel_sync_request()
+                if explicit_config and channel_name:
+                    try:
+                        sync_import_result_to_channel_package(
+                            cfg,
+                            import_result_root,
+                            channel_name,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"\033[91m[渠道包同步][停止] 导入结果已生成，但自动覆盖渠道包失败: "
+                            f"{exc}\033[0m",
+                            flush=True,
+                        )
+                        result = 1
+                else:
+                    print_final_addressables_sync_reminder(cfg, import_result_root)
             if "image" in selection:
                 print_not_imported_images(not_imported_images)
             return result

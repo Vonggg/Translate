@@ -177,11 +177,12 @@ class ObjectHierarchyPreviewLayoutTests(unittest.TestCase):
 
         self.assertIn("chain_child_by_parent = {", source)
         self.assertIn("preferred_child_id = chain_child_by_parent.get(object_id)", source)
+        self.assertIn("traversal_child_nodes = list(serialized_child_nodes)", source)
         self.assertLess(
-            source.index("child_nodes.sort("),
+            source.index("traversal_child_nodes.sort("),
             source.index(
-                "for child_object_id, child_transform in child_nodes:",
-                source.index("child_nodes.sort("),
+                "for child_object_id, child_transform in traversal_child_nodes:",
+                source.index("traversal_child_nodes.sort("),
             ),
         )
 
@@ -676,7 +677,7 @@ class ObjectHierarchyPreviewLayoutTests(unittest.TestCase):
                     "m_Enabled": 1,
                     "m_Script": {
                         "m_FileID": 1,
-                        "m_PathID": -3229211799126679632,
+                        "m_PathID": 664,
                     },
                     "m_Padding": {
                         "m_Left": 10,
@@ -728,6 +729,173 @@ class ObjectHierarchyPreviewLayoutTests(unittest.TestCase):
         self.assertTrue(applied)
         self.assertEqual(rects[3], (47.5, 10.0, 60.0, 20.0))
         self.assertEqual(rects[2], (112.5, 10.0, 40.0, 20.0))
+
+    def test_vertical_layout_group_positions_current_unity_children_top_to_bottom(self) -> None:
+        def entry(data: dict) -> dict:
+            return {"data": data, "path": Path("fixture.json")}
+
+        scope = {
+            "items": {
+                ("MonoBehaviour", 90): entry({
+                    "m_Enabled": 1,
+                    "m_Script": {"m_FileID": 1, "m_PathID": 1227},
+                    "m_Padding": {
+                        "m_Left": 0,
+                        "m_Right": 0,
+                        "m_Top": 10,
+                        "m_Bottom": 10,
+                    },
+                    "m_ChildAlignment": 4,
+                    "m_Spacing": 5,
+                    "m_ChildForceExpandWidth": 0,
+                    "m_ChildForceExpandHeight": 0,
+                    "m_ChildControlWidth": 0,
+                    "m_ChildControlHeight": 0,
+                    "m_ReverseArrangement": 0,
+                }),
+                ("GameObject", 1): entry({
+                    "m_Name": "Sidebar",
+                    "m_Component": {"Array": [
+                        {"component": {"m_FileID": 0, "m_PathID": 90}}
+                    ]},
+                }),
+                ("GameObject", 2): entry({
+                    "m_Name": "Play",
+                    "m_IsActive": True,
+                    "m_Component": {"Array": []},
+                }),
+                ("GameObject", 3): entry({
+                    "m_Name": "Login",
+                    "m_IsActive": True,
+                    "m_Component": {"Array": []},
+                }),
+                ("GameObject", 4): entry({
+                    "m_Name": "Settings",
+                    "m_IsActive": True,
+                    "m_Component": {"Array": []},
+                }),
+            }
+        }
+        child_transform = {
+            "m_AnchorMin": {"x": 0, "y": 0},
+            "m_AnchorMax": {"x": 0, "y": 0},
+            "m_AnchoredPosition": {"x": 0, "y": 0},
+            "m_SizeDelta": {"x": 100, "y": 50},
+            "m_Pivot": {"x": 0.5, "y": 0.5},
+            "m_LocalScale": {"x": 1, "y": 1},
+        }
+
+        rects, applied = TOOLS._preview_vertical_layout_child_rects(
+            scope,
+            scope["items"][("GameObject", 1)]["data"],
+            (0.0, 0.0, 200.0, 300.0),
+            (1.0, 1.0),
+            [(2, child_transform), (3, child_transform), (4, child_transform)],
+        )
+
+        self.assertTrue(applied)
+        self.assertEqual(rects[2], (50.0, 180.0, 100.0, 50.0))
+        self.assertEqual(rects[3], (50.0, 125.0, 100.0, 50.0))
+        self.assertEqual(rects[4], (50.0, 70.0, 100.0, 50.0))
+
+    def test_selected_chain_does_not_reorder_vertical_layout_siblings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            def entry(data: dict, name: str) -> dict:
+                return {"data": data, "path": root / name}
+
+            scope = {
+                "source": "fixture.bundle",
+                "bundle_entry": "ui",
+                "items": {
+                    ("GameObject", 1): entry({
+                        "m_Name": "Sidebar",
+                        "m_IsActive": True,
+                        "m_Component": {"Array": [
+                            {"component": {"m_FileID": 0, "m_PathID": 10}},
+                            {"component": {"m_FileID": 0, "m_PathID": 90}},
+                        ]},
+                    }, "Sidebar.json"),
+                    ("RectTransform", 10): entry({
+                        "m_GameObject": {"m_FileID": 0, "m_PathID": 1},
+                        "m_LocalScale": {"x": 1, "y": 1, "z": 1},
+                        "m_Children": {"Array": [
+                            {"m_FileID": 0, "m_PathID": 20},
+                            {"m_FileID": 0, "m_PathID": 30},
+                            {"m_FileID": 0, "m_PathID": 40},
+                        ]},
+                        "m_Father": {"m_FileID": 0, "m_PathID": 0},
+                        "m_AnchorMin": {"x": 0, "y": 0},
+                        "m_AnchorMax": {"x": 0, "y": 0},
+                        "m_AnchoredPosition": {"x": 0, "y": 0},
+                        "m_SizeDelta": {"x": 600, "y": 400},
+                        "m_Pivot": {"x": 0, "y": 0},
+                    }, "Sidebar.RectTransform.json"),
+                    ("MonoBehaviour", 90): entry({
+                        "m_Enabled": 1,
+                        "m_Script": {"m_FileID": 1, "m_PathID": 1227},
+                        "m_Padding": {
+                            "m_Left": 0,
+                            "m_Right": 0,
+                            "m_Top": 0,
+                            "m_Bottom": 0,
+                        },
+                        "m_ChildAlignment": 4,
+                        "m_Spacing": 0,
+                        "m_ChildForceExpandWidth": 0,
+                        "m_ChildForceExpandHeight": 1,
+                        "m_ChildControlWidth": 0,
+                        "m_ChildControlHeight": 0,
+                        "m_ReverseArrangement": 0,
+                    }, "VerticalLayoutGroup.json"),
+                },
+            }
+            for object_id, transform_id, name in (
+                (2, 20, "Play"),
+                (3, 30, "Login"),
+                (4, 40, "Settings"),
+            ):
+                scope["items"][("GameObject", object_id)] = entry({
+                    "m_Name": name,
+                    "m_IsActive": True,
+                    "m_Component": {"Array": [
+                        {"component": {"m_FileID": 0, "m_PathID": transform_id}}
+                    ]},
+                }, f"{name}.json")
+                scope["items"][("RectTransform", transform_id)] = entry({
+                    "m_GameObject": {"m_FileID": 0, "m_PathID": object_id},
+                    "m_LocalScale": {"x": 1, "y": 1, "z": 1},
+                    "m_Children": {"Array": []},
+                    "m_Father": {"m_FileID": 0, "m_PathID": 10},
+                    "m_AnchorMin": {"x": 0, "y": 0},
+                    "m_AnchorMax": {"x": 0, "y": 0},
+                    "m_AnchoredPosition": {"x": 0, "y": 0},
+                    "m_SizeDelta": {"x": 500, "y": 82},
+                    "m_Pivot": {"x": 0.5, "y": 0.5},
+                }, f"{name}.RectTransform.json")
+            scope["pointer_scopes"] = {0: scope}
+            scopes = {("fixture", "ui"): scope}
+            match = {
+                "source": "fixture.bundle",
+                "bundle_entry": "ui",
+                "chain": [
+                    {"name": "Settings", "path_id": 4},
+                    {"name": "Sidebar", "path_id": 1},
+                ],
+            }
+
+            with patch.object(TOOLS, "DEFAULT_OBJECT_PREVIEW_ROOT", root / "preview"):
+                target = TOOLS._create_object_hierarchy_preview(match, 1, scopes)
+                metadata = json.loads(
+                    target.with_suffix(".regions.json").read_text(encoding="utf-8")
+                )
+
+            nodes = {int(node["path_id"]): node for node in metadata["tree_nodes"]}
+            self.assertEqual(nodes[1]["children"], [2, 3, 4])
+            self.assertEqual(nodes[1]["layout_note"], "vertical_layout_group")
+            self.assertLess(nodes[2]["y"], nodes[3]["y"])
+            self.assertLess(nodes[3]["y"], nodes[4]["y"])
 
     def test_vertical_runtime_state_layout_only_restores_cross_axis(self) -> None:
         def entry(data: dict) -> dict:
@@ -1112,8 +1280,14 @@ class ObjectHierarchyPreviewLayoutTests(unittest.TestCase):
                     }, "Label.RectTransform.json"),
                     ("MonoBehaviour", 45): entry({
                         "m_Enabled": 1,
-                        "m_Text": "Hello",
-                        "mFontSize": 20,
+                        "m_Text": "",
+                        "m_text": "Hello TMP",
+                        "m_fontSize": 20,
+                        "m_fontColor": {"r": 1, "g": 1, "b": 1, "a": 1},
+                        "m_enableAutoSizing": 1,
+                        "m_fontSizeMin": 8,
+                        "m_HorizontalAlignment": 2,
+                        "m_VerticalAlignment": 512,
                     }, "Label.Component.json"),
                     ("GameObject", 5): entry({
                         "m_Name": "Runtime Fill",
@@ -1170,6 +1344,7 @@ class ObjectHierarchyPreviewLayoutTests(unittest.TestCase):
             self.assertGreater(nodes[3]["width"], 50)
             self.assertGreater(nodes[5]["width"], 2)
             self.assertIn(4, layer_ids)
+            self.assertEqual(nodes[4]["texts"], ["Hello TMP"])
             self.assertGreaterEqual(layer_ids.count(3), 1)
 
     def test_dynamic_preview_collects_full_transform_subtree(self) -> None:

@@ -12,6 +12,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 QUICK_CONFIG_SCRIPT = (PROJECT_ROOT / "快速配置.py").resolve()
 DEFAULT_CONFIG_PATH = (PROJECT_ROOT / "config.json").resolve()
 ACTIVE_CONFIG_PATH_ENV = "TRANSLATE_CONFIG_PATH"
+EXPLICIT_CONFIG_ENV = "TRANSLATE_CONFIG_EXPLICIT"
+CHANNEL_PACKAGE_DIR_NAME_ENV = "TRANSLATE_CHANNEL_PACKAGE_DIR_NAME"
 SCRIPT_CHOICES = (
     ("0", "快速配置.py", "首次使用快速配置"),
     ("1", "resource_menu.py", "资源菜单"),
@@ -82,6 +84,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="本次启动会话使用的配置文件；相对路径按 Translate 项目根目录解析。",
     )
+    parser.add_argument(
+        "--channel-package-dir-name",
+        default=None,
+        help="导入成功后自动回写的渠道包目录名，例如 GAME_hongtu_L。",
+    )
     parser.add_argument("--print-python", action="store_true", help="只打印配置解析出的 Python 路径并退出。")
     parser.add_argument(
         "script",
@@ -113,7 +120,14 @@ def choose_script() -> str | None:
         print("无效选择，请输入 0/1/2/3/q。")
 
 
-def run_script(script: str, script_args: list[str], config_path: Path) -> int:
+def run_script(
+    script: str,
+    script_args: list[str],
+    config_path: Path,
+    *,
+    explicit_config: bool = False,
+    channel_package_dir_name: str = "",
+) -> int:
     script_path = resolve_script(script)
     if script_path == QUICK_CONFIG_SCRIPT:
         python_path = Path(sys.executable)
@@ -128,8 +142,17 @@ def run_script(script: str, script_args: list[str], config_path: Path) -> int:
     command = [str(python_path), "-u", str(script_path), *forwarded_args]
     child_env = dict(os.environ)
     child_env[ACTIVE_CONFIG_PATH_ENV] = str(config_path)
+    child_env[EXPLICIT_CONFIG_ENV] = "1" if explicit_config else "0"
+    if channel_package_dir_name:
+        child_env[CHANNEL_PACKAGE_DIR_NAME_ENV] = channel_package_dir_name
+    else:
+        child_env.pop(CHANNEL_PACKAGE_DIR_NAME_ENV, None)
     print(f"[launcher] Python: {python_path}", flush=True)
     print(f"[launcher] Config: {config_path}", flush=True)
+    if explicit_config:
+        print(f"[launcher] Config mode: explicit", flush=True)
+    if channel_package_dir_name:
+        print(f"[launcher] Channel package: {channel_package_dir_name}", flush=True)
     print(f"[launcher] Script: {script_path}", flush=True)
     try:
         return subprocess.run(
@@ -148,6 +171,12 @@ def run_script(script: str, script_args: list[str], config_path: Path) -> int:
 def main() -> int:
     args = parse_args()
     config_path = resolve_config_path(args.config)
+    explicit_config = args.config is not None or os.environ.get(EXPLICIT_CONFIG_ENV) == "1"
+    channel_package_dir_name = str(
+        args.channel_package_dir_name
+        if args.channel_package_dir_name is not None
+        else os.environ.get(CHANNEL_PACKAGE_DIR_NAME_ENV, "")
+    ).strip()
 
     if args.print_python:
         python_path = resolve_configured_python(config_path)
@@ -157,13 +186,25 @@ def main() -> int:
         return 0
 
     if args.script:
-        return run_script(args.script, args.script_args, config_path)
+        return run_script(
+            args.script,
+            args.script_args,
+            config_path,
+            explicit_config=explicit_config,
+            channel_package_dir_name=channel_package_dir_name,
+        )
 
     while True:
         script = choose_script()
         if not script:
             return 0
-        result = run_script(script, [], config_path)
+        result = run_script(
+            script,
+            [],
+            config_path,
+            explicit_config=explicit_config,
+            channel_package_dir_name=channel_package_dir_name,
+        )
         if result != 0:
             print(f"\033[91m[launcher] 子菜单执行失败，返回码: {result}\033[0m", flush=True)
         print("[launcher] 已返回 Translate Project Launcher。", flush=True)

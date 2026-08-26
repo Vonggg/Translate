@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import io
+import os
 import sys
 import tempfile
 import unittest
@@ -28,6 +29,7 @@ LAUNCHER = _load_launcher()
 def _args(script: str, *script_args: str) -> argparse.Namespace:
     return argparse.Namespace(
         config=LAUNCHER.DEFAULT_CONFIG_PATH,
+        channel_package_dir_name=None,
         script=script,
         script_args=list(script_args),
         print_python=False,
@@ -156,6 +158,52 @@ class ConfiguredPythonLauncherTests(unittest.TestCase):
                 run.call_args.kwargs["env"][LAUNCHER.ACTIVE_CONFIG_PATH_ENV],
                 str(config_path.resolve()),
             )
+
+    def test_explicit_config_and_channel_are_forwarded_to_child_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "Game A.json"
+            configured = Path(temporary) / "python.exe"
+            config_path.write_text("{}", encoding="utf-8")
+            configured.touch()
+            args = _args("resource_menu.py")
+            args.config = config_path
+            args.channel_package_dir_name = "GAME_hongtu_L"
+            completed = SimpleNamespace(returncode=0)
+            with (
+                patch.object(LAUNCHER, "parse_args", return_value=args),
+                patch.object(LAUNCHER, "load_config", return_value={"python_executable": str(configured)}),
+                patch.object(LAUNCHER.subprocess, "run", return_value=completed) as run,
+            ):
+                result = LAUNCHER.main()
+
+            self.assertEqual(result, 0)
+            child_env = run.call_args.kwargs["env"]
+            self.assertEqual(child_env[LAUNCHER.EXPLICIT_CONFIG_ENV], "1")
+            self.assertEqual(
+                child_env[LAUNCHER.CHANNEL_PACKAGE_DIR_NAME_ENV],
+                "GAME_hongtu_L",
+            )
+
+    def test_channel_without_explicit_config_does_not_enable_explicit_mode(self) -> None:
+        args = _args("resource_menu.py")
+        args.config = None
+        args.channel_package_dir_name = "GAME_hongtu_L"
+        completed = SimpleNamespace(returncode=0)
+        with (
+            patch.dict(os.environ, {LAUNCHER.EXPLICIT_CONFIG_ENV: "0"}, clear=False),
+            patch.object(LAUNCHER, "parse_args", return_value=args),
+            patch.object(LAUNCHER, "resolve_configured_python", return_value=Path(sys.executable)),
+            patch.object(LAUNCHER.subprocess, "run", return_value=completed) as run,
+        ):
+            result = LAUNCHER.main()
+
+        self.assertEqual(result, 0)
+        child_env = run.call_args.kwargs["env"]
+        self.assertEqual(child_env[LAUNCHER.EXPLICIT_CONFIG_ENV], "0")
+        self.assertEqual(
+            child_env[LAUNCHER.CHANNEL_PACKAGE_DIR_NAME_ENV],
+            "GAME_hongtu_L",
+        )
 
 
 if __name__ == "__main__":
