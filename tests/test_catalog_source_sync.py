@@ -9,12 +9,130 @@ from unittest.mock import patch
 
 from pipeline.catalog_tools import (
     auto_patch_and_repack_catalog_after_import,
+    patch_and_repack_embedded_catalog_after_import,
     patch_expanded_catalog_from_final_bundles,
     validate_catalog_crc_algorithm,
 )
 
 
 class CatalogSourceSyncTests(unittest.TestCase):
+    def test_embedded_catalog_restarts_from_source_on_each_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            catalog_source = root / "source" / "aa" / "catalog.json"
+            source_bundle_root = catalog_source.parent / "Android"
+            final_bundle_root = root / "raw" / "aa" / "Android"
+            output_dir = root / "output" / "catalog" / "obb"
+            final_catalog_root = root / "raw" / "aa"
+            catalog_source.parent.mkdir(parents=True)
+            source_bundle_root.mkdir(parents=True)
+            final_bundle_root.mkdir(parents=True)
+            catalog_source.write_text("{}", encoding="utf-8")
+
+            first_name = "first.bundle"
+            second_name = "second.bundle"
+            (source_bundle_root / first_name).write_bytes(b"first")
+            (source_bundle_root / second_name).write_bytes(b"second")
+            first_original_size = len(b"first")
+            second_original_size = len(b"second")
+            baseline_catalog = {
+                "m_ExtraDataString": {
+                    "AssetBundleRequestOptions": [
+                        {
+                            "m_Hash": "first-hash",
+                            "PrimaryKey": first_name,
+                            "m_BundleName": "first",
+                            "m_Crc": 101,
+                            "m_BundleSize": first_original_size,
+                        },
+                        {
+                            "m_Hash": "second-hash",
+                            "PrimaryKey": second_name,
+                            "m_BundleName": "second",
+                            "m_Crc": 202,
+                            "m_BundleSize": second_original_size,
+                        },
+                    ]
+                }
+            }
+
+            def fake_parse(_cfg, _source, destination):
+                expanded_path = destination / "Output.json"
+                destination.mkdir(parents=True, exist_ok=True)
+                expanded_path.write_text(
+                    json.dumps(baseline_catalog),
+                    encoding="utf-8",
+                )
+                return destination / "catalog.json", expanded_path
+
+            captured_catalogs: list[dict] = []
+
+            def fake_repack(expanded_path: Path, destination: Path) -> Path:
+                payload = json.loads(expanded_path.read_text(encoding="utf-8"))
+                captured_catalogs.append(payload)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(json.dumps(payload), encoding="utf-8")
+                return destination
+
+            def fake_crc(path: Path) -> int:
+                return 101 if path.name == first_name else 202
+
+            cfg = SimpleNamespace(root_dir=root, enable_sample_collection=False)
+            first_modified_size = len(b"first-import-result")
+            (final_bundle_root / first_name).write_bytes(b"first-import-result")
+
+            with patch(
+                "pipeline.catalog_tools.parse_catalog_to_output",
+                side_effect=fake_parse,
+            ) as parse_mock, patch(
+                "pipeline.catalog_tools.validate_catalog_crc_algorithm",
+                return_value=True,
+            ), patch(
+                "pipeline.catalog_tools.calculate_unityfs_uncompressed_crc",
+                side_effect=fake_crc,
+            ), patch(
+                "pipeline.catalog_tools.repack_expanded_catalog",
+                side_effect=fake_repack,
+            ):
+                patch_and_repack_embedded_catalog_after_import(
+                    cfg,
+                    catalog_source,
+                    source_bundle_root,
+                    final_bundle_root,
+                    output_dir,
+                    final_catalog_root,
+                )
+
+                (final_bundle_root / first_name).unlink()
+                second_modified_size = len(b"second-import-result-is-different")
+                (final_bundle_root / second_name).write_bytes(
+                    b"second-import-result-is-different"
+                )
+                patch_and_repack_embedded_catalog_after_import(
+                    cfg,
+                    catalog_source,
+                    source_bundle_root,
+                    final_bundle_root,
+                    output_dir,
+                    final_catalog_root,
+                )
+
+            self.assertEqual(parse_mock.call_count, 2)
+            first_rows = captured_catalogs[0]["m_ExtraDataString"][
+                "AssetBundleRequestOptions"
+            ]
+            self.assertEqual(first_rows[0]["m_BundleSize"], first_modified_size)
+            self.assertEqual(first_rows[0]["m_Crc"], 0)
+            self.assertEqual(first_rows[1]["m_BundleSize"], second_original_size)
+
+            second_rows = captured_catalogs[1]["m_ExtraDataString"][
+                "AssetBundleRequestOptions"
+            ]
+            self.assertEqual(second_rows[0]["m_BundleSize"], first_original_size)
+            self.assertEqual(second_rows[0]["m_Crc"], 101)
+            self.assertEqual(second_rows[1]["m_BundleSize"], second_modified_size)
+            self.assertEqual(second_rows[1]["m_Crc"], 0)
+
     def test_repeated_import_uses_original_catalog_metadata_for_matching(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -23,7 +141,7 @@ class CatalogSourceSyncTests(unittest.TestCase):
                 output_path.suffix + ".bak_before_catalog_auto_patch"
             )
             source_bundle_root = root / "source" / "Android"
-            final_bundle_root = root / "final" / "Bundle" / "Android"
+            final_bundle_root = root / "final" / "aa" / "Android"
             source_bundle_root.mkdir(parents=True)
             final_bundle_root.mkdir(parents=True)
             bundle_name = "_generatedisolationlocal_assets_all.bundle"
@@ -95,7 +213,7 @@ class CatalogSourceSyncTests(unittest.TestCase):
             expanded_path.write_text("{}", encoding="utf-8")
 
             final_root = root / "workspace" / "FinalResult"
-            (final_root / "Bundle" / "Android").mkdir(parents=True)
+            (final_root / "aa" / "Android").mkdir(parents=True)
             report_path = (
                 root
                 / "workspace"
@@ -137,7 +255,7 @@ class CatalogSourceSyncTests(unittest.TestCase):
             )
             with common_patches[0], common_patches[1], common_patches[2], common_patches[3]:
                 result = auto_patch_and_repack_catalog_after_import(cfg, final_root)
-            self.assertEqual(result, final_root / "Bundle" / "catalog.json")
+            self.assertEqual(result, final_root / "aa" / "catalog.json")
             self.assertEqual(source_catalog.read_text(encoding="utf-8"), '{"source":"original"}')
 
             report_path.write_text(
@@ -185,7 +303,7 @@ class CatalogSourceSyncTests(unittest.TestCase):
             expanded_path = output_dir / "Output.json"
             expanded_path.write_text("{}", encoding="utf-8")
             final_root = root / "workspace" / "FinalResult"
-            (final_root / "Bundle" / "Android").mkdir(parents=True)
+            (final_root / "aa" / "Android").mkdir(parents=True)
             report_path = (
                 root
                 / "workspace"
@@ -250,11 +368,11 @@ class CatalogSourceSyncTests(unittest.TestCase):
             self.assertEqual(source_catalog.read_bytes(), b"original-bin")
             self.assertEqual(source_hash.read_text(encoding="ascii"), "original-hash")
             self.assertEqual(
-                (final_root / "Bundle" / "catalog.bin").read_bytes(),
+                (final_root / "aa" / "catalog.bin").read_bytes(),
                 b"final-bin",
             )
             self.assertEqual(
-                (final_root / "Bundle" / "catalog.hash").read_text(encoding="ascii"),
+                (final_root / "aa" / "catalog.hash").read_text(encoding="ascii"),
                 "final-hash",
             )
 

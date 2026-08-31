@@ -900,9 +900,10 @@ namespace UnityResourceCLI
             {
                 EnsurePlayerDataDependenciesLoaded();
             }
-            string resultPath = fileType == DetectedFileType.BundleFile && IsBundleExtension(manifest.SourceRelativePath)
-                ? Path.Combine(resultRoot, "Bundle", "Android", manifest.SourceRelativePath)
-                : Path.Combine(resultRoot, manifest.SourceRelativePath);
+            // Keep import output in the same source-relative tree. Python's
+            // resource staging layer maps direct assets/aa, bin/Data and
+            // OBB-contained entries to their final destinations.
+            string resultPath = Path.Combine(resultRoot, manifest.SourceRelativePath);
 
             if (fileType == DetectedFileType.AssetsFile)
             {
@@ -994,11 +995,6 @@ namespace UnityResourceCLI
                 foreach (string temporaryEntry in changedEntries.Values)
                     File.Delete(temporaryEntry);
             }
-        }
-
-        private static bool IsBundleExtension(string path)
-        {
-            return string.Equals(Path.GetExtension(path), ".bundle", StringComparison.OrdinalIgnoreCase);
         }
 
         private void EnsurePlayerDataDependenciesLoaded()

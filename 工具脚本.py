@@ -3331,6 +3331,8 @@ def _has_unresolved_preview_sprite(scope: dict, game_object_data: dict) -> bool:
             data = _entry_data(entry) if entry else None
             if not data:
                 continue
+            if int(data.get("m_Enabled", 1) or 0) == 0:
+                continue
             if "m_Sprite" not in data:
                 atlas_path_id = _pptr(data.get("mAtlas"))[1]
                 if atlas_path_id and str(data.get("mSpriteName", "")).strip():
@@ -4551,6 +4553,28 @@ def _show_interactive_object_preview(target: Path) -> dict:
     view_height = min(source_image.height, max(480, screen_height - 180))
     window.geometry(f"{view_width + side_width}x{view_height + 34}")
 
+    def reveal_preview_window() -> None:
+        """Place a subprocess-owned preview above the Workbench control UI."""
+
+        try:
+            window.deiconify()
+            window.attributes("-topmost", True)
+            window.lift()
+            window.focus_force()
+        except tk.TclError:
+            return
+
+        def release_topmost() -> None:
+            try:
+                # Only use topmost to cross the initial foreground boundary;
+                # afterwards the preview behaves like a normal independent
+                # window and will not cover other applications permanently.
+                window.attributes("-topmost", False)
+            except tk.TclError:
+                pass
+
+        window.after(500, release_topmost)
+
     frame = ttk.Frame(window)
     frame.pack(fill="both", expand=True)
     split_view = tk.PanedWindow(
@@ -5630,6 +5654,7 @@ def _show_interactive_object_preview(target: Path) -> dict:
     if root_path_id:
         refresh_for_path_id(root_path_id)
     window.after(0, fit_to_window)
+    window.after_idle(reveal_preview_window)
     entry_list.focus_set()
     window.mainloop()
     return action_result

@@ -1068,7 +1068,7 @@ def auto_patch_and_repack_catalog_after_import(
         _log_green(f"[catalog] 未找到 catalog，无需自动修正，已正常跳过: {cfg.catalog_source_path}")
         return None
 
-    bundle_root = final_result_root / "Bundle" / "Android"
+    bundle_root = final_result_root / "aa" / "Android"
     if not collect_final_bundle_files(bundle_root):
         _log_green(
             f"[catalog] 本次没有修改 bundle 文件，无需修改 catalog，已正常跳过: "
@@ -1141,8 +1141,8 @@ def auto_patch_and_repack_catalog_after_import(
     sync_source_catalog = source_catalog_modified or localized_internal_id_count > 0
 
     if catalog_source.suffix.lower() == ".bin":
-        final_catalog_path = final_result_root / "Bundle" / "catalog.bin"
-        final_hash_path = final_result_root / "Bundle" / "catalog.hash"
+        final_catalog_path = final_result_root / "aa" / "catalog.bin"
+        final_hash_path = final_result_root / "aa" / "catalog.hash"
         repack_result = repack_binary_catalog_from_legacy_output(
             catalog_source,
             expanded_path,
@@ -1176,7 +1176,7 @@ def auto_patch_and_repack_catalog_after_import(
             )
         return final_catalog_path
 
-    final_catalog_path = final_result_root / "Bundle" / "catalog.json"
+    final_catalog_path = final_result_root / "aa" / "catalog.json"
     repacked_path = repack_expanded_catalog(expanded_path, final_catalog_path)
     _log_green(f"[catalog] 已回打 catalog 并输出到: {repacked_path}")
     if sync_source_catalog:
@@ -1191,3 +1191,82 @@ def auto_patch_and_repack_catalog_after_import(
             f"请手动替换: {repacked_path}"
         )
     return repacked_path
+
+
+def patch_and_repack_embedded_catalog_after_import(
+    cfg: PipelineConfig,
+    catalog_source: Path,
+    source_bundle_root: Path,
+    final_bundle_root: Path,
+    output_dir: Path,
+    final_catalog_root: Path,
+    log_paths: Iterable[Path] = (),
+) -> list[Path]:
+    """Patch one catalog domain embedded in an OBB work tree.
+
+    Unlike :func:`auto_patch_and_repack_catalog_after_import`, this function
+    never modifies the source catalog and never writes to ``FinalResult/aa``.
+    Its outputs stay beside the modified OBB entries until the container is
+    rebuilt.
+    """
+
+    catalog_source = Path(catalog_source)
+    if not catalog_source.is_file():
+        return []
+    if not collect_final_bundle_files(final_bundle_root):
+        return []
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _formatted_path, expanded_path = parse_catalog_to_output(
+        cfg,
+        catalog_source,
+        output_dir,
+    )
+
+    baseline_path = expanded_path.with_suffix(
+        expanded_path.suffix + ".bak_before_catalog_auto_patch"
+    )
+    # FinalResult is rebuilt from the original OBB on every import. Rebuild the
+    # working catalog from that same source as well; otherwise metadata patched
+    # for a bundle in a previous import survives when that bundle is omitted
+    # from the next import, even though the bundle itself reverts to the source
+    # OBB version.
+    shutil.copy2(expanded_path, baseline_path)
+    matching_catalog_path = baseline_path
+    if not validate_catalog_crc_algorithm(
+        cfg,
+        matching_catalog_path,
+        source_bundle_root,
+        final_bundle_root,
+        output_dir,
+    ):
+        raise RuntimeError(f"OBB catalog CRC/尺寸匹配失败: {catalog_source}")
+
+    size_updates, crc_updates, _backup_path = patch_expanded_catalog_from_final_bundles(
+        expanded_path,
+        final_bundle_root,
+        log_paths=log_paths,
+        source_bundle_root=source_bundle_root,
+        zero_crc=True,
+        reference_catalog_path=matching_catalog_path,
+    )
+    _log_green(
+        f"[OBB catalog] 已按修改后的 bundle 更新: "
+        f"size={size_updates}, crc置0={crc_updates}"
+    )
+
+    final_catalog_root.mkdir(parents=True, exist_ok=True)
+    if catalog_source.suffix.casefold() == ".bin":
+        final_catalog_path = final_catalog_root / "catalog.bin"
+        final_hash_path = final_catalog_root / "catalog.hash"
+        repack_binary_catalog_from_legacy_output(
+            catalog_source,
+            expanded_path,
+            final_catalog_path,
+            final_hash_path,
+        )
+        return [final_catalog_path, final_hash_path]
+
+    final_catalog_path = final_catalog_root / catalog_source.name
+    repack_expanded_catalog(expanded_path, final_catalog_path)
+    return [final_catalog_path]

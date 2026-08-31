@@ -14,6 +14,63 @@ import resource_menu
 
 
 class ImageImportAutoRestoreTests(unittest.TestCase):
+    def test_same_flat_name_full_texture_wins_over_split_sprite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_root = root / "workspace" / "input"
+            allpng_root = root / "workspace" / "AllPNG"
+            edited_root = allpng_root / "修改后的图片目录"
+            relative_texture = Path("bundle") / "Texture2D" / "Logo_2.png"
+            source_texture = input_root / relative_texture
+            source_texture.parent.mkdir(parents=True)
+            edited_root.mkdir(parents=True)
+            Image.new("RGBA", (4, 4), (255, 0, 0, 255)).save(source_texture)
+            replacement = edited_root / "Logo_2.png"
+            Image.new("RGBA", (4, 4), (0, 0, 0, 0)).save(replacement)
+            (allpng_root / "_allpng_map.json").write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "flat_name": replacement.name,
+                                "original_relative_path": str(relative_texture),
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sprite_root = allpng_root / "Sprite"
+            sprite_root.mkdir()
+            (sprite_root / "_allsprite_map.json").write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "item_type": "sprite",
+                                "flat_name": replacement.name,
+                                "texture_png": str(source_texture),
+                                "rect": {"x": 1, "y": 1, "width": 2, "height": 2},
+                                "packing_rotation": 0,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            to_import_root = root / "workspace" / "output" / "Image" / "ToImport"
+            not_imported: list[Path] = []
+
+            restored, patched, rebuilt, invalid = resource_menu.restore_edited_images_before_import(
+                root / "workspace", input_root, to_import_root, not_imported
+            )
+
+            self.assertEqual((restored, patched, rebuilt, invalid), (1, 0, 0, 0))
+            self.assertEqual(not_imported, [])
+            with Image.open(to_import_root / relative_texture) as output:
+                self.assertEqual(output.size, (4, 4))
+                self.assertEqual(output.convert("RGBA").getbbox(), None)
+
     def test_building_image_overlay_restores_flat_edits_first(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

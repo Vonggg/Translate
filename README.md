@@ -44,7 +44,7 @@ dotnet --version
 - Windows SDK
 - 适用于 Windows 的 C++ CMake 工具
 
-无需手动配置 PATH。第一次执行 `dotnet build`、一键导入或资源验证时，项目会通过 `vswhere` 自动找到 Visual Studio 自带的 CMake，构建 `textureencoder.dll` 和不启用 PVRTC 的 `PVRTexLib.dll` 兼容占位库，并把它们与 `cuttlefish.dll` 一起复制到 CLI 输出目录。ETC2/ASTC 编码在隔离子进程中执行；原生 DLL 缺失、编码异常或子进程崩溃时，主导入流程会回退为兼容的单 mip RGBA32。仅当 `enable_sample_collection=true` 时才会把替换图片、manifest 和错误信息写入 `样本/TextureEncode_*`，关闭时不保存失败样本。RGBA32 回退结果通常比 GPU 压缩格式大，应结合日志检查后再发布。
+无需手动配置 PATH。第一次执行 `dotnet build`、一键导入或资源验证时，项目会优先使用构建脚本中配置的 Visual Studio 固定目录；该目录不存在或缺少 CMake、MSBuild、x64 C++ 编译器时，再通过 `vswhere` 自动查找有效安装。随后构建 `textureencoder.dll` 和不启用 PVRTC 的 `PVRTexLib.dll` 兼容占位库，并把它们与 `cuttlefish.dll` 一起复制到 CLI 输出目录。ETC2/ASTC 编码在隔离子进程中执行；原生 DLL 缺失、编码异常或子进程崩溃时，主导入流程会回退为兼容的单 mip RGBA32。仅当 `enable_sample_collection=true` 时才会把替换图片、manifest 和错误信息写入 `样本/TextureEncode_*`，关闭时不保存失败样本。RGBA32 回退结果通常比 GPU 压缩格式大，应结合日志检查后再发布。
 
 ### 4. Unity Editor（按资源类型需要）
 
@@ -359,18 +359,24 @@ python .\run_with_config_python.py resource_menu.py
 - `5`: Object 屏蔽，读取 `workspace/output/Object/ToImport`
 - `a`: 全部
 
-UnityResourceCLI 不会用重打后的 Bundle/Data 直接覆盖原始资源，结果输出到：
+UnityResourceCLI 不会用重打后的 Bundle/Data 或 OBB 直接覆盖原始资源，结果输出到：
 
 ```text
 workspace/FinalResult
 ```
 
-Addressables Bundle 和 `bin/Data` 资源会分别放到：
+外层 Addressables Bundle、`bin/Data` 资源和完整重打后的 OBB 会分别放到：
 
 ```text
-workspace/FinalResult/Bundle/Android
+workspace/FinalResult/aa/Android
 workspace/FinalResult/Data
+workspace/FinalResult/obb/<包名>/<原 OBB 文件名>
 ```
+
+`FinalResult/aa` 直接对应游戏外层的 `assets/aa`，`FinalResult/obb` 直接对应
+`assets/obb`。OBB 内部的 `assets/aa` 和 `assets/bin/Data` 只在导出、导入的隔离
+暂存区中处理；最终输出的是保留原 OBB 相对路径和未修改条目的完整 OBB 文件，
+不会把 OBB 内部文件散落到外层 `FinalResult/aa` 或 `FinalResult/Data`。
 
 例外是 Addressables catalog：如果导出阶段已把远程 InternalId 本地化，导入收尾可能同步更新游戏源目录中的 catalog/hash，并用橙色 `[源文件已修改]` 明确提示。
 
@@ -379,11 +385,13 @@ workspace/FinalResult/Data
 若该文件缺失，才会兜底重新解析原始 catalog。
 
 ```text
-workspace/FinalResult/Bundle/catalog.json
+workspace/FinalResult/aa/catalog.json
 ```
 
 当前默认策略是匹配最终 Bundle 后把对应 catalog 条目的 CRC 置为 `0`。
-回打成功后会输出到 `workspace/FinalResult/Bundle`。只要 catalog 中的远程
+外层 catalog 回打成功后会输出到 `workspace/FinalResult/aa`。OBB 内的 catalog
+会在对应容器的隔离工作树中修正，再一并写回 `FinalResult/obb` 中的完整 OBB，
+不会输出到外层 `FinalResult/aa`。只要外层 catalog 中的远程
 InternalId 被改为本地 RuntimePath，就会同步覆盖源 `game/assets/aa` 中的 catalog；
 无论资源是本次下载，还是此前已经存在于本地，规则都相同。没有远程路径被本地化时
 保留源文件，并用蓝色日志提示手动替换最终产物。所有直接写入游戏源目录的操作均以
@@ -593,24 +601,30 @@ workspace/output/Font/NGUI/ToImport
 
 ### 1. 一键导出
 
-先把两处游戏资源汇总到统一暂存区，再导出到 `workspace/input`：
+先扫描外层 Addressables、`bin/Data` 和 `assets/obb` 中的 OBB，再汇总到统一暂存区并导出到 `workspace/input`：
 
 ```text
-game/assets/aa/Android -> workspace/input_sources/aa/Android
-game/assets/bin/Data   -> workspace/input_sources/bin/Data
+game/assets/aa/Android          -> workspace/input_sources/aa/Android
+game/assets/bin/Data            -> workspace/input_sources/bin/Data
+game/assets/obb/**/*.obb 内的资源 -> workspace/input_sources/obb/<容器标识>/...
 ```
+
+OBB 会递归扫描 `assets/obb` 下的 `*.obb`，并只提取其中的 `assets/aa`、
+`assets/bin/Data` Unity 资源。每个 OBB 使用独立容器标识隔离，防止多个 OBB
+或外层资源中的同名 bundle、catalog 和 split 相互覆盖。
 
 导出前会：
 
 - `workspace` 非空时默认保留；只有输入 `c` 才会重建整个工作区。保留时，本次 profile 会替换同类型旧文件并与已有 manifest 合并。
 - 把当前 `game/assets/aa` 完整备份到 `game-name/bak/aa_before_resource_export`；下次导出会用新的操作前快照覆盖该备份。
+- 自动扫描 `game/assets/obb` 下的 OBB，验证容器内路径后在隔离暂存区解包；导出阶段不修改原 OBB。
 - 如果 catalog 存在，先解析并检查远程 InternalId。
 - 可确定完整 URL 时，自动把本地缺失资源下载到游戏的 `assets/aa/Android`。
 - 全部下载成功后用绿色日志汇总；失败时只用红色日志列出失败项。每项结果记录在 `workspace/resource_state/addressables_remote_resources.json`。
 - 下载文件完整落地后，把 catalog 中对应的远程 URL 改为 `{UnityEngine.AddressableAssets.Addressables.RuntimePath}/Android/...` 本地加载路径。
 - 远程资源下载、catalog 本地化、Managed DLL 自动补齐等直接修改游戏源目录的操作，都会输出橙色 `[源文件已修改]` 提示。
 - 远程条目不是完整 HTTP/HTTPS 下载链接时停止，并写出 `workspace/resource_state/addressables_remote_resources.json`。
-- 根据源文件路径、大小和修改时间计算指纹；源资源未变化时复用 `workspace/input_sources`，变化时才清空重建。
+- 根据外层源文件与 OBB 文件的路径、大小和修改时间计算指纹；源资源未变化时复用 `workspace/input_sources`，变化时才清空重建。
 - 在暂存区自动合并 `.splitN`，不询问、不修改游戏原目录。
 - 检查 Managed DLL，必要时从 DummyDll 补齐。
 - 使用单次扫描直接导出，不再为了计算总数提前完整解析一遍资源包；每处理 10,000 条输出一次当前数量，结束时输出最终计数。
@@ -619,7 +633,7 @@ game/assets/bin/Data   -> workspace/input_sources/bin/Data
 导出后会：
 
 - 写入 `workspace/records/file_id_map.json`。
-- 写入 `workspace/resource_state/resource_source_map.json`，记录暂存资源对应的原始路径。
+- 写入 `workspace/resource_state/resource_source_map.json`，记录暂存资源对应的外层原始路径，或 OBB 容器、原相对路径及容器内条目。
 - 写入 `workspace/resource_state/split_bundle_merges.json`，记录自动合并的 split。
 - 在 manifest 的 `ExportedProfiles` 中记录已累计档位，并输出当前已完成和缺失的档位。
 
@@ -641,21 +655,23 @@ workspace/FinalResult
 导入结果会按映射整理到：
 
 ```text
-workspace/FinalResult/Bundle/Android
+workspace/FinalResult/aa
 workspace/FinalResult/Data
+workspace/FinalResult/obb
 ```
 
-如果修改资源原本来自 `.splitN`，导入收尾会在 `FinalResult/Data` 或
-`FinalResult/Bundle/Android` 的对应目录中直接恢复原 `.splitN` 文件，并删除仅供
-导入处理的合并版资源。`FinalResult` 因此只保留可以按目录覆盖回游戏的最终文件，
-不再生成额外的 `SplitBundles` 目录。
+如果修改资源原本来自 `.splitN`，导入收尾会先按原分卷布局恢复切片并删除
+仅供导入处理的合并版资源。外层切片保存在 `FinalResult/Data` 或
+`FinalResult/aa` 的对应目录；OBB 内切片会在容器隔离工作树中恢复后再写回完整 OBB。
+`FinalResult` 因此只保留可以按目录覆盖回游戏的最终文件，不再生成额外的
+`SplitBundles` 目录，也不会在 `FinalResult/obb` 中保留散落的 OBB 内部文件。
 
 未启用渠道包自动覆盖时，导入完成后会再次用绿色日志提醒替换顺序：
 
 1. 先把已下载资源和本地化 catalog 所在的 `game/assets/aa` 同步到目标游戏的 `assets/aa`。
-2. 再用 `workspace/FinalResult` 中的修改资源覆盖目标游戏对应文件。
+2. 再把 `FinalResult/Data`、`FinalResult/aa`、`FinalResult/obb` 分别覆盖到目标游戏的 `assets/bin/Data`、`assets/aa`、`assets/obb`。
 
-启用渠道包自动覆盖后，上述顺序由资源菜单自动执行：检测到远程资源本地化记录时，先把原游戏的完整 `game/assets/aa` 覆盖到渠道包 `assets/aa`，再用 `FinalResult/Data` 覆盖 `assets/bin/Data`、用 `FinalResult/Bundle/Android` 覆盖 `assets/aa/Android`，最后覆盖 catalog/hash 等 `FinalResult/Bundle` 直属文件。任一渠道路径验证或复制步骤失败都会标红并让本次导入返回失败，不会误报为已完成。
+启用渠道包自动覆盖后，上述顺序由资源菜单自动执行：检测到远程资源本地化记录时，先把原游戏的完整 `game/assets/aa` 覆盖到渠道包 `assets/aa`；再把 `FinalResult/Data` 覆盖到 `assets/bin/Data`、把包含 bundle 和 catalog/hash 的完整 `FinalResult/aa` 覆盖到 `assets/aa`、把完整重打后的 `FinalResult/obb` 覆盖到 `assets/obb`。任一渠道路径验证或复制步骤失败都会标红并让本次导入返回失败，不会误报为已完成。
 
 ## 工具脚本.py 菜单说明
 
@@ -721,8 +737,9 @@ Object 层级静态预览会按序列化 sibling 顺序还原 UGUI 的 Horizonta
 - 只要远程 InternalId 被本地化，就会自动回写源 `catalog.bin` 并更新
   `catalog.hash`；复用已经存在的本地资源时同样会修改源 catalog。
 - 一键导入收尾修改 Bundle CRC/size 后，会输出
-  `FinalResult/Bundle/catalog.bin` 与 `FinalResult/Bundle/catalog.hash`。存在远程路径
+  `FinalResult/aa/catalog.bin` 与 `FinalResult/aa/catalog.hash`。存在远程路径
   本地化时同步覆盖游戏源 catalog；否则由用户手动替换。JSON catalog 使用相同规则。
+
 ## 图片对象层级预览（工具脚本主菜单 5）
 
 `工具脚本.py` 主菜单 5“按图片定位对象并选择层级屏蔽”在层级选择处支持静态效果预览：

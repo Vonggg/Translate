@@ -140,9 +140,10 @@ def sync_import_result_to_channel_package(
             f"导入结果不属于当前配置的 workspace: {final_root} != {expected_final_root}"
         )
     final_data = final_root / "Data"
-    final_bundle = final_root / "Bundle"
-    if not final_data.is_dir() and not final_bundle.is_dir():
-        raise FileNotFoundError(f"导入结果中没有 Data 或 Bundle: {final_root}")
+    final_aa = final_root / "aa"
+    final_obb = final_root / "obb"
+    if not final_data.is_dir() and not final_aa.is_dir() and not final_obb.is_dir():
+        raise FileNotFoundError(f"导入结果中没有 Data、aa 或 obb: {final_root}")
 
     source_aa_files = 0
     final_result_files = 0
@@ -167,7 +168,8 @@ def sync_import_result_to_channel_package(
     # win over the original aa tree copied above.
     mappings = (
         (final_data, target.assets_root / "bin" / "Data"),
-        (final_bundle / "Android", target.assets_root / "aa" / "Android"),
+        (final_aa, target.assets_root / "aa"),
+        (final_obb, target.assets_root / "obb"),
     )
     for source_root, destination_root in mappings:
         count, size = _overlay_tree(
@@ -177,15 +179,6 @@ def sync_import_result_to_channel_package(
         )
         final_result_files += count
         copied_bytes += size
-
-    if final_bundle.is_dir():
-        for source in sorted(path for path in final_bundle.iterdir() if path.is_file()):
-            copied_bytes += _copy_file_atomic(
-                source,
-                target.assets_root / "aa" / source.name,
-                target.assets_root,
-            )
-            final_result_files += 1
 
     if final_result_files <= 0:
         raise RuntimeError(f"FinalResult 没有可同步到渠道包的文件: {final_root}")

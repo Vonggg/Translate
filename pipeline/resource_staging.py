@@ -5,21 +5,33 @@ import hashlib
 import os
 import re
 import shutil
+import tempfile
 import urllib.parse
 import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from support.config import PipelineConfig
-from .catalog_tools import parse_catalog_to_output
+from .catalog_tools import (
+    parse_catalog_to_output,
+    patch_and_repack_embedded_catalog_after_import,
+)
+from .obb_container import (
+    ObbEntryMetadata,
+    discover_obb_files,
+    extract_obb_resources,
+    write_obb_from_template,
+)
 from .split_bundle import find_split_bundle_groups, merge_split_bundle_group
 from tools.catalog_bin_tool import repack_binary_catalog_from_legacy_output
 
 
 REMOTE_PLACEHOLDER_RE = re.compile(r"\{[^}]*RemoteLoadPath[^}]*\}", re.IGNORECASE)
-RESOURCE_STAGING_STATE_VERSION = 2
+RESOURCE_STAGING_STATE_VERSION = 3
+OBB_STAGING_CONTENT_SUFFIX = ".contents"
 
 
 def _log_blue(message: str) -> None:
@@ -102,6 +114,14 @@ def _resource_source_fingerprint(cfg: PipelineConfig) -> dict[str, Any]:
     catalog_hash_path = catalog_path.with_suffix(".hash")
     if catalog_hash_path != catalog_path:
         add_file(f"catalog/{catalog_hash_path.name}", catalog_hash_path)
+    game_root = _game_root(cfg)
+    obb_root = game_root / "assets" / "obb"
+    for obb_path in discover_obb_files(game_root):
+        try:
+            relative = obb_path.relative_to(obb_root).as_posix()
+        except ValueError:
+            relative = obb_path.name
+        add_file(f"obb/{relative}", obb_path)
     return {
         "file_count": file_count,
         "total_size": total_size,
@@ -228,6 +248,67 @@ def _addressables_root(cfg: PipelineConfig) -> Path:
 
 def _addressables_backup_root(cfg: PipelineConfig) -> Path:
     return _game_root(cfg).parent / "bak" / "aa_before_resource_export"
+
+
+def _obb_root(cfg: PipelineConfig) -> Path:
+    return _game_root(cfg) / "assets" / "obb"
+
+
+def _obb_staging_prefix(obb_relative: Path) -> Path:
+    return (
+        Path("obb")
+        / obb_relative.parent
+        / f"{obb_relative.name}{OBB_STAGING_CONTENT_SUFFIX}"
+    )
+
+
+def _is_managed_obb_resource(relative: str) -> bool:
+    parts = Path(relative).parts
+    return (
+        len(parts) >= 3
+        and parts[0].casefold() == "bin"
+        and parts[1].casefold() == "data"
+        and parts[2].casefold() == "managed"
+    )
+
+
+def _obb_category(extracted_relative: str) -> str:
+    parts = Path(extracted_relative).parts
+    if len(parts) >= 2 and parts[0].casefold() == "aa":
+        return "obb_addressables"
+    if (
+        len(parts) >= 2
+        and parts[0].casefold() == "bin"
+        and parts[1].casefold() == "data"
+    ):
+        return "obb_data"
+    return "obb_resource"
+
+
+def _obb_entry_record(
+    cfg: PipelineConfig,
+    obb_path: Path,
+    obb_relative: Path,
+    staging_prefix: Path,
+    metadata: ObbEntryMetadata,
+) -> dict[str, Any]:
+    staged_relative = staging_prefix / Path(metadata.extracted_relative)
+    return {
+        "category": _obb_category(metadata.extracted_relative),
+        "origin_kind": "obb",
+        "staged_relative": str(staged_relative),
+        "staged_path": str(cfg.resource_staging_root / staged_relative),
+        "source_path": str(obb_path),
+        "source_relative_game": str(Path("assets") / "obb" / obb_relative),
+        "container_path": str(obb_path),
+        "container_relative_assets_obb": obb_relative.as_posix(),
+        "container_staging_prefix": str(staging_prefix),
+        "archive_entry": metadata.entry_name,
+        "original_file_size": metadata.file_size,
+        "original_compressed_size": metadata.compressed_size,
+        "original_crc32": metadata.crc32,
+        "original_compress_type": metadata.compress_type,
+    }
 
 
 def _safe_relative_path(value: str) -> Path | None:
@@ -686,6 +767,13 @@ def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
         )
         return reusable_root
 
+    # Once reuse has been rejected, the old map must no longer authorize an
+    # import.  Rebuilding can fail later (for example while opening a damaged
+    # OBB); keeping the old map beside a partially replaced staging tree would
+    # make that failed export look usable on the next import attempt.
+    resource_source_map_path(cfg).unlink(missing_ok=True)
+    split_merge_report_path(cfg).unlink(missing_ok=True)
+
     try:
         backup_game_addressables(cfg)
     except Exception as exc:
@@ -693,8 +781,12 @@ def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
         return None
     if not inspect_and_download_catalog_resources(cfg):
         return None
-    if not cfg.resource_source_root.is_dir():
-        print(f"[资源暂存][停止] Data 资源目录不存在: {cfg.resource_source_root}")
+    obb_paths = discover_obb_files(_game_root(cfg))
+    if not cfg.resource_source_root.is_dir() and not obb_paths:
+        print(
+            f"[资源暂存][停止] Data 资源目录不存在，assets/obb 下也没有 OBB: "
+            f"{cfg.resource_source_root}"
+        )
         return None
 
     staging_root = cfg.resource_staging_root
@@ -709,6 +801,61 @@ def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
     print(f"[资源暂存] Addressables Android: {android_count} 个文件")
     print(f"[资源暂存] bin/Data（不含 Managed）: {data_count} 个文件")
 
+    obb_root = _obb_root(cfg)
+    obb_entry_records: dict[str, dict[str, Any]] = {}
+    obb_containers: list[dict[str, Any]] = []
+    obb_resource_count = 0
+    for obb_path in obb_paths:
+        try:
+            obb_relative = obb_path.relative_to(obb_root)
+        except ValueError:
+            _log_red(f"[OBB][停止] OBB 不在当前项目 assets/obb 下: {obb_path}")
+            return None
+        staging_prefix = _obb_staging_prefix(obb_relative)
+        destination = staging_root / staging_prefix
+        try:
+            metadata_rows = extract_obb_resources(obb_path, destination)
+        except Exception as exc:
+            _log_red(f"[OBB][停止] 无法安全读取 OBB: {obb_path} ({exc})")
+            return None
+
+        kept_count = 0
+        for metadata in metadata_rows:
+            extracted_path = destination / Path(metadata.extracted_relative)
+            if _is_managed_obb_resource(metadata.extracted_relative):
+                extracted_path.unlink(missing_ok=True)
+                continue
+            record = _obb_entry_record(
+                cfg,
+                obb_path,
+                obb_relative,
+                staging_prefix,
+                metadata,
+            )
+            obb_entry_records[record["staged_relative"]] = record
+            kept_count += 1
+        obb_resource_count += kept_count
+        stat = obb_path.stat()
+        obb_containers.append(
+            {
+                "container_path": str(obb_path),
+                "container_relative_assets_obb": obb_relative.as_posix(),
+                "container_staging_prefix": str(staging_prefix),
+                "source_size": stat.st_size,
+                "source_mtime_ns": stat.st_mtime_ns,
+                "resource_entry_count": kept_count,
+            }
+        )
+        _log_blue(
+            f"[OBB] 已纳入统一暂存: {obb_relative.as_posix()}，"
+            f"资源条目={kept_count}"
+        )
+    if obb_containers:
+        _log_green(
+            f"[OBB] 自动发现 {len(obb_containers)} 个 OBB，"
+            f"已暂存资源条目={obb_resource_count}"
+        )
+
     groups = find_split_bundle_groups(staging_root)
     invalid_groups = [group for group in groups if not group.is_contiguous_from_zero]
     if invalid_groups:
@@ -720,30 +867,79 @@ def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
     split_records: dict[str, dict[str, Any]] = {}
     for group in groups:
         staged_relative = group.base_path.relative_to(staging_root)
-        category, source_base, source_relative_game = _source_info_for_staged_path(cfg, staged_relative)
+        group_part_relatives = [str(path.relative_to(staging_root)) for path in group.parts]
+        obb_part_records = [obb_entry_records.get(value) for value in group_part_relatives]
+        is_obb_group = any(record is not None for record in obb_part_records)
+        if is_obb_group:
+            if any(record is None for record in obb_part_records):
+                _log_red(f"[OBB][停止] split 组跨越 OBB/普通文件来源: {staged_relative}")
+                return None
+            typed_obb_records = [record for record in obb_part_records if record is not None]
+            container_paths = {str(record.get("container_path", "")) for record in typed_obb_records}
+            if len(container_paths) != 1:
+                _log_red(f"[OBB][停止] split 组跨越多个 OBB: {staged_relative}")
+                return None
+            base_record = dict(typed_obb_records[0])
+            category = str(base_record["category"])
+            source_base = Path(str(base_record["container_path"]))
+            source_relative_game = Path(str(base_record["source_relative_game"]))
+        else:
+            base_record = {}
+            category, source_base, source_relative_game = _source_info_for_staged_path(cfg, staged_relative)
         part_rows = []
-        for part, size in zip(group.parts, (path.stat().st_size for path in group.parts)):
-            source_part = source_base.with_name(part.name)
-            try:
-                source_part_relative_game = source_part.relative_to(_game_root(cfg))
-            except ValueError:
-                source_part_relative_game = source_relative_game.with_name(part.name)
-            part_rows.append(
-                {
-                    "name": part.name,
-                    "size": size,
-                    "source_path": str(source_part),
-                    "source_relative_game": str(source_part_relative_game),
-                }
-            )
+        for index, (part, size) in enumerate(
+            zip(group.parts, (path.stat().st_size for path in group.parts))
+        ):
+            if is_obb_group:
+                part_record = typed_obb_records[index]
+                part_rows.append(
+                    {
+                        "name": part.name,
+                        "size": size,
+                        "source_path": str(part_record["container_path"]),
+                        "source_relative_game": str(part_record["source_relative_game"]),
+                        "archive_entry": str(part_record["archive_entry"]),
+                        "original_crc32": int(part_record["original_crc32"]),
+                        "original_file_size": int(part_record["original_file_size"]),
+                    }
+                )
+            else:
+                source_part = source_base.with_name(part.name)
+                try:
+                    source_part_relative_game = source_part.relative_to(_game_root(cfg))
+                except ValueError:
+                    source_part_relative_game = source_relative_game.with_name(part.name)
+                part_rows.append(
+                    {
+                        "name": part.name,
+                        "size": size,
+                        "source_path": str(source_part),
+                        "source_relative_game": str(source_part_relative_game),
+                    }
+                )
         merge_split_bundle_group(group, overwrite=True, delete_parts=True)
-        split_records[str(staged_relative)] = {
+        split_record = {
             "category": category,
             "staged_relative": str(staged_relative),
             "source_base_path": str(source_base),
             "source_relative_game": str(source_relative_game),
             "parts": part_rows,
         }
+        if is_obb_group:
+            split_record.update(
+                {
+                    key: base_record[key]
+                    for key in (
+                        "origin_kind",
+                        "container_path",
+                        "container_relative_assets_obb",
+                        "container_staging_prefix",
+                    )
+                }
+            )
+            first_archive_entry = str(part_rows[0]["archive_entry"])
+            split_record["archive_entry"] = re.sub(r"\.split\d+$", "", first_archive_entry)
+        split_records[str(staged_relative)] = split_record
         _log_blue(
             f"[分卷] 已在暂存区自动合并: {staged_relative} <- "
             f"{len(part_rows)} 个 split"
@@ -752,17 +948,28 @@ def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
     entries: list[dict[str, Any]] = []
     for staged_path in sorted(path for path in staging_root.rglob("*") if path.is_file()):
         staged_relative = staged_path.relative_to(staging_root)
-        category, source_path, source_relative_game = _source_info_for_staged_path(cfg, staged_relative)
-        entry: dict[str, Any] = {
-            "category": category,
-            "staged_relative": str(staged_relative),
-            "staged_path": str(staged_path),
-            "source_path": str(source_path),
-            "source_relative_game": str(source_relative_game),
-        }
         split_record = split_records.get(str(staged_relative))
-        if split_record is not None:
+        obb_record = obb_entry_records.get(str(staged_relative))
+        if split_record is not None and split_record.get("origin_kind") == "obb":
+            entry = dict(split_record)
+            entry["staged_path"] = str(staged_path)
             entry["split_parts"] = split_record["parts"]
+            entry.pop("parts", None)
+        elif obb_record is not None:
+            entry = dict(obb_record)
+            entry["staged_path"] = str(staged_path)
+        else:
+            category, source_path, source_relative_game = _source_info_for_staged_path(cfg, staged_relative)
+            entry = {
+                "category": category,
+                "origin_kind": "filesystem",
+                "staged_relative": str(staged_relative),
+                "staged_path": str(staged_path),
+                "source_path": str(source_path),
+                "source_relative_game": str(source_relative_game),
+            }
+            if split_record is not None:
+                entry["split_parts"] = split_record["parts"]
         entries.append(entry)
 
     state = {
@@ -773,6 +980,9 @@ def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
         "addressables_android_root": str(android_root),
         "entries": entries,
         "split_group_count": len(split_records),
+        "obb_containers": obb_containers,
+        "obb_container_count": len(obb_containers),
+        "obb_resource_entry_count": obb_resource_count,
     }
     _write_json(resource_source_map_path(cfg), state)
     _write_json(split_merge_report_path(cfg), list(split_records.values()))
@@ -808,13 +1018,17 @@ def _final_path_for_entry(final_root: Path, entry: dict[str, Any]) -> Path:
     staged_relative = Path(str(entry.get("staged_relative", "")))
     parts = staged_relative.parts
     if category == "addressables_android" and len(parts) >= 2:
-        return final_root / "Bundle" / "Android" / Path(*parts[2:])
+        return final_root / "aa" / "Android" / Path(*parts[2:])
     if category == "data" and len(parts) >= 2:
         return final_root / "Data" / Path(*parts[2:])
     return final_root / staged_relative
 
 
-def restore_imported_resource_paths(cfg: PipelineConfig, final_root: Path) -> dict[str, Path]:
+def restore_imported_resource_paths(
+    cfg: PipelineConfig,
+    final_root: Path,
+    import_result_root: Path | None = None,
+) -> dict[str, Path]:
     map_path = resource_source_map_path(cfg)
     state = json.loads(map_path.read_text(encoding="utf-8-sig"))
     entries = state.get("entries") if isinstance(state, dict) else None
@@ -823,18 +1037,20 @@ def restore_imported_resource_paths(cfg: PipelineConfig, final_root: Path) -> di
 
     restored: dict[str, Path] = {}
     moved = 0
+    raw_root = import_result_root or final_root
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         staged_relative = Path(str(entry.get("staged_relative", "")))
-        candidates = [
-            final_root / staged_relative,
-            final_root / "Bundle" / "Android" / staged_relative,
-        ]
-        source_result = next((path for path in candidates if path.is_file()), None)
+        source_result = raw_root / staged_relative
+        if not source_result.is_file():
+            source_result = None
         if source_result is None:
             continue
-        destination = _final_path_for_entry(final_root, entry)
+        if entry.get("origin_kind") == "obb":
+            destination = source_result
+        else:
+            destination = _final_path_for_entry(final_root, entry)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if source_result.resolve() != destination.resolve():
             if destination.exists():
@@ -843,7 +1059,7 @@ def restore_imported_resource_paths(cfg: PipelineConfig, final_root: Path) -> di
             moved += 1
         restored[str(staged_relative)] = destination
 
-    for root in (final_root / "aa", final_root / "bin", final_root / "Bundle" / "Android" / "aa", final_root / "Bundle" / "Android" / "bin"):
+    for root in (raw_root / "aa", raw_root / "bin"):
         if not root.exists():
             continue
         for directory in sorted((path for path in root.rglob("*") if path.is_dir()), reverse=True):
@@ -857,8 +1073,10 @@ def restore_imported_resource_paths(cfg: PipelineConfig, final_root: Path) -> di
             pass
 
     print(f"[导入路径] 已按原始来源整理修改结果: {moved} 个文件")
-    print(f"[导入路径] Addressables: {final_root / 'Bundle' / 'Android'}")
+    print(f"[导入路径] Addressables: {final_root / 'aa'}")
     print(f"[导入路径] bin/Data: {final_root / 'Data'}")
+    if any(entry.get("origin_kind") == "obb" for entry in entries if isinstance(entry, dict)):
+        print(f"[导入路径] OBB 修改暂存: {raw_root / 'obb'}")
     return restored
 
 
@@ -1012,7 +1230,7 @@ def prepare_split_sync_outputs(
         if added_outputs:
             _log_blue(
                 f"[分卷][新增] 修改后资源超过原分卷容量，已新增 {len(added_outputs)} 个切片；"
-                "重打包 APK 时必须把这些新文件一并加入，不能只替换已有条目。"
+                "最终打包时必须把这些新文件一并加入，不能只替换已有条目。"
             )
             for added_output in added_outputs:
                 _log_blue(f"[分卷][新增] {added_output}")
@@ -1040,6 +1258,273 @@ def prepare_split_sync_outputs(
     _log_blue("[分卷][完成] FinalResult 可直接按目录覆盖，不再保留 SplitBundles 和合并版资源")
     _log_blue(f"[分卷][完成] 输出记录: {report_path}")
     return len(records)
+
+
+def patch_obb_catalogs_after_import(
+    cfg: PipelineConfig,
+    import_result_root: Path,
+    log_paths: list[Path] | tuple[Path, ...] = (),
+) -> int:
+    """Patch Addressables catalog metadata inside each modified OBB domain."""
+
+    state = json.loads(resource_source_map_path(cfg).read_text(encoding="utf-8-sig"))
+    containers = state.get("obb_containers") if isinstance(state, dict) else None
+    if not isinstance(containers, list):
+        return 0
+    staging_root = _resolve_staging_root_from_state(
+        cfg,
+        state,
+        resource_source_map_path(cfg),
+    )
+    patched = 0
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        relative_text = str(container.get("container_relative_assets_obb", ""))
+        prefix_text = str(container.get("container_staging_prefix", ""))
+        if not relative_text or not prefix_text:
+            continue
+        relative = Path(relative_text)
+        prefix = Path(prefix_text)
+        source_work_root = staging_root / prefix
+        final_work_root = import_result_root / prefix
+        final_bundle_root = final_work_root / "aa" / "Android"
+        if not final_bundle_root.is_dir() or not any(final_bundle_root.rglob("*.bundle")):
+            continue
+
+        catalog_source = next(
+            (
+                path
+                for path in (
+                    source_work_root / "aa" / "catalog.bin",
+                    source_work_root / "aa" / "catalog.json",
+                )
+                if path.is_file()
+            ),
+            None,
+        )
+        if catalog_source is None:
+            _log_blue(
+                f"[OBB catalog] 修改了 bundle，但容器内没有 catalog，跳过: "
+                f"{relative.as_posix()}"
+            )
+            continue
+        output_dir = (
+            cfg.result_dir
+            / "catalog"
+            / "obb"
+            / relative.parent
+            / f"{relative.name}{OBB_STAGING_CONTENT_SUFFIX}"
+        )
+        generated = patch_and_repack_embedded_catalog_after_import(
+            cfg,
+            catalog_source,
+            source_work_root / "aa" / "Android",
+            final_bundle_root,
+            output_dir,
+            final_work_root / "aa",
+            log_paths=log_paths,
+        )
+        if generated:
+            patched += 1
+            _log_green(
+                f"[OBB catalog] 已生成容器内 catalog 替换: "
+                f"{relative.as_posix()}"
+            )
+    return patched
+
+
+def _obb_replacements_for_container(
+    entries: list[dict[str, Any]],
+    container_relative: str,
+    import_result_root: Path,
+) -> dict[str, Path]:
+    replacements: dict[str, Path] = {}
+    for entry in entries:
+        if (
+            entry.get("origin_kind") != "obb"
+            or str(entry.get("container_relative_assets_obb", ""))
+            != container_relative
+        ):
+            continue
+        staged_relative = Path(str(entry.get("staged_relative", "")))
+        modified_path = import_result_root / staged_relative
+        part_rows = entry.get("split_parts")
+        if isinstance(part_rows, list) and part_rows:
+            existing_parts: list[Path] = []
+            for row in part_rows:
+                if not isinstance(row, dict):
+                    continue
+                part_path = modified_path.with_name(str(row.get("name", "")))
+                if part_path.is_file():
+                    existing_parts.append(part_path)
+                    archive_entry = str(row.get("archive_entry", ""))
+                    if not archive_entry:
+                        raise RuntimeError(
+                            f"OBB split 缺少 archive_entry 映射: {staged_relative}"
+                        )
+                    replacements[archive_entry] = part_path
+            if existing_parts:
+                first_name = str(part_rows[0].get("name", ""))
+                match = re.fullmatch(r"(.+\.split)\d+", first_name)
+                if match is None:
+                    raise RuntimeError(f"无法识别 OBB split 名称: {first_name}")
+                archive_first_name = str(part_rows[0].get("archive_entry", ""))
+                archive_match = re.fullmatch(r"(.+\.split)\d+", archive_first_name)
+                if archive_match is None:
+                    raise RuntimeError(
+                        f"无法识别 OBB split archive_entry: {archive_first_name or '<空>'}"
+                    )
+                extra_index = len(part_rows)
+                while True:
+                    extra_path = modified_path.with_name(f"{match.group(1)}{extra_index}")
+                    if not extra_path.is_file():
+                        break
+                    replacements[f"{archive_match.group(1)}{extra_index}"] = extra_path
+                    extra_index += 1
+            continue
+
+        if not modified_path.is_file():
+            continue
+        archive_entry = str(entry.get("archive_entry", ""))
+        if not archive_entry:
+            raise RuntimeError(f"OBB 条目缺少 archive_entry 映射: {staged_relative}")
+        replacements[archive_entry] = modified_path
+    return replacements
+
+
+def finalize_obb_outputs(
+    cfg: PipelineConfig,
+    final_root: Path,
+    import_result_root: Path,
+) -> int:
+    """Rebuild every modified OBB and emit complete containers under obb/."""
+
+    map_path = resource_source_map_path(cfg)
+    state = json.loads(map_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(state, dict):
+        return 0
+    containers = state.get("obb_containers")
+    raw_entries = state.get("entries")
+    if not isinstance(containers, list) or not isinstance(raw_entries, list):
+        return 0
+    entries = [entry for entry in raw_entries if isinstance(entry, dict)]
+
+    plans: list[dict[str, Any]] = []
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        relative_text = str(container.get("container_relative_assets_obb", ""))
+        prefix_text = str(container.get("container_staging_prefix", ""))
+        source_text = str(container.get("container_path", ""))
+        if not relative_text or not prefix_text or not source_text:
+            raise RuntimeError(f"OBB 来源映射不完整: {container}")
+        source_obb = Path(source_text)
+        source_stat = source_obb.stat()
+        if (
+            source_stat.st_size != int(container.get("source_size", -1))
+            or source_stat.st_mtime_ns != int(container.get("source_mtime_ns", -1))
+        ):
+            raise RuntimeError(
+                f"导出后源 OBB 已变化，请重新执行一键导出: {source_obb}"
+            )
+
+        replacements = _obb_replacements_for_container(
+            entries,
+            relative_text,
+            import_result_root,
+        )
+        if not replacements:
+            continue
+        destination = final_root / "obb" / Path(relative_text)
+        plans.append(
+            {
+                "source_path": source_obb,
+                "destination_path": destination,
+                "work_root": import_result_root / Path(prefix_text),
+                "replacements": replacements,
+                "source_obb": str(source_obb),
+                "output_obb": str(destination),
+                "container_relative_assets_obb": relative_text,
+                "replacement_count": len(replacements),
+                "replacement_entries": sorted(replacements),
+            }
+        )
+
+    outputs: list[dict[str, Any]] = []
+    final_root.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=".obb_finalize_",
+        dir=str(final_root.parent),
+    ) as batch_dir_text:
+        batch_root = Path(batch_dir_text)
+        staged_outputs: list[tuple[dict[str, Any], Path]] = []
+        for plan in plans:
+            staged_output = batch_root / "staged" / Path(
+                str(plan["container_relative_assets_obb"])
+            )
+            write_obb_from_template(
+                Path(plan["source_path"]),
+                staged_output,
+                plan["replacements"],
+            )
+            with zipfile.ZipFile(staged_output, "r") as archive:
+                corrupt_entry = archive.testzip()
+            if corrupt_entry is not None:
+                raise RuntimeError(
+                    f"重打 OBB ZIP 校验失败，损坏条目={corrupt_entry}: {staged_output}"
+                )
+            staged_outputs.append((plan, staged_output))
+
+        # Build and verify the complete batch first.  Publishing is then a
+        # short rename phase with rollback for any destination that existed.
+        published: list[tuple[Path, Path | None]] = []
+        try:
+            for index, (plan, staged_output) in enumerate(staged_outputs):
+                destination = Path(plan["destination_path"])
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                backup: Path | None = None
+                if destination.exists():
+                    backup = batch_root / "backup" / str(index) / destination.name
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(str(destination), str(backup))
+                published.append((destination, backup))
+                os.replace(str(staged_output), str(destination))
+        except Exception:
+            for destination, backup in reversed(published):
+                destination.unlink(missing_ok=True)
+                if backup is not None and backup.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(str(backup), str(destination))
+            raise
+
+        for plan, _staged_output in staged_outputs:
+            output_row = {
+                key: value
+                for key, value in plan.items()
+                if key
+                not in {
+                    "source_path",
+                    "destination_path",
+                    "work_root",
+                    "replacements",
+                }
+            }
+            outputs.append(output_row)
+            work_root = Path(plan["work_root"])
+            if work_root.exists():
+                shutil.rmtree(work_root)
+            _log_green(
+                f"[OBB][完成] 已重打 {plan['container_relative_assets_obb']}，"
+                f"替换条目={plan['replacement_count']} -> {plan['output_obb']}"
+            )
+
+    report_path = resource_state_root(cfg) / "final_obb_outputs.json"
+    if outputs:
+        _write_json(report_path, outputs)
+    else:
+        report_path.unlink(missing_ok=True)
+    return len(outputs)
 
 
 def print_final_addressables_sync_reminder(cfg: PipelineConfig, final_root: Path) -> None:

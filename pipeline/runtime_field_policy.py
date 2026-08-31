@@ -43,7 +43,8 @@ _ALWAYS_RUNTIME_PATH_PATTERNS: tuple[tuple[str, str], ...] = (
     ("m_FaceInfo.m_StyleName", "TMP 字体元数据"),
     ("m_Version", "Unity/TMP 版本元数据"),
     ("settings.passTag", "Shader Pass 标签"),
-    ("m_RegexValue", "正则表达式配置"),
+    ("*m_RegexValue", "正则表达式配置"),
+    ("*_textFormat", "运行时格式串"),
     ("*AdUnit", "广告位标识"),
     ("*AppId", "应用标识"),
     ("*AppKey", "应用密钥"),
@@ -251,3 +252,52 @@ def runtime_field_exclusion_reason(
 
 def is_runtime_non_text_field(data: Any, field_path: str, value: str) -> bool:
     return runtime_field_exclusion_reason(data, field_path, value) is not None
+
+
+def restore_protected_runtime_fields(
+    original: Any,
+    candidate: Any,
+) -> tuple[Any, list[tuple[str, str]]]:
+    """Restore protected strings in a translated JSON tree from its original copy.
+
+    Translation normally skips these fields.  This second pass also protects imports
+    made from stale or manually edited translation output generated before a runtime
+    field rule existed.
+    """
+
+    restored: list[tuple[str, str]] = []
+    root_data = original
+
+    def walk(source: Any, current: Any, field_path: str) -> Any:
+        if isinstance(source, str):
+            reason = runtime_field_exclusion_reason(root_data, field_path, source)
+            if reason is not None and current != source:
+                restored.append((field_path, reason))
+                return source
+            return current
+
+        if isinstance(source, dict) and isinstance(current, dict):
+            for key, source_value in source.items():
+                child_path = f"{field_path}.{key}" if field_path else str(key)
+                if key in current:
+                    current[key] = walk(source_value, current[key], child_path)
+                elif isinstance(source_value, str):
+                    reason = runtime_field_exclusion_reason(
+                        root_data,
+                        child_path,
+                        source_value,
+                    )
+                    if reason is not None:
+                        current[key] = source_value
+                        restored.append((child_path, reason))
+            return current
+
+        if isinstance(source, list) and isinstance(current, list):
+            for index in range(min(len(source), len(current))):
+                child_path = f"{field_path}[{index}]"
+                current[index] = walk(source[index], current[index], child_path)
+            return current
+
+        return current
+
+    return walk(original, candidate, ""), restored

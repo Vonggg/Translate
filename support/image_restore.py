@@ -102,6 +102,12 @@ def restore_split_sprites_to_import(
     from PIL import Image
 
     items = load_allpng_map(sprite_map_path)
+    # A flat filename can legitimately collide between an exported Texture2D
+    # and one of its split Sprites (for example ``TextureName_2.png``).  The
+    # ordinary-image restore runs first, so a file already imported there is a
+    # deliberate full-texture replacement.  Do not reinterpret that same flat
+    # file as a cropped Sprite and patch it into the replacement again.
+    directly_restored_images = set(imported_images or ())
     atlas_groups: dict[str, dict] = {}
     missing = 0
     invalid = 0
@@ -116,6 +122,12 @@ def restore_split_sprites_to_import(
         edited_path = edited_root / flat_name
         if not edited_path.is_file():
             missing += 1
+            continue
+        if edited_path.resolve() in directly_restored_images:
+            print(
+                f"[图集回拼] {edited_path.name} 已作为同名完整 Texture2D 直接替换，"
+                "跳过重复子图回拼。"
+            )
             continue
         if not isinstance(rect, dict):
             invalid += 1

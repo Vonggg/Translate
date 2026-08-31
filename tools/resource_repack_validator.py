@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +38,7 @@ def _final_path(final_root: Path, entry: dict[str, Any]) -> Path:
     if category == "data" and len(parts) >= 2:
         return final_root / "Data" / Path(*parts[2:])
     if category == "addressables_android" and len(parts) >= 2:
-        return final_root / "Bundle" / "Android" / Path(*parts[2:])
+        return final_root / "aa" / "Android" / Path(*parts[2:])
     return final_root / relative
 
 
@@ -118,8 +120,18 @@ def _prepare_candidates(
         raise FileNotFoundError(f"原始资源缓存不存在，请重新执行一键导出: {source_root}")
 
     prepared = 0
+    obb_entries_by_container: dict[str, list[dict[str, Any]]] = {}
     for raw_entry in state["entries"]:
         if not isinstance(raw_entry, dict):
+            continue
+        if raw_entry.get("origin_kind") == "obb":
+            container_relative = str(
+                raw_entry.get("container_relative_assets_obb", "")
+            )
+            if container_relative:
+                obb_entries_by_container.setdefault(container_relative, []).append(
+                    raw_entry
+                )
             continue
         staged_relative = Path(str(raw_entry.get("staged_relative", "")))
         if not staged_relative.parts:
@@ -136,6 +148,91 @@ def _prepare_candidates(
             continue
         if _merge_final_split(raw_entry, final_path, destination):
             prepared += 1
+
+    for container_relative, obb_entries in sorted(obb_entries_by_container.items()):
+        final_obb = final_root / "obb" / Path(container_relative)
+        if not final_obb.is_file():
+            continue
+        with zipfile.ZipFile(final_obb, "r") as archive:
+            corrupt_entry = archive.testzip()
+            if corrupt_entry is not None:
+                raise RuntimeError(
+                    f"FinalResult OBB ZIP 损坏，条目={corrupt_entry}: {final_obb}"
+                )
+            info_by_name = {info.filename: info for info in archive.infolist()}
+            for raw_entry in obb_entries:
+                staged_relative = Path(
+                    str(raw_entry.get("staged_relative", ""))
+                )
+                if not staged_relative.parts:
+                    continue
+                original = source_root / staged_relative
+                if not original.is_file():
+                    continue
+                destination = candidate_root / staged_relative
+                part_rows = raw_entry.get("split_parts")
+                if isinstance(part_rows, list) and part_rows:
+                    archive_parts: list[tuple[zipfile.ZipInfo, dict[str, Any]]] = []
+                    changed = False
+                    for row in part_rows:
+                        if not isinstance(row, dict):
+                            continue
+                        entry_name = str(row.get("archive_entry", ""))
+                        info = info_by_name.get(entry_name)
+                        if info is None:
+                            raise RuntimeError(
+                                f"FinalResult OBB 缺少 split 条目 {entry_name}: {final_obb}"
+                            )
+                        archive_parts.append((info, row))
+                        if (
+                            info.CRC != int(row.get("original_crc32", -1))
+                            or info.file_size
+                            != int(row.get("original_file_size", -1))
+                        ):
+                            changed = True
+                    first_archive_entry = str(part_rows[0].get("archive_entry", ""))
+                    split_match = re.fullmatch(r"(.+\.split)\d+", first_archive_entry)
+                    if split_match is None:
+                        raise RuntimeError(
+                            f"无法识别 OBB split archive_entry: {first_archive_entry or '<空>'}"
+                        )
+                    extra_index = len(part_rows)
+                    while True:
+                        extra_name = f"{split_match.group(1)}{extra_index}"
+                        extra_info = info_by_name.get(extra_name)
+                        if extra_info is None:
+                            break
+                        archive_parts.append((extra_info, {}))
+                        changed = True
+                        extra_index += 1
+                    if not changed:
+                        continue
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with destination.open("wb") as output:
+                        for info, _row in archive_parts:
+                            with archive.open(info, "r") as source:
+                                shutil.copyfileobj(source, output, length=1024 * 1024)
+                    prepared += 1
+                    continue
+
+                entry_name = str(raw_entry.get("archive_entry", ""))
+                info = info_by_name.get(entry_name)
+                if info is None:
+                    raise RuntimeError(
+                        f"FinalResult OBB 缺少映射条目 {entry_name}: {final_obb}"
+                    )
+                if (
+                    info.CRC == int(raw_entry.get("original_crc32", -1))
+                    and info.file_size
+                    == int(raw_entry.get("original_file_size", -1))
+                ):
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(info, "r") as source, destination.open(
+                    "wb"
+                ) as output:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+                prepared += 1
 
     return source_root, prepared
 

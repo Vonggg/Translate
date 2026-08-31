@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from pipeline.runtime_field_policy import runtime_field_exclusion_reason
+import resource_menu
+
+from pipeline.runtime_field_policy import (
+    restore_protected_runtime_fields,
+    runtime_field_exclusion_reason,
+)
 from pipeline.translation import _scan_one_translation_json, apply_translations_to_json
 from support.config import load_config
 
@@ -76,6 +81,90 @@ class RuntimeFieldPolicyTests(unittest.TestCase):
         )
         self.assertEqual(action_map["m_Bindings"]["Array"][0]["m_Action"], "Move")
         self.assertEqual(translated["m_Label"], "移动")
+
+    def test_runtime_text_format_is_preserved(self) -> None:
+        data = {
+            "_textFormat": r"mm\:ss",
+            "m_text": "Time left",
+        }
+        translated = apply_translations_to_json(
+            data,
+            load_config(),
+            {
+                r"mm\:ss": "mm:ss",
+                "Time left": "剩余时间",
+            },
+        )
+
+        self.assertEqual(r"mm\:ss", translated["_textFormat"])
+        self.assertEqual("剩余时间", translated["m_text"])
+        self.assertEqual(
+            "运行时格式串",
+            runtime_field_exclusion_reason(data, "_textFormat", r"mm\:ss"),
+        )
+
+    def test_import_guard_restores_stale_runtime_translation(self) -> None:
+        original = {
+            "_textFormat": r"mm\:ss",
+            "m_text": "Time left",
+            "nested": {"m_RegexValue": r"^room_[0-9]+$"},
+        }
+        stale_output = {
+            "_textFormat": "mm:ss",
+            "m_text": "剩余时间",
+            "nested": {"m_RegexValue": "房间"},
+        }
+
+        repaired, restored = restore_protected_runtime_fields(original, stale_output)
+
+        self.assertEqual(r"mm\:ss", repaired["_textFormat"])
+        self.assertEqual(r"^room_[0-9]+$", repaired["nested"]["m_RegexValue"])
+        self.assertEqual("剩余时间", repaired["m_text"])
+        self.assertEqual(
+            {
+                ("_textFormat", "运行时格式串"),
+                ("nested.m_RegexValue", "正则表达式配置"),
+            },
+            set(restored),
+        )
+
+    def test_import_overlay_repairs_runtime_fields_but_keeps_visible_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            input_root = workspace / "input"
+            text_root = workspace / "output" / "Text"
+            relative = Path("bundle") / "MonoBehaviour" / "asset.json"
+            original_path = input_root / relative
+            translated_path = text_root / relative
+            original_path.parent.mkdir(parents=True)
+            translated_path.parent.mkdir(parents=True)
+            original_path.write_text(
+                json.dumps(
+                    {"_textFormat": r"mm\:ss", "m_text": "Time left"},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            translated_path.write_text(
+                json.dumps(
+                    {"_textFormat": "mm:ss", "m_text": "剩余时间"},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            cfg = SimpleNamespace(
+                workspace_root=workspace,
+                root_dir=Path(temp_dir),
+                resource_input_root=input_root,
+                stage_dir=workspace / "output",
+            )
+
+            overlay_root = resource_menu.build_import_overlay(cfg, {"text"})
+
+            self.assertIsNotNone(overlay_root)
+            repaired = json.loads((overlay_root / relative).read_text(encoding="utf-8"))
+            self.assertEqual(r"mm\:ss", repaired["_textFormat"])
+            self.assertEqual("剩余时间", repaired["m_text"])
 
     def test_legacy_input_and_startup_lookup_names_are_preserved(self) -> None:
         cases = [

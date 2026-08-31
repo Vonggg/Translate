@@ -4,6 +4,7 @@ import json
 import io
 import tempfile
 import unittest
+import zipfile
 from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
@@ -12,6 +13,7 @@ from unittest.mock import patch
 from pipeline.resource_staging import (
     _write_split_parts_next_to_merged,
     _build_remote_downloads,
+    finalize_obb_outputs,
     inspect_and_download_catalog_resources,
     load_prepared_resource_source,
     prepare_split_sync_outputs,
@@ -108,6 +110,67 @@ class ResourceStagingTests(unittest.TestCase):
             self.assertIsNone(resolved)
             self.assertIn(str(current_staging_root), output.getvalue())
             self.assertNotIn("旧工作区路径映射迁移到当前项目", output.getvalue())
+
+    def test_failed_obb_rebuild_invalidates_previous_resource_map(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tool_root = root / "tool"
+            project_root = root / "projects"
+            game_root = project_root / "demo" / "game-name" / "game"
+            data_root = game_root / "assets" / "bin" / "Data"
+            data_root.mkdir(parents=True)
+            source_data = data_root / "globalgamemanagers"
+            source_data.write_bytes(b"initial data")
+
+            source_obb = (
+                game_root
+                / "assets"
+                / "obb"
+                / "com.example.game"
+                / "main.1.com.example.game.obb"
+            )
+            source_obb.parent.mkdir(parents=True)
+            with zipfile.ZipFile(source_obb, "w") as archive:
+                archive.writestr("assets/aa/Android/content.bundle", b"bundle")
+
+            cfg = replace(
+                load_config(),
+                root_dir=tool_root,
+                project_root_dir=project_root,
+                project_name="demo",
+                resource_source_subpath=Path("game-name/game/assets/bin/Data"),
+                resource_managed_subpath=Path(
+                    "game-name/game/assets/bin/Data/Managed"
+                ),
+                catalog_source_subpath=Path(
+                    "game-name/game/assets/aa/catalog.json"
+                ),
+                resource_staging_root=tool_root / "workspace" / "input_sources",
+                resource_input_root=tool_root / "workspace" / "input",
+                result_dir=tool_root / "workspace" / "output",
+                record_dir=tool_root / "workspace" / "records",
+                log_dir=tool_root / "workspace" / "logs",
+            )
+
+            prepared = prepare_unified_resource_source(cfg)
+            self.assertEqual(prepared, cfg.resource_staging_root)
+            map_path = resource_source_map_path(cfg)
+            self.assertTrue(map_path.is_file())
+            self.assertEqual(load_prepared_resource_source(cfg), prepared)
+
+            source_data.write_bytes(b"changed data invalidates the fingerprint")
+            with patch(
+                "pipeline.resource_staging.extract_obb_resources",
+                side_effect=RuntimeError("simulated OBB extraction failure"),
+            ):
+                self.assertIsNone(prepare_unified_resource_source(cfg))
+
+            reloaded = load_prepared_resource_source(cfg)
+            self.assertEqual(
+                (map_path.exists(), reloaded),
+                (False, None),
+                "OBB 重建失败后必须删除旧路径映射，不能把半成品暂存区当作可复用导出源",
+            )
 
     def test_split_output_preserves_fixed_boundaries_and_verifies_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -278,7 +341,7 @@ class ResourceStagingTests(unittest.TestCase):
             )
 
             state = json.loads(resource_source_map_path(cfg).read_text(encoding="utf-8"))
-            self.assertEqual(state["state_version"], 2)
+            self.assertEqual(state["state_version"], 3)
             self.assertIn("source_fingerprint", state)
             split_entries = [entry for entry in state["entries"] if entry.get("split_parts")]
             self.assertEqual(len(split_entries), 1)
@@ -310,7 +373,7 @@ class ResourceStagingTests(unittest.TestCase):
             )
 
             final_root = tool_root / "workspace" / "FinalResult"
-            staged_bundle_result = final_root / "Bundle" / "Android" / "aa" / "Android" / "remote.bundle"
+            staged_bundle_result = final_root / "aa" / "Android" / "remote.bundle"
             staged_data_result = final_root / "bin" / "Data" / "globalgamemanagers"
             staged_bundle_result.parent.mkdir(parents=True)
             staged_data_result.parent.mkdir(parents=True)
@@ -318,11 +381,11 @@ class ResourceStagingTests(unittest.TestCase):
             staged_data_result.write_bytes(b"changed-data")
 
             restored = restore_imported_resource_paths(cfg, final_root)
-            self.assertEqual((final_root / "Bundle" / "Android" / "remote.bundle").read_bytes(), b"WXYZ")
+            self.assertEqual((final_root / "aa" / "Android" / "remote.bundle").read_bytes(), b"WXYZ")
             self.assertEqual((final_root / "Data" / "globalgamemanagers").read_bytes(), b"changed-data")
 
             self.assertEqual(prepare_split_sync_outputs(cfg, final_root, restored), 1)
-            split_root = final_root / "Bundle" / "Android"
+            split_root = final_root / "aa" / "Android"
             self.assertEqual((split_root / "remote.bundle.split0").read_bytes(), b"WX")
             self.assertEqual((split_root / "remote.bundle.split1").read_bytes(), b"YZ")
             self.assertFalse((split_root / "remote.bundle.split2").exists())
@@ -357,6 +420,294 @@ class ResourceStagingTests(unittest.TestCase):
             with redirect_stdout(reminder_output):
                 print_final_addressables_sync_reminder(cfg, final_root)
             self.assertIn("本次实际下载 2 个", reminder_output.getvalue())
+
+    def test_obb_resources_are_namespaced_and_rebuilt_to_final_obb(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tool_root = root / "tool"
+            project_root = root / "projects"
+            game_root = project_root / "demo" / "game-name" / "game"
+            data_root = game_root / "assets" / "bin" / "Data"
+            data_root.mkdir(parents=True)
+            (data_root / "globalgamemanagers").write_bytes(b"outer data")
+
+            obb_relative = Path("com.example.game") / "main.1.com.example.game.obb"
+            source_obb = game_root / "assets" / "obb" / obb_relative
+            source_obb.parent.mkdir(parents=True)
+            with zipfile.ZipFile(source_obb, "w") as archive:
+                archive.writestr("assets/aa/Android/content.bundle", b"old bundle")
+                archive.writestr("assets/bin/Data/inside.assets", b"inside data")
+                archive.writestr("assets/unrelated.txt", b"keep me")
+
+            cfg = replace(
+                load_config(),
+                root_dir=tool_root,
+                project_root_dir=project_root,
+                project_name="demo",
+                resource_source_subpath=Path("game-name/game/assets/bin/Data"),
+                resource_managed_subpath=Path("game-name/game/assets/bin/Data/Managed"),
+                catalog_source_subpath=Path("game-name/game/assets/aa/catalog.json"),
+                resource_staging_root=tool_root / "workspace" / "input_sources",
+                resource_input_root=tool_root / "workspace" / "input",
+                result_dir=tool_root / "workspace" / "output",
+                record_dir=tool_root / "workspace" / "records",
+                log_dir=tool_root / "workspace" / "logs",
+            )
+
+            staging_root = prepare_unified_resource_source(cfg)
+            prefix = (
+                Path("obb")
+                / "com.example.game"
+                / "main.1.com.example.game.obb.contents"
+            )
+            self.assertEqual(
+                (staging_root / prefix / "aa" / "Android" / "content.bundle").read_bytes(),
+                b"old bundle",
+            )
+            self.assertEqual(
+                (staging_root / prefix / "bin" / "Data" / "inside.assets").read_bytes(),
+                b"inside data",
+            )
+
+            state = json.loads(resource_source_map_path(cfg).read_text(encoding="utf-8"))
+            self.assertEqual(state["state_version"], 3)
+            self.assertEqual(state["obb_container_count"], 1)
+            obb_entries = [
+                entry for entry in state["entries"] if entry.get("origin_kind") == "obb"
+            ]
+            self.assertEqual(len(obb_entries), 2)
+            self.assertTrue(all(entry.get("archive_entry") for entry in obb_entries))
+
+            raw_root = tool_root / "workspace" / "temp" / "import_result_raw"
+            modified = raw_root / prefix / "aa" / "Android" / "content.bundle"
+            modified.parent.mkdir(parents=True)
+            modified.write_bytes(b"new bundle")
+            final_root = tool_root / "workspace" / "FinalResult"
+
+            restored = restore_imported_resource_paths(cfg, final_root, raw_root)
+            self.assertIn(str(prefix / "aa" / "Android" / "content.bundle"), restored)
+            self.assertEqual(finalize_obb_outputs(cfg, final_root, raw_root), 1)
+
+            output_obb = final_root / "obb" / obb_relative
+            with zipfile.ZipFile(output_obb, "r") as archive:
+                self.assertIsNone(archive.testzip())
+                self.assertEqual(
+                    archive.read("assets/aa/Android/content.bundle"),
+                    b"new bundle",
+                )
+                self.assertEqual(
+                    archive.read("assets/bin/Data/inside.assets"),
+                    b"inside data",
+                )
+                self.assertEqual(archive.read("assets/unrelated.txt"), b"keep me")
+            self.assertFalse((final_root / "Bundle").exists())
+            self.assertFalse((raw_root / prefix).exists())
+
+    def test_obb_split_growth_adds_new_archive_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tool_root = root / "tool"
+            project_root = root / "projects"
+            game_root = project_root / "demo" / "game-name" / "game"
+            data_root = game_root / "assets" / "bin" / "Data"
+            data_root.mkdir(parents=True)
+            (data_root / "globalgamemanagers").write_bytes(b"outer data")
+
+            obb_relative = Path("game") / "main.1.demo.obb"
+            source_obb = game_root / "assets" / "obb" / obb_relative
+            source_obb.parent.mkdir(parents=True)
+            with zipfile.ZipFile(source_obb, "w") as archive:
+                archive.writestr("assets/aa/Android/large.bundle.split0", b"ABCD")
+                archive.writestr("assets/aa/Android/large.bundle.split1", b"EF")
+
+            cfg = replace(
+                load_config(),
+                root_dir=tool_root,
+                project_root_dir=project_root,
+                project_name="demo",
+                resource_source_subpath=Path("game-name/game/assets/bin/Data"),
+                resource_managed_subpath=Path("game-name/game/assets/bin/Data/Managed"),
+                catalog_source_subpath=Path("game-name/game/assets/aa/catalog.json"),
+                resource_staging_root=tool_root / "workspace" / "input_sources",
+                resource_input_root=tool_root / "workspace" / "input",
+                result_dir=tool_root / "workspace" / "output",
+                record_dir=tool_root / "workspace" / "records",
+                log_dir=tool_root / "workspace" / "logs",
+            )
+
+            staging_root = prepare_unified_resource_source(cfg)
+            self.assertIsNotNone(staging_root)
+            assert staging_root is not None
+            prefix = Path("obb") / "game" / "main.1.demo.obb.contents"
+            staged_relative = prefix / "aa" / "Android" / "large.bundle"
+            self.assertEqual((staging_root / staged_relative).read_bytes(), b"ABCDEF")
+
+            raw_root = tool_root / "workspace" / "temp" / "import_result_raw"
+            modified = raw_root / staged_relative
+            modified.parent.mkdir(parents=True)
+            modified.write_bytes(b"ABCDEFGHIJ")
+            final_root = tool_root / "workspace" / "FinalResult"
+            restored = restore_imported_resource_paths(cfg, final_root, raw_root)
+            self.assertEqual(prepare_split_sync_outputs(cfg, final_root, restored), 1)
+            self.assertEqual(finalize_obb_outputs(cfg, final_root, raw_root), 1)
+
+            output_obb = final_root / "obb" / obb_relative
+            with zipfile.ZipFile(output_obb, "r") as archive:
+                self.assertEqual(
+                    archive.namelist(),
+                    [
+                        "assets/aa/Android/large.bundle.split0",
+                        "assets/aa/Android/large.bundle.split1",
+                        "assets/aa/Android/large.bundle.split2",
+                    ],
+                )
+                self.assertEqual(
+                    b"".join(
+                        archive.read(f"assets/aa/Android/large.bundle.split{index}")
+                        for index in range(3)
+                    ),
+                    b"ABCDEFGHIJ",
+                )
+
+    def test_multi_obb_failure_does_not_publish_partial_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tool_root = root / "tool"
+            project_root = root / "projects"
+            game_root = project_root / "demo" / "game-name" / "game"
+            data_root = game_root / "assets" / "bin" / "Data"
+            data_root.mkdir(parents=True)
+            (data_root / "globalgamemanagers").write_bytes(b"outer data")
+
+            obb_root = game_root / "assets" / "obb"
+            relatives = [Path("base") / "main.1.demo.obb", Path("patch") / "main.1.demo.obb"]
+            for index, relative in enumerate(relatives):
+                source_obb = obb_root / relative
+                source_obb.parent.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(source_obb, "w") as archive:
+                    archive.writestr("assets/aa/Android/content.bundle", f"old-{index}".encode())
+
+            cfg = replace(
+                load_config(),
+                root_dir=tool_root,
+                project_root_dir=project_root,
+                project_name="demo",
+                resource_source_subpath=Path("game-name/game/assets/bin/Data"),
+                resource_managed_subpath=Path("game-name/game/assets/bin/Data/Managed"),
+                catalog_source_subpath=Path("game-name/game/assets/aa/catalog.json"),
+                resource_staging_root=tool_root / "workspace" / "input_sources",
+                resource_input_root=tool_root / "workspace" / "input",
+                result_dir=tool_root / "workspace" / "output",
+                record_dir=tool_root / "workspace" / "records",
+                log_dir=tool_root / "workspace" / "logs",
+            )
+            self.assertIsNotNone(prepare_unified_resource_source(cfg))
+
+            raw_root = tool_root / "workspace" / "temp" / "import_result_raw"
+            for index, relative in enumerate(relatives):
+                prefix = Path("obb") / relative.parent / f"{relative.name}.contents"
+                modified = raw_root / prefix / "aa" / "Android" / "content.bundle"
+                modified.parent.mkdir(parents=True, exist_ok=True)
+                modified.write_bytes(f"new-{index}".encode())
+            final_root = tool_root / "workspace" / "FinalResult"
+            restore_imported_resource_paths(cfg, final_root, raw_root)
+
+            (obb_root / relatives[1]).write_bytes(b"source changed after export")
+            with self.assertRaisesRegex(RuntimeError, "源 OBB 已变化"):
+                finalize_obb_outputs(cfg, final_root, raw_root)
+            final_obb_root = final_root / "obb"
+            self.assertFalse(
+                final_obb_root.exists() and any(final_obb_root.rglob("*.obb"))
+            )
+
+    def test_same_archive_entry_in_multiple_obbs_uses_isolated_staging_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tool_root = root / "tool"
+            project_root = root / "projects"
+            game_root = project_root / "demo" / "game-name" / "game"
+            data_root = game_root / "assets" / "bin" / "Data"
+            data_root.mkdir(parents=True)
+            (data_root / "globalgamemanagers").write_bytes(b"outer data")
+
+            archive_entry = "assets/aa/Android/shared.bundle"
+            obb_root = game_root / "assets" / "obb"
+            first_relative = Path("base") / "main.1.demo.obb"
+            second_relative = Path("patch") / "main.1.demo.obb"
+            for relative, content in (
+                (first_relative, b"base bundle"),
+                (second_relative, b"patch bundle"),
+            ):
+                source_obb = obb_root / relative
+                source_obb.parent.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(source_obb, "w") as archive:
+                    archive.writestr(archive_entry, content)
+
+            cfg = replace(
+                load_config(),
+                root_dir=tool_root,
+                project_root_dir=project_root,
+                project_name="demo",
+                resource_source_subpath=Path("game-name/game/assets/bin/Data"),
+                resource_managed_subpath=Path(
+                    "game-name/game/assets/bin/Data/Managed"
+                ),
+                catalog_source_subpath=Path(
+                    "game-name/game/assets/aa/catalog.json"
+                ),
+                resource_staging_root=tool_root / "workspace" / "input_sources",
+                resource_input_root=tool_root / "workspace" / "input",
+                result_dir=tool_root / "workspace" / "output",
+                record_dir=tool_root / "workspace" / "records",
+                log_dir=tool_root / "workspace" / "logs",
+            )
+
+            staging_root = prepare_unified_resource_source(cfg)
+            self.assertIsNotNone(staging_root)
+            assert staging_root is not None
+            first_staged = (
+                staging_root
+                / "obb"
+                / "base"
+                / "main.1.demo.obb.contents"
+                / "aa"
+                / "Android"
+                / "shared.bundle"
+            )
+            second_staged = (
+                staging_root
+                / "obb"
+                / "patch"
+                / "main.1.demo.obb.contents"
+                / "aa"
+                / "Android"
+                / "shared.bundle"
+            )
+
+            self.assertNotEqual(first_staged, second_staged)
+            self.assertEqual(first_staged.read_bytes(), b"base bundle")
+            self.assertEqual(second_staged.read_bytes(), b"patch bundle")
+
+            state = json.loads(
+                resource_source_map_path(cfg).read_text(encoding="utf-8")
+            )
+            obb_entries = [
+                entry
+                for entry in state["entries"]
+                if entry.get("origin_kind") == "obb"
+                and entry.get("archive_entry") == archive_entry
+            ]
+            self.assertEqual(len(obb_entries), 2)
+            self.assertEqual(
+                {
+                    entry["container_relative_assets_obb"]
+                    for entry in obb_entries
+                },
+                {first_relative.as_posix(), second_relative.as_posix()},
+            )
+            self.assertEqual(
+                len({entry["staged_relative"] for entry in obb_entries}), 2
+            )
 
 
 if __name__ == "__main__":

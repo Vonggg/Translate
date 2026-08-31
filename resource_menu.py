@@ -21,8 +21,11 @@ from support.image_restore import (
 )
 from pipeline.catalog_tools import auto_patch_and_repack_catalog_after_import
 from pipeline.manifest_index import load_tmp_manifest_index, tmp_manifest_index_path
+from pipeline.runtime_field_policy import restore_protected_runtime_fields
 from pipeline.resource_staging import (
+    finalize_obb_outputs,
     load_prepared_resource_source,
+    patch_obb_catalogs_after_import,
     print_final_addressables_sync_reminder,
     prepare_split_sync_outputs,
     prepare_unified_resource_source,
@@ -532,6 +535,56 @@ def _normalize_monobehaviour_json_arrays_for_import(root: Path) -> int:
     return fixed
 
 
+def _restore_text_overlay_runtime_fields(
+    cfg,
+    overlay_root: Path,
+    relative_json_paths: set[Path],
+) -> int:
+    restored_fields = 0
+    restored_files = 0
+    reasons: dict[str, int] = {}
+    samples: list[tuple[Path, str, str]] = []
+
+    for relative_path in sorted(relative_json_paths, key=lambda path: str(path).lower()):
+        original_path = cfg.resource_input_root / relative_path
+        candidate_path = overlay_root / relative_path
+        if not original_path.is_file() or not candidate_path.is_file():
+            continue
+        try:
+            original = json.loads(original_path.read_text(encoding="utf-8-sig"))
+            candidate = json.loads(candidate_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+
+        repaired, restored = restore_protected_runtime_fields(original, candidate)
+        if not restored:
+            continue
+        candidate_path.write_text(
+            json.dumps(repaired, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        restored_files += 1
+        restored_fields += len(restored)
+        for field_path, reason in restored:
+            reasons[reason] = reasons.get(reason, 0) + 1
+            if len(samples) < 10:
+                samples.append((relative_path, field_path, reason))
+
+    if restored_fields:
+        reason_summary = "，".join(
+            f"{reason}={count}" for reason, count in sorted(reasons.items())
+        )
+        print(
+            f"\033[93m[导入保护] 已从原始 JSON 恢复运行时字段: "
+            f"文件={restored_files}，字段={restored_fields}（{reason_summary}）\033[0m"
+        )
+        for relative_path, field_path, reason in samples:
+            print(f"[导入保护] {relative_path} :: {field_path}（{reason}）")
+    else:
+        print("[导入保护] 文本输出中的运行时字段与原始资源一致。")
+    return restored_fields
+
+
 def _is_unsupported_json_import_source(path: Path) -> bool:
     if path.suffix.lower() != ".json":
         return False
@@ -671,9 +724,16 @@ def build_import_overlay(
     overlay_root.mkdir(parents=True, exist_ok=True)
 
     copied_counts: list[str] = []
+    text_json_paths: set[Path] = set()
 
     if "text" in selection:
-        text_count = _merge_tree(cfg.stage_dir / "Text", overlay_root, "文本")
+        text_root = cfg.stage_dir / "Text"
+        text_json_paths = {
+            path.relative_to(text_root)
+            for path in text_root.rglob("*.json")
+            if path.is_file()
+        } if text_root.is_dir() else set()
+        text_count = _merge_tree(text_root, overlay_root, "文本")
         copied_counts.append(f"文本={text_count}")
 
     if "tmp" in selection:
@@ -710,6 +770,8 @@ def build_import_overlay(
         return None
 
     _normalize_monobehaviour_json_arrays_for_import(overlay_root)
+    if text_json_paths:
+        _restore_text_overlay_runtime_fields(cfg, overlay_root, text_json_paths)
 
     print(f"已构建临时导入覆盖层: {overlay_root}")
     print(f"包含文件: {', '.join(copied_counts)}")
@@ -787,12 +849,13 @@ def print_menu() -> None:
     print("q. 退出")
     print()
     print("说明:")
-    print("  导出: 自动解析 catalog.json/catalog.bin 并补齐可定位的远程资源，再汇总 aa/Android 与 bin/Data")
+    print("  导出: 自动解析 catalog.json/catalog.bin，并扫描外层 aa、bin/Data 与 assets/obb 内资源")
     print("        源资源未变化时复用 workspace/input_sources；split 只在暂存区自动合并，不修改原游戏目录")
     print("        支持保留 workspace 后按 1 -> 2 -> 3 分阶段增量导出，manifest 会自动合并")
     print("        导出成功后会在 workspace\\records\\file_id_map.json 记录各资源文件的 FileID 外部依赖映射")
-    print("  导入: 使用导出时的统一资源暂存区，并按记录恢复 aa/Android 与 bin/Data 原始路径")
-    print("        catalog 输出到 FinalResult/Bundle；远程路径改为本地路径时同步覆盖源 catalog/hash")
+    print("  导入: 按来源恢复外层 aa、bin/Data，并将 OBB 内修改重新打回完整 OBB")
+    print("        外层 Addressables 输出到 FinalResult/aa，内嵌 OBB 输出到 FinalResult/obb")
+    print("        远程路径改为本地路径时同步覆盖源 catalog/hash")
     print("        修改过的 split 会在 FinalResult 原目录中恢复为 .splitN，并删除仅供处理的合并版")
     print()
 
@@ -828,6 +891,7 @@ def main() -> int:
     managed_root = cfg.resource_managed_root
     replacement_root = cfg.import_overlay_dir
     import_result_root = workspace_root(cfg) / "FinalResult"
+    raw_import_result_root = workspace_temp_root(cfg) / "import_result_raw"
     log_dir = cfg.log_dir
     print(f"当前项目工作区: {workspace_root(cfg)}")
 
@@ -905,6 +969,7 @@ def main() -> int:
                 return 1
             print(f"正在强制清空导入输出目录: {import_result_root}")
             clean_result_root(import_result_root)
+            clean_result_root(raw_import_result_root)
             result = run_pipeline(
                 "import",
                 source_root,
@@ -912,13 +977,17 @@ def main() -> int:
                 managed_root,
                 log_dir / "一键导入.log",
                 replacement_root,
-                import_result_root,
+                raw_import_result_root,
                 import_workers=cfg.max_import_workers,
                 save_samples=cfg.enable_sample_collection,
                 sample_root=cfg.sample_root,
             )
             if result == 0:
-                restored_paths = restore_imported_resource_paths(cfg, import_result_root)
+                restored_paths = restore_imported_resource_paths(
+                    cfg,
+                    import_result_root,
+                    raw_import_result_root,
+                )
                 catalog_logs = sorted(log_dir.glob("*.log")) + sorted(log_dir.glob("*.txt"))
                 auto_patch_and_repack_catalog_after_import(
                     cfg,
@@ -926,7 +995,17 @@ def main() -> int:
                     catalog_logs,
                     source_root / "aa" / "Android",
                 )
+                patch_obb_catalogs_after_import(
+                    cfg,
+                    raw_import_result_root,
+                    catalog_logs,
+                )
                 prepare_split_sync_outputs(cfg, import_result_root, restored_paths)
+                finalize_obb_outputs(
+                    cfg,
+                    import_result_root,
+                    raw_import_result_root,
+                )
                 explicit_config, channel_name = explicit_channel_sync_request()
                 if explicit_config and channel_name:
                     try:

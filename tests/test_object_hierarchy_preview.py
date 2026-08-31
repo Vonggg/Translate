@@ -1115,6 +1115,29 @@ class ObjectHierarchyPreviewLayoutTests(unittest.TestCase):
                 TOOLS._has_unresolved_preview_sprite(scope, game_object_data)
             )
 
+    def test_disabled_image_component_is_not_reported_as_unresolved(self) -> None:
+        scope = {
+            "items": {
+                ("MonoBehaviour", 99): {
+                    "data": {
+                        "m_Enabled": 0,
+                        "m_Sprite": {"m_FileID": 2, "m_PathID": 123},
+                    }
+                }
+            }
+        }
+        game_object_data = {
+            "m_Component": {
+                "Array": [
+                    {"component": {"m_FileID": 0, "m_PathID": 99}}
+                ]
+            }
+        }
+
+        self.assertFalse(
+            TOOLS._has_unresolved_preview_sprite(scope, game_object_data)
+        )
+
     def test_ngui_widget_bounds_use_size_scale_and_top_right_pivot(self) -> None:
         scope = {
             "items": {
