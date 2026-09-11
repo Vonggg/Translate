@@ -26,6 +26,8 @@ class DeepSeekTranslationStrategy(DefaultAITranslationStrategy):
             "保留 id，不要新增、删除、合并、重排项目。"
             "保留换行、占位符、数字、货币符号、格式控制符和富文本标签。"
             "短 UI 文本要自然、紧凑，适合按钮、菜单和弹窗。"
+            "如果输入项包含 context，它只用于说明文本出现的函数、显示组件和拼接方式，"
+            "不得翻译或输出 context。"
             "只返回严格 JSON，格式为 {\"items\":[{\"id\":数字,\"translation\":\"译文\"}]}。"
             "必须严格使用 JSON 属性分隔符：每个 id、translation、items 键后都必须是英文冒号 :，"
             "绝不能误写成 >、=，也不能漏掉冒号；相邻对象之间必须使用英文逗号分隔。"

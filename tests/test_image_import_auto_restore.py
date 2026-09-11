@@ -14,6 +14,101 @@ import resource_menu
 
 
 class ImageImportAutoRestoreTests(unittest.TestCase):
+    def test_ngui_font_atlas_keeps_generated_glyphs_and_applies_edited_sprite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            input_root = workspace / "input"
+            allpng_root = workspace / "AllPNG"
+            edited_root = allpng_root / "修改后的图片目录"
+            image_import_root = workspace / "output" / "Image" / "ToImport"
+            ngui_import_root = workspace / "output" / "Font" / "NGUI" / "ToImport"
+            ngui_generated_root = workspace / "output" / "Font" / "NGUI" / "generated"
+            relative_texture = Path("bundle") / "Texture2D" / "Atlas.png"
+            source_texture = input_root / relative_texture
+            font_texture = ngui_import_root / relative_texture
+            source_texture.parent.mkdir(parents=True)
+            font_texture.parent.mkdir(parents=True)
+            edited_root.mkdir(parents=True)
+            ngui_generated_root.mkdir(parents=True)
+
+            Image.new("RGBA", (4, 4), (255, 0, 0, 255)).save(source_texture)
+            expanded = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+            expanded.paste(Image.open(source_texture).convert("RGBA"), (0, 0))
+            expanded.putpixel((6, 6), (0, 255, 0, 255))
+            expanded.save(font_texture)
+
+            edited_sprite = edited_root / "Button_NGUI_30.png"
+            Image.new("RGBA", (2, 2), (0, 0, 255, 255)).save(edited_sprite)
+            # Simulate a full original atlas image that was edited before the
+            # NGUI font step.  It must be overlaid on the generated font atlas
+            # first, then the translated Sprite must be pasted on top of it.
+            edited_full_atlas = edited_root / "Atlas.png"
+            Image.new("RGBA", (4, 4), (255, 255, 0, 255)).save(edited_full_atlas)
+            (allpng_root / "_allpng_map.json").write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "flat_name": edited_full_atlas.name,
+                                "original_relative_path": str(relative_texture),
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sprite_root = allpng_root / "Sprite"
+            sprite_root.mkdir()
+            (sprite_root / "_allsprite_map.json").write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "item_type": "ngui_sprite",
+                                "flat_name": edited_sprite.name,
+                                "texture_png": str(source_texture),
+                                "rect": {"x": 1, "y": 1, "width": 2, "height": 2},
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (ngui_generated_root / "ngui_font_generation.json").write_text(
+                json.dumps(
+                    {
+                        "groups": [
+                            {
+                                "texture": relative_texture.as_posix(),
+                                "original_size": [4, 4],
+                                "generated_size": [8, 8],
+                                "forbidden_rect": [0, 0, 4, 4],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = SimpleNamespace(
+                root_dir=root,
+                resource_input_root=input_root,
+                image_import_dir=image_import_root,
+                import_overlay_dir=workspace / "output" / "Font" / "SDF" / "ToImport",
+                ngui_import_dir=ngui_import_root,
+                ngui_generated_dir=ngui_generated_root,
+            )
+
+            overlay_root = resource_menu.build_import_overlay(cfg, {"tmp", "image"})
+
+            self.assertIsNotNone(overlay_root)
+            with Image.open(overlay_root / relative_texture) as composed:
+                rgba = composed.convert("RGBA")
+                self.assertEqual((8, 8), rgba.size)
+                self.assertEqual((0, 0, 255, 255), rgba.getpixel((1, 1)))
+                self.assertEqual((255, 255, 0, 255), rgba.getpixel((0, 0)))
+                self.assertEqual((0, 255, 0, 255), rgba.getpixel((6, 6)))
+
     def test_same_flat_name_full_texture_wins_over_split_sprite(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

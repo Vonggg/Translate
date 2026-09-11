@@ -185,6 +185,50 @@ class SplitSpriteReassemblyTests(unittest.TestCase):
                 self.assertEqual(rebuilt.getpixel((2, 0)), (0, 255, 0, 255))
                 self.assertEqual(rebuilt.getpixel((1, 3)), (255, 0, 0, 255))
 
+    def test_sprite_atlas_downscale_multiplier_scales_rect_and_edited_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "input"
+            edited_root = root / "edited"
+            output_root = root / "ToImport"
+            atlas_path = source_root / "atlas.png"
+            source_root.mkdir()
+            edited_root.mkdir()
+            Image.new("RGBA", (4, 4), (255, 0, 0, 255)).save(atlas_path)
+            Image.new("RGBA", (4, 2), (0, 255, 0, 255)).save(
+                edited_root / "Scaled_1.png"
+            )
+            sprite_map = root / "_allsprite_map.json"
+            sprite_map.write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "item_type": "sprite",
+                                "flat_name": "Scaled_1.png",
+                                "texture_png": str(atlas_path),
+                                "rect": {"x": 2, "y": 4, "width": 4, "height": 2},
+                                "downscale_multiplier": 0.5,
+                                "packing_rotation": 0,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                restore_split_sprites_to_import(
+                    edited_root, output_root, sprite_map, source_root
+                ),
+                (1, 1, 0),
+            )
+            with Image.open(output_root / "atlas.png") as rebuilt:
+                rebuilt = rebuilt.convert("RGBA")
+                self.assertEqual(rebuilt.getpixel((1, 1)), (0, 255, 0, 255))
+                self.assertEqual(rebuilt.getpixel((2, 1)), (0, 255, 0, 255))
+                self.assertEqual(rebuilt.getpixel((0, 0)), (255, 0, 0, 255))
+
 
 if __name__ == "__main__":
     unittest.main()

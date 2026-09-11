@@ -6,10 +6,12 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 from support.config import activate_config_path, load_config
 from support.menu_selection import parse_number_ranges
 from pipeline.font_ttf import build_ttf_replacements
+from pipeline.dynamic_translation_dictionary import generate_dynamic_translation_dictionary
 from pipeline.manifest_index import tmp_manifest_index_path
 from pipeline.ngui_font import (
     generate_ngui_fonts,
@@ -35,6 +37,7 @@ from pipeline.translation import (
     export_translated_files,
     rebuild_game_text_outputs,
     scan_and_record,
+    build_translation_map_for_texts,
     translate_from_scan_records,
 )
 
@@ -130,7 +133,7 @@ def existing_tmp_chars_path(cfg) -> Path | None:
     if path.is_file():
         return path
     print(f"[TMP] 未找到已生成字符文件: {path}")
-    print("[TMP] 请先执行菜单 7 生成 tmp_chars.txt，再执行菜单 8。")
+    print("[TMP] 请先执行菜单 8 生成 tmp_chars.txt，再执行菜单 9。")
     return None
 
 
@@ -152,6 +155,24 @@ def _is_unity_startup_crash(cfg, return_code: int) -> bool:
     return UNITY_GENERATOR_ENTRY_MARKER not in log_text
 
 
+def _is_unity_transient_startup_failure(cfg, return_code: int) -> bool:
+    if (return_code & 0xFFFFFFFF) == 199:
+        return True
+    log_path = _unity_log_path(cfg)
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="ignore").casefold()
+    except OSError:
+        return False
+    return any(
+        marker in log_text
+        for marker in (
+            "licensingclient",
+            "waiting for channel",
+            "ipc channel to licensingclient doesn't exist",
+        )
+    ) and UNITY_GENERATOR_ENTRY_MARKER.casefold() not in log_text
+
+
 def _clear_stale_unity_lock(cfg) -> bool:
     lock_path = cfg.unity_font_project / "Temp" / "UnityLockfile"
     if not lock_path.exists():
@@ -160,7 +181,7 @@ def _clear_stale_unity_lock(cfg) -> bool:
         lock_path.unlink()
     except OSError as exc:
         print(f"[TMP][重试失败] UnityLockfile 仍被占用，未删除: {lock_path} ({exc})")
-        print("[TMP][重试失败] 请关闭正在使用该辅助工程的 Unity 后，再单独执行菜单 8。")
+        print("[TMP][重试失败] 请关闭正在使用该辅助工程的 Unity 后，再单独执行菜单 9。")
         return False
     print(f"[TMP][重试] 已清理失效 UnityLockfile: {lock_path}")
     return True
@@ -172,15 +193,29 @@ def _run_unity_tmp_generation(cfg) -> int:
         return 1
 
     print(f"[TMP] 使用字符文件: {tmp_chars_path}")
-    result = launch_unity_tmp_generator(cfg, tmp_chars_path)
-    if result != 0 and _is_unity_startup_crash(cfg, result):
-        print(
-            f"[TMP][重试] 检测到 Unity 在进入字体生成前原生崩溃，"
-            f"返回码={result}，将清理失效锁后重试一次。"
-        )
-        if not _clear_stale_unity_lock(cfg):
-            return 1
+    max_attempts = 3
+    result = 1
+    for attempt in range(1, max_attempts + 1):
         result = launch_unity_tmp_generator(cfg, tmp_chars_path)
+        if result == 0:
+            return 0
+        if attempt >= max_attempts:
+            break
+        if _is_unity_startup_crash(cfg, result):
+            print(
+                f"[TMP][重试 {attempt}/{max_attempts - 1}] 检测到 Unity 在进入字体生成前原生崩溃，"
+                f"返回码={result}，将清理失效锁后重试。"
+            )
+            if not _clear_stale_unity_lock(cfg):
+                return 1
+        elif _is_unity_transient_startup_failure(cfg, result):
+            print(
+                f"[TMP][重试 {attempt}/{max_attempts - 1}] Unity 授权/IPC 启动失败，"
+                f"返回码={result}，等待后自动重试。"
+            )
+        else:
+            break
+        time.sleep(5 * attempt)
 
     return result
 
@@ -235,11 +270,11 @@ def _prepare_generated_font_import_replacements(cfg) -> None:
 def _run_sdf_finalize_in_fresh_process(cfg) -> int:
     result = _run_font_generation(cfg)
     if result != 0:
-        print(f"[字体生成][停止] 字体生成失败，返回码={result}；不会继续执行步骤 9。")
+        print(f"[字体生成][停止] 字体生成失败，返回码={result}；不会继续执行步骤 10。")
         return result
 
     _prepare_generated_font_import_replacements(cfg)
-    log_step_completed("8-9（TMP/NGUI 字体生成与待导入替换）")
+    log_step_completed("9-10（TMP/NGUI 字体生成与待导入替换）")
     return 0
 
 
@@ -251,10 +286,16 @@ def _execute_noninteractive_step(cfg, step: str) -> int:
     if step == "2":
         return finish_step(step, translate_from_scan_records(cfg) or 0)
     if step == "3":
-        return finish_step(step, rebuild_game_text_outputs(cfg) or 0)
+        generate_dynamic_translation_dictionary(
+            cfg,
+            translation_builder=build_translation_map_for_texts,
+        )
+        return finish_step(step, 0)
     if step == "4":
-        return finish_step(step, export_translated_files(cfg) or 0)
+        return finish_step(step, rebuild_game_text_outputs(cfg) or 0)
     if step == "5":
+        return finish_step(step, export_translated_files(cfg) or 0)
+    if step == "6":
         return finish_step(
             step,
             disable_translated_text_effect_components(
@@ -264,15 +305,15 @@ def _execute_noninteractive_step(cfg, step: str) -> int:
             )
             or 0,
         )
-    if step == "6":
+    if step == "7":
         build_ttf_replacements(cfg)
         return finish_step(step, 0)
-    if step == "7":
+    if step == "8":
         build_merged_tmp_chars(cfg)
         return finish_step(step, 0)
-    if step == "8":
-        return finish_step(step, _run_font_generation(cfg))
     if step == "9":
+        return finish_step(step, _run_font_generation(cfg))
+    if step == "10":
         _prepare_generated_font_import_replacements(cfg)
         return finish_step(step, 0)
     print(f"[全部执行][停止] 不支持的内部步骤: {step}")
@@ -337,7 +378,7 @@ def _run_full_pipeline_in_isolated_processes(cfg) -> int:
         steps.append("1")
     else:
         print("\033[94m[全部执行] enable_ai_field_review=false，跳过步骤 1。\033[0m")
-    steps.extend(["2", "3", "4", "5", "6", "7", "8", "9"])
+    steps.extend(["2", "3", "4", "5", "6", "7", "8", "9", "10"])
     result = _run_steps_in_isolated_processes(cfg, steps, "全部执行")
     if result == 0:
         log_step_completed("a（全部执行）")
@@ -359,43 +400,47 @@ def print_menu() -> None:
     print("     最后按字段及自动识别的脚本/同级结构上下文过滤 records.json，删除无关字段记录。")
     print("  2: 读取过滤后的 records.json；对其中原文去重并翻译；")
     print("     输出 trans.json、game.txt、game_chars.txt、mapping.tsv 等文本记录文件。")
-    print("  3: 只读取已有 trans.json；重新生成 game.txt 和 game_chars.txt；")
-    print("     用于手动修改 trans.json 后刷新文本/字符清单，不重新扫描也不重新翻译。")
-    print("  4: 读取 records.json 和 trans.json；只处理 trans.json 命中的待汉化源 JSON；")
+    print("  3: 联合分析 stringliteral.json、script.json 与 ARM64 libil2cpp.so；")
+    print("     原值直达 TMP/uGUI 显示参数的文本写入整句字典；")
+    print("     Format/Concat 后显示的模板写入任意位置替换字典，并输出统一的 C++ 动态汉化字典。")
+    print("  4: 读取已有 trans.json 与 stringliteral_trans.json；重新生成 game.txt 和 game_chars.txt；")
+    print("     用于手动修改静态/动态词库后刷新文本与字体字符清单，不重新扫描也不重新翻译。")
+    print("  5: 读取 records.json 和 trans.json；只处理 trans.json 命中的待汉化源 JSON；")
     print("     把翻译写入 workspace/input 的资源副本结构，输出到 workspace/output/Text。")
     print("     同时生成 runtime_text_binding_report.json，记录 I2/Localization 等无法静态关联材质的运行时文本来源。")
-    print("  5: 根据 records.json、material_map.json 和译文使用关系定位文本组件；")
+    print("  6: 根据 records.json、material_map.json 和译文使用关系定位文本组件；")
     print("     只清理译文和 I2 文本同 GameObject 上额外挂载的 Shadow/Outline 组件，输出到 workspace/output/Text。")
-    print("     TMP 字体材质阴影/描边参数已合并到步骤 9 的 SDF 导入覆盖层中统一处理。")
-    print("  6: 读取导出的 Legacy TTF/OTF 信息和固定模板字体；")
+    print("     TMP 字体材质阴影/描边参数已合并到步骤 10 的 SDF 导入覆盖层中统一处理。")
+    print("  7: 读取导出的 Legacy TTF/OTF 信息和固定模板字体；")
     print("     生成 workspace/output/Font/TTF/ToImport 下的 TTF 待导入替换文件。")
-    print("  7: 检查 trans.json 译文字符是否被模板 TTF 和老工具 SDF 模板支持；")
+    print("  8: 检查静态与动态词库译文字符是否被模板 TTF 和老工具 SDF 模板支持；")
     print("     模板 TTF 缺译文字符会输出 translation_chars_missing_from_ttf.tsv 并停止；")
     print("     老工具 SDF 模板缺译文字符只输出提示文件，不中断后续流程。")
-    print("     再合并原游戏字体字符、译文字符、模板 TTF 非中文字符；")
+    print("     再合并原游戏字体字符、译文字符、模板 TTF 全部字符；")
     print("     仅当 include_old_sdf_template_chars=true 时额外合并老工具 SDF 模板全部字符，")
     print("     删除模板 TTF 不支持字符后生成 tmp_chars.txt。")
-    print("  8: 生成字体（支持 TMP、NGUI）；按脚本 0 的字体检测结果选择所需流程；")
+    print("  9: 生成字体（支持 TMP、NGUI）；按脚本 0 的字体检测结果选择所需流程；")
     print("     检测到 TMP/SDF 时读取 tmp_chars.txt 调用 Unity，检测到 NGUI 时读取")
-    print("     trans.json、NGUI UIFont/UIAtlas 和模板 TTF，生成扩展图集及静态字形表；")
+    print("     tmp_chars.txt、NGUI UIFont/UIAtlas 和模板 TTF，生成扩展图集及静态字形表；")
     print("     NGUI 保留原图集左上区域，逐字打包到扩展后的 L 形可用空间。")
-    print("  9: 按脚本 0 的检测结果读取脚本 8 已生成的 TMP/NGUI 字体产物和字体索引；")
+    print("  10: 按脚本 0 的检测结果读取脚本 9 已生成的 TMP/NGUI 字体产物和字体索引；")
     print("     对索引中的全部候选做 TMP FontAsset 结构校验，不按 font_map 排除运行时字体，")
     print("     输出 TMP/SDF 与 NGUI 的待导入字体、UIFont、UIAtlas 和 Texture2D 文件。")
-    print("  a: 依次执行 0 -> 1(仅 AI 模式) -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9。")
-    print("     支持 1-2、4-7 或 0,2,4-9 等连续/组合输入。")
+    print("  a: 依次执行 0 -> 1(仅 AI 模式) -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9 -> 10。")
+    print("     支持 1-3、5-8 或 0,2,4-10 等连续/组合输入。")
     print()
     print("菜单:")
     print("0. 扫描导出的 JSON，生成文本、字体、材质、引用索引")
     print("1. AI 判断字段后过滤 records.json")
     print("2. 根据扫描记录翻译")
-    print("3. 从 trans.json 重建 game.txt 和 game_chars.txt")
-    print("4. 导出并实际翻译 Text 资源")
-    print("5. 清理译文/I2 文本额外挂载的阴影/描边组件")
-    print("6. 生成 TTF 替换字体")
-    print("7. 合并 TMP 字符并提示新增字符")
-    print("8. 生成字体（支持 TMP、NGUI）")
-    print("9. 根据已生成字体准备导入替换（支持 TMP、NGUI）")
+    print("3. 分析 IL2CPP 显示链路并生成动态 Hook C++ 字典")
+    print("4. 从静态/动态词库重建 game.txt 和 game_chars.txt")
+    print("5. 导出并实际翻译 Text 资源")
+    print("6. 清理译文/I2 文本额外挂载的阴影/描边组件")
+    print("7. 生成 TTF 替换字体")
+    print("8. 合并 TMP 字符并提示新增字符")
+    print("9. 生成字体（支持 TMP、NGUI）")
+    print("10. 根据已生成字体准备导入替换（支持 TMP、NGUI）")
     print("a. 全部执行")
     print("q. 退出")
     print()
@@ -423,9 +468,9 @@ def main() -> int:
             return 0
 
         try:
-            steps = parse_number_ranges(choice, set(range(10)))
+            steps = parse_number_ranges(choice, set(range(11)))
         except ValueError as exc:
-            print(f"无效选择: {exc}。请输入 0-9、1-2、逗号组合、a 或 q。")
+            print(f"无效选择: {exc}。请输入 0-10、1-3、逗号组合、a 或 q。")
             print()
             continue
 

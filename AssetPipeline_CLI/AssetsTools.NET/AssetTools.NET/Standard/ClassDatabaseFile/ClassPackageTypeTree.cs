@@ -18,7 +18,7 @@ namespace AssetsTools.NET
         /// Read the <see cref="ClassPackageTypeTree"/> with the provided reader.
         /// </summary>
         /// <param name="reader">The reader to use.</param>
-        public void Read(AssetsFileReader reader)
+        public void Read(AssetsFileReader reader, byte fileVersion = 1)
         {
 			CreationTime = DateTime.FromBinary(reader.ReadInt64());
 
@@ -39,7 +39,7 @@ namespace AssetsTools.NET
 			}
 
 			CommonString = new ClassPackageCommonString();
-			CommonString.Read(reader);
+			CommonString.Read(reader, fileVersion);
 
 			int nodeCount = reader.ReadInt32();
 			Nodes = new List<ClassPackageTypeNode>(nodeCount);
@@ -58,7 +58,7 @@ namespace AssetsTools.NET
         /// Write the <see cref="ClassPackageTypeTree"/> with the provided writer.
         /// </summary>
         /// <param name="writer">The writer to use.</param>
-        public void Write(AssetsFileWriter writer)
+        public void Write(AssetsFileWriter writer, byte fileVersion = 1)
         {
 			writer.Write(CreationTime.ToBinary());
 
@@ -74,7 +74,7 @@ namespace AssetsTools.NET
 				ClassInformation[i].Write(writer);
             }
 
-			CommonString.Write(writer);
+			CommonString.Write(writer, fileVersion);
 
 			writer.Write(Nodes.Count);
 			for (int i = 0; i < Nodes.Count; i++)

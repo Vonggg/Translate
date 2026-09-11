@@ -17,6 +17,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = ROOT_DIR / "config.json"
 RENAMED_CONFIG_SOURCE = ROOT_DIR / "config（删除括弧后缀后运行快速配置）.json"
 CODEX_TRANSLATION_MODEL = "gpt-5.3-codex-spark"
+CODEX_FALLBACK_MODEL = "gpt-5.6-luna"
 CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 MINIMUM_PYTHON_VERSION = (3, 9)
 REQUIRED_PYTHON_MODULES = (
@@ -316,7 +317,7 @@ def _prompt_translation(config: dict[str, Any]) -> None:
     print("\n请选择 AI 自动翻译方式；也可以跳过并稍后修改 config.json。")
     print(f"  0. 跳过，保留当前设置（当前 AI 翻译={'开启' if config.get('enable_ai_translation') else '关闭'}）")
     print(
-        f"  1. Codex CLI / {CODEX_TRANSLATION_MODEL}（使用 Codex 额度；失败时回退已配置的 HTTP AI）"
+        f"  1. Codex CLI / {CODEX_TRANSLATION_MODEL}（失败时依次回退 {CODEX_FALLBACK_MODEL}、DeepSeek）"
     )
     print("  2. 自定义 OpenAI-compatible API（配置 Base URL、模型和 API Key）")
     print("  3. 关闭 AI 自动翻译并清空全部翻译密钥")
@@ -348,9 +349,9 @@ def _prompt_translation(config: dict[str, Any]) -> None:
             )
         )
         print(
-            "HTTP AI 回退已启用。"
+            f"{CODEX_FALLBACK_MODEL} 回退始终启用；DeepSeek 回退已启用。"
             if http_fallback_ready
-            else "HTTP AI 回退尚未完整配置；可先选择 2 配置接口，再重新选择 1 作为主通道。"
+            else f"{CODEX_FALLBACK_MODEL} 回退始终启用；DeepSeek 回退尚未完整配置，可先选择 2 配置接口。"
         )
         return
     if choice == "2":

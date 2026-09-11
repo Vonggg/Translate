@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from pipeline.codex_cli_provider import (
     CodexCLIError,
+    CodexCLISkipped,
     _run_codex_process,
     find_codex_cli,
     request_structured_output,
@@ -96,6 +98,36 @@ class CodexCLIProviderTests(unittest.TestCase):
                 _run_codex_process(["codex"], "prompt", 1)
 
         terminate.assert_called_once_with(process)
+
+    def test_skip_key_terminates_current_model_and_raises_fallback_error(self) -> None:
+        process = MagicMock()
+        process.pid = 4321
+        process.returncode = -1
+        released = threading.Event()
+
+        def communicate(*, input: str, timeout: int) -> tuple[str, str]:
+            released.wait(timeout=2)
+            return "", ""
+
+        process.communicate.side_effect = communicate
+
+        def terminate(_process: object) -> None:
+            released.set()
+
+        with patch(
+            "pipeline.codex_cli_provider.subprocess.Popen",
+            return_value=process,
+        ), patch(
+            "pipeline.codex_cli_provider._user_requested_model_skip",
+            return_value=True,
+        ), patch(
+            "pipeline.codex_cli_provider._terminate_process_tree",
+            side_effect=terminate,
+        ) as terminate_mock:
+            with self.assertRaisesRegex(CodexCLISkipped, "手动跳过"):
+                _run_codex_process(["codex"], "prompt", 30)
+
+        terminate_mock.assert_called_once_with(process)
 
     def test_finds_codex_bundled_in_vscode_extension_when_path_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

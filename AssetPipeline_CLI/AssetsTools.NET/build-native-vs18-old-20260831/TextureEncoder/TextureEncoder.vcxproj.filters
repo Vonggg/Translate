@@ -1,0 +1,27 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="D:\user\von\NewTools\Translate\AssetPipeline_CLI\AssetsTools.NET\TextureEncoder\TextureEncoder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="D:\user\von\NewTools\Translate\AssetPipeline_CLI\AssetsTools.NET\TextureEncoder\TextureEncoder.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="D:\user\von\NewTools\Translate\AssetPipeline_CLI\AssetsTools.NET\TextureEncoder\TextureFormat.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="D:\user\von\NewTools\Translate\AssetPipeline_CLI\AssetsTools.NET\TextureEncoder\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{003733EF-3F8C-3231-8EA2-206D792DF9DB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{F00427FF-B2E8-3634-B5BA-26D6772FFE1A}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

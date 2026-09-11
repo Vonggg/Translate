@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/user/von/NewTools/Translate/AssetPipeline_CLI/AssetsTools.NET/build-native/cmake_install.cmake",
+		"D:/user/von/NewTools/Translate/AssetPipeline_CLI/AssetsTools.NET/build-native/TextureEncoder/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

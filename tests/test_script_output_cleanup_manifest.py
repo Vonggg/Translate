@@ -10,9 +10,9 @@ from support.script_output_cleanup import (
 
 
 class ScriptOutputCleanupManifestTests(unittest.TestCase):
-    def test_all_expands_steps_zero_through_nine_and_counts_their_rules(self) -> None:
+    def test_all_expands_steps_zero_through_ten_and_counts_their_rules(self) -> None:
         manifest = load_script_output_manifest()
-        expected_ids = [str(index) for index in range(10)]
+        expected_ids = [str(index) for index in range(11)]
 
         expanded = expand_script_output_ids(manifest, ["a"])
 
@@ -22,6 +22,22 @@ class ScriptOutputCleanupManifestTests(unittest.TestCase):
             count_script_output_rules(manifest, ["a"]),
         )
         self.assertGreater(count_script_output_rules(manifest, ["a"]), 0)
+
+    def test_dynamic_dictionary_outputs_belong_to_script_three(self) -> None:
+        manifest = load_script_output_manifest()
+        script_three_paths = {
+            rule.get("path") for rule in manifest["scripts"]["3"]["outputs"]
+        }
+
+        self.assertIn("stringliteral_trans.json", script_three_paths)
+        self.assertIn(
+            "Hook_Translate/native_unity_translation_dictionary.generated.cpp",
+            script_three_paths,
+        )
+        self.assertEqual(
+            "从静态/动态词库重建文本字符文件",
+            manifest["scripts"]["4"]["name"],
+        )
 
     def test_scan_cleanup_manifest_contains_all_ai_field_context_artifacts(self) -> None:
         manifest = load_script_output_manifest()

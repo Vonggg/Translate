@@ -192,10 +192,18 @@ class _ResourceResolver:
 
 
 def _translated_characters(cfg: PipelineConfig) -> list[str]:
-    trans_path = cfg.stage_record_dir / cfg.output_trans_json
-    if not trans_path.is_file():
-        raise FileNotFoundError(f"未找到 trans.json，请先完成翻译步骤: {trans_path}")
-    payload = read_json(trans_path)
+    """Read the final shared TMP/NGUI character set from script 8."""
+    combined_chars_path = cfg.stage_record_dir / getattr(
+        cfg,
+        "output_tmp_chars_txt",
+        "tmp_chars.txt",
+    )
+    if not combined_chars_path.is_file():
+        raise FileNotFoundError(
+            f"未找到 TMP/NGUI 共用字符文件 tmp_chars.txt，请先执行脚本 8: "
+            f"{combined_chars_path}"
+        )
+    payload: Any = combined_chars_path.read_text(encoding="utf-8")
     strings: list[str] = []
 
     def collect(value: Any) -> None:
@@ -208,13 +216,10 @@ def _translated_characters(cfg: PipelineConfig) -> list[str]:
             for child in value.values():
                 collect(child)
 
-    if isinstance(payload, dict):
-        for translated_value in payload.values():
-            collect(translated_value)
-    elif isinstance(payload, list):
+    if isinstance(payload, str):
         collect(payload)
     else:
-        raise ValueError(f"trans.json 结构无效: {trans_path}")
+        raise ValueError(f"翻译字符数据结构无效: {combined_chars_path}")
 
     unique: dict[str, None] = {}
     for text in strings:
@@ -490,10 +495,13 @@ def _load_font_jobs(cfg: PipelineConfig, resolver: _ResourceResolver) -> list[_F
             atlas_data = loaded_atlas
             atlas_cache[atlas_path] = atlas_data
         sprite_data = _find_sprite(atlas_data, sprite_name)
-        if any(int(sprite_data.get(field, 0) or 0) != 0 for field in (
-            "paddingLeft", "paddingRight", "paddingTop", "paddingBottom"
-        )):
-            raise ValueError(f"NGUI 字体 Sprite 使用了 trimming/padding，暂不安全处理: {source_path}")
+        # AtlasMaker may trim transparent rows/columns from the source font
+        # sprite and describe the removed area with padding*. That metadata is
+        # only needed while the UIFont addresses the old, trimmed sprite. This
+        # pipeline regenerates every glyph, points the UIFont at a new full-
+        # atlas sprite, expands mUVRect to the whole texture, and explicitly
+        # zeros the new sprite's padding. Therefore the source trimming does
+        # not participate in any generated glyph coordinate calculation.
 
         material_ref = atlas_data.get("material", atlas_data.get("mMaterial"))
         material_path = resolver.resolve(atlas_path, material_ref, "NGUI Atlas Material")
@@ -544,7 +552,7 @@ def _artifact_entry(cfg: PipelineConfig, source: Path, generated: Path, kind: st
 
 
 def generate_ngui_fonts(cfg: PipelineConfig) -> dict[str, Any]:
-    """Generate expanded NGUI bitmap font atlases and modified JSON artifacts for step 8."""
+    """Generate expanded NGUI bitmap font atlases and modified JSON artifacts for step 9."""
     if not cfg.ttf_template_path.is_file():
         raise FileNotFoundError(f"NGUI 字形来源 TTF 不存在: {cfg.ttf_template_path}")
     if cfg.ngui_generated_dir.exists():
@@ -573,7 +581,7 @@ def generate_ngui_fonts(cfg: PipelineConfig) -> dict[str, Any]:
         preview = "".join(_display_codepoint(codepoint) or f"[U+{codepoint:04X}]" for codepoint in missing_translated[:30])
         raise ValueError(
             f"NGUI 字形来源 TTF 缺少 {len(missing_translated)} 个译文字符: {preview}；"
-            "请先按 SDF 缺字流程修改 trans.json 或更换模板 TTF。"
+            "请先按 SDF 缺字流程修改静态/动态词库，或更换模板 TTF。"
         )
 
     source_codepoints: set[int] = set()
@@ -744,10 +752,10 @@ def generate_ngui_fonts(cfg: PipelineConfig) -> dict[str, Any]:
 
 
 def prepare_generated_ngui_import_replacements(cfg: PipelineConfig) -> dict[str, int]:
-    """Validate step-8 NGUI artifacts and copy them into the step-9 import tree."""
+    """Validate step-9 NGUI artifacts and copy them into the step-10 import tree."""
     manifest_path = cfg.ngui_generated_dir / GENERATION_MANIFEST_NAME
     if not manifest_path.is_file():
-        raise FileNotFoundError(f"未找到脚本 8 的 NGUI 生成清单: {manifest_path}")
+        raise FileNotFoundError(f"未找到脚本 9 的 NGUI 生成清单: {manifest_path}")
     manifest = read_json(manifest_path)
     if not isinstance(manifest, dict) or manifest.get("schema_version") != GENERATION_SCHEMA_VERSION:
         raise ValueError(f"NGUI 生成清单版本无效: {manifest_path}")
@@ -771,9 +779,9 @@ def prepare_generated_ngui_import_replacements(cfg: PipelineConfig) -> dict[str,
         source = cfg.resource_input_root / Path(*source_relative.split("/"))
         generated = cfg.ngui_generated_dir / Path(*generated_relative.split("/"))
         if not source.is_file() or _sha256(source) != artifact.get("source_sha256"):
-            raise RuntimeError(f"NGUI 源资源已变化，请重新执行脚本 8: {source}")
+            raise RuntimeError(f"NGUI 源资源已变化，请重新执行脚本 9: {source}")
         if not generated.is_file() or _sha256(generated) != artifact.get("generated_sha256"):
-            raise RuntimeError(f"NGUI 生成产物缺失或已变化，请重新执行脚本 8: {generated}")
+            raise RuntimeError(f"NGUI 生成产物缺失或已变化，请重新执行脚本 9: {generated}")
         destination = cfg.ngui_import_dir / Path(*source_relative.split("/"))
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(generated, destination)

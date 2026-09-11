@@ -175,7 +175,10 @@ class DynamicListAIReviewTests(unittest.TestCase):
                     [_candidate(private_id)]
                 )
 
-            self.assertEqual(codex_request.call_count, 1)
+            self.assertEqual(
+                [call.kwargs["model"] for call in codex_request.call_args_list],
+                ["gpt-5.3-codex-spark", "gpt-5.6-luna"],
+            )
             self.assertEqual(len(http_calls), 4)
             self.assertEqual(accepted, {private_id})
 

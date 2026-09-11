@@ -21,6 +21,7 @@ namespace UnityResourceCLI
         public int ImportWorkers { get; init; }
         public bool SaveSamples { get; init; }
         public bool VerboseExportAssets { get; init; }
+        public bool VerboseImportAssets { get; init; }
         public string ExportProfile { get; init; } = "all";
         public bool ShowHelp { get; init; }
 
@@ -81,6 +82,10 @@ namespace UnityResourceCLI
                 GetOptional(dict, "verbose-export-assets", "false"),
                 out bool parsedVerboseExportAssets
             ) && parsedVerboseExportAssets;
+            bool verboseImportAssets = bool.TryParse(
+                GetOptional(dict, "verbose-import-assets", "false"),
+                out bool parsedVerboseImportAssets
+            ) && parsedVerboseImportAssets;
             string exportProfile = GetOptional(dict, "export-profile", "all").ToLowerInvariant();
             string[] exportProfiles = exportProfile.Split(
                 '+',
@@ -108,6 +113,7 @@ namespace UnityResourceCLI
                 ImportWorkers = importWorkers,
                 SaveSamples = saveSamples,
                 VerboseExportAssets = verboseExportAssets,
+                VerboseImportAssets = verboseImportAssets,
                 ExportProfile = exportProfile
             };
         }

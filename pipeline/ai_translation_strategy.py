@@ -39,6 +39,7 @@ class DefaultAITranslationStrategy:
 
     def __init__(self, cfg: Any) -> None:
         self.cfg = cfg
+        self.source_contexts: dict[str, Any] = {}
 
     @property
     def batch_max_chars(self) -> int:
@@ -112,6 +113,8 @@ class DefaultAITranslationStrategy:
             "如果不同语言文本表达的是同一句话或同一个 UI 含义，要翻译成一致的简体中文说法。"
             "保留 id，不要新增、删除、合并、重排项目。"
             "保留换行、占位符、数字、货币符号、格式控制符和富文本标签。"
+            "如果输入项包含 context，它只用于说明文本出现的函数、显示组件和拼接方式，"
+            "不得翻译或输出 context。"
             "只返回严格 JSON，格式为 {\"items\":[{\"id\":数字,\"translation\":\"译文\"}]}。"
             "必须严格使用 JSON 属性分隔符：每个 id、translation、items 键后都必须是英文冒号 :，"
             "绝不能误写成 >、=，也不能漏掉冒号；相邻对象之间必须使用英文逗号分隔。"
@@ -123,7 +126,13 @@ class DefaultAITranslationStrategy:
         )
 
     def user_content(self, batch: list[tuple[int, str]], batch_index: int, batch_count: int) -> str:
-        items = [{"id": index, "text": source_text} for index, source_text in batch]
+        items = []
+        for index, source_text in batch:
+            item = {"id": index, "text": source_text}
+            context = self.source_contexts.get(source_text)
+            if context:
+                item["context"] = context
+            items.append(item)
         return json.dumps({"items": items}, ensure_ascii=False, separators=(",", ":"))
 
     def extra_payload(self) -> dict[str, Any]:

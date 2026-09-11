@@ -53,7 +53,7 @@ namespace AssetsTools.NET
             }
 
             TpkTypeTree = new ClassPackageTypeTree();
-            TpkTypeTree.Read(newReader);
+            TpkTypeTree.Read(newReader, Header.FileVersion);
         }
 
         /// <summary>
@@ -77,7 +77,8 @@ namespace AssetsTools.NET
             dStream = new MemoryStream();
             dWriter = new AssetsFileWriter(dStream);
 
-            TpkTypeTree.Write(dWriter);
+            TpkTypeTree.Write(dWriter, Header.FileVersion);
+            dStream.Position = 0;
 
             if (Header.CompressionType == ClassFileCompressionType.Lz4)
             {
@@ -98,6 +99,7 @@ namespace AssetsTools.NET
                 Header.DecompressedSize = (uint)dStream.Length;
 
                 Header.Write(writer);
+                cStream.Position = 0;
                 cStream.CopyToCompat(writer.BaseStream);
             }
             else
@@ -180,7 +182,11 @@ namespace AssetsTools.NET
 
             cldb.StringTable = TpkTypeTree.StringTable;
 
-            byte commonStringCount = TpkTypeTree.CommonString.GetCommonStringLengthForVersion(version);
+            // TPK v2 stores version-specific explicit common-string offsets.
+            // CLDB v1 cannot represent those offsets. Use local type-tree strings
+            // instead of inventing offsets from a concatenated common table.
+            byte commonStringCount = Header.FileVersion >= 2
+                ? (byte)0 : TpkTypeTree.CommonString.GetCommonStringLengthForVersion(version);
             cldb.CommonStringBufferIndices = new List<ushort>(commonStringCount);
             for (int i = 0; i < commonStringCount; i++)
             {

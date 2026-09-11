@@ -12,140 +12,10 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from pipeline.runtime_field_policy import runtime_field_exclusion_reason
+from pipeline.local_field_policy import classify_local_string_field
 
 
 _FIELD_LINE_RE = re.compile(r"^field:\s*(.+)$", re.MULTILINE)
-_BACKING_FIELD_RE = re.compile(r"<([^>]+)>k__BackingField")
-_ARRAY_INDEX_RE = re.compile(r"\[\]")
-
-_TRUSTED_VISIBLE_FIELDS = {
-    "m_text",
-    "m_Text",
-}
-
-_VISIBLE_LOCALIZATION_RE = re.compile(
-    r"(?:^|\.)localizations\.Array\[\]\."
-    r"(?:GDPRAcceptButton|GDPRDescription|GDPRHeader|GDPRPrivacyButton|GDPRTermsButton)$",
-    re.IGNORECASE,
-)
-
-_LOCALIZED_VALUE_RE = re.compile(
-    r"(?:^|\.)(?:m_Localized|localizedText|translatedText|translation)$",
-    re.IGNORECASE,
-)
-
-_RUNTIME_PATH_RE = re.compile(
-    r"(?:"
-    r"m_fontInfo(?:\.|$)|m_FaceInfo(?:\.|$)|m_CreationSettings(?:\.|$)|"
-    r"m_StyleList(?:\.|$)|spriteInfoList(?:\.|$)|"
-    r"m_ExcludedPropertiesInInspector(?:\.|$)|"
-    r"tagNames\.Array\[\]$|_names\.Array\[\]$|"
-    r"data\.dataString$|InstrumentationSettings(?:\.|$)|"
-    r"lightLayerName\d*$|meshName$"
-    r")",
-    re.IGNORECASE,
-)
-
-_RUNTIME_SEMANTIC_NAMES = {
-    "actionid",
-    "adunit",
-    "analyticsid",
-    "animationname",
-    "animatorstate",
-    "appkey",
-    "appid",
-    "assembly",
-    "assemblyname",
-    "assetguid",
-    "assettype",
-    "behaviourid",
-    "brainid",
-    "callback",
-    "cachedassettype",
-    "classname",
-    "clientid",
-    "collectsoundid",
-    "collectvfxid",
-    "code",
-    "configid",
-    "contractnames",
-    "controllerreference",
-    "controlpath",
-    "desiredtag",
-    "enterportalvfxid",
-    "eventname",
-    "fileid",
-    "formulastring",
-    "gamekey",
-    "guid",
-    "id",
-    "itemid",
-    "joystickname",
-    "languageiso",
-    "methodname",
-    "musicids",
-    "multiplayerbrainid",
-    "namespace",
-    "parentcontractnames",
-    "poolname",
-    "preloadbundlesgroupsids",
-    "providerid",
-    "regexvalue",
-    "sceneid",
-    "scenename",
-    "secretkey",
-    "serializabletype",
-    "shadername",
-    "skinid",
-    "slotid",
-    "soundid",
-    "statconfigid",
-    "statename",
-    "subobjectname",
-    "tagname",
-    "token",
-    "typename",
-    "updatedbehaviourid",
-    "updatedstatconfigid",
-    "uuid",
-    "vfxid",
-    "vfxs",
-}
-
-_RUNTIME_SEMANTIC_SUFFIXES = (
-    "guid",
-    "uuid",
-    "analyticsid",
-    "soundid",
-    "vfxid",
-    "brainid",
-    "configid",
-    "statconfigid",
-    "behaviourid",
-    "skinid",
-    "itemid",
-    "actionid",
-    "key",
-    "url",
-    "uri",
-    "host",
-    "type",
-    "property",
-    "propertyname",
-    "sound",
-    "audio",
-    "vfx",
-    "preset",
-)
-
-_MACHINE_VALUE_PATTERNS = (
-    re.compile(r"^-----BEGIN (?:RSA )?(?:PRIVATE KEY|CERTIFICATE)-----"),
-    re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE),
-    re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$"),
-    re.compile(r"^#[0-9a-fA-F]{3,8}$"),
-    re.compile(r"^(?:NaN|[-+]?Infinity)$", re.IGNORECASE),
-)
 
 
 @dataclass(frozen=True)
@@ -200,106 +70,13 @@ def parse_review(path: Path) -> tuple[str, list[ReviewBlock]]:
     return header, blocks
 
 
-def _raw_semantic_names(field_path: str) -> set[str]:
-    names = {match.group(1) for match in _BACKING_FIELD_RE.finditer(field_path)}
-    cleaned = _BACKING_FIELD_RE.sub(lambda match: match.group(1), field_path)
-    names.update(part for part in re.split(r"[.\[\]]+", cleaned) if part and part != "Array")
-    return {name.strip("_<> ").replace("-", "") for name in names if name.strip("_<> ")}
-
-
-def _semantic_names(field_path: str) -> set[str]:
-    names = _raw_semantic_names(field_path)
-    return {name.strip("_<> ").replace("-", "").casefold() for name in names if name.strip("_<> ")}
-
-
-def _has_identifier_name(field_path: str) -> bool:
-    for name in _raw_semantic_names(field_path):
-        lowered = name.casefold()
-        if re.search(r"(?:^|_)(?:id|ids|guid|guids|uuid|uuids)$", lowered):
-            return True
-        if re.search(r"(?:Id|IDs|ID|GUID|Guid|UUID|Uuid)s?$", name):
-            return True
-        if re.match(r"^id[A-Z]", name):
-            return True
-    return False
-
-
-def _all_samples_have_no_language(samples: tuple[str, ...]) -> bool:
-    meaningful = [sample.strip() for sample in samples if sample.strip()]
-    if not meaningful:
-        return True
-    return all(not any(character.isalpha() for character in sample) for sample in meaningful)
-
-
-def _all_samples_are_machine_values(samples: tuple[str, ...]) -> bool:
-    meaningful = [sample.strip() for sample in samples if sample.strip()]
-    return bool(meaningful) and all(
-        any(pattern.search(sample) for pattern in _MACHINE_VALUE_PATTERNS)
-        for sample in meaningful
-    )
-
-
-def _runtime_policy_reason(field_path: str, samples: tuple[str, ...]) -> str | None:
-    concrete_path = _ARRAY_INDEX_RE.sub("[0]", field_path)
-    values = samples or ("",)
-    for value in values:
-        reason = runtime_field_exclusion_reason(None, concrete_path, value)
-        if reason is not None:
-            return reason
-    return None
-
-
 def classify(block: ReviewBlock) -> tuple[str, str]:
-    field_path = block.normalized_field
-
-    if field_path in _TRUSTED_VISIBLE_FIELDS:
-        return "allow", "Unity Text/TMP 直接文本字段"
-    if _VISIBLE_LOCALIZATION_RE.search(field_path):
-        return "allow", "结构化本地化显示文本"
-    if _LOCALIZED_VALUE_RE.search(field_path):
-        return "allow", "明确本地化译文值字段"
-
-    policy_reason = _runtime_policy_reason(field_path, block.samples)
-    if policy_reason is not None:
-        return "protect", policy_reason
-    if _RUNTIME_PATH_RE.search(field_path):
-        return "protect", "Unity/运行时元数据路径"
-
-    semantic_names = _semantic_names(field_path)
-    if semantic_names & _RUNTIME_SEMANTIC_NAMES:
-        matched = sorted(semantic_names & _RUNTIME_SEMANTIC_NAMES)[0]
-        return "protect", f"运行时语义字段名: {matched}"
-    if _has_identifier_name(field_path):
-        return "protect", "运行时 ID/GUID 字段"
-    if any(name.endswith(_RUNTIME_SEMANTIC_SUFFIXES) for name in semantic_names):
-        return "protect", "运行时 ID/GUID 字段"
-
-    schema_lower = block.sibling_schema.casefold()
-    if "task=string" in schema_lower and (
-        "<analyticsid>k__backingfield=string" in schema_lower
-        or "<vfxinfo>k__backingfield=object" in schema_lower
-        or "_finishsoundinfos=object" in schema_lower
-    ):
-        return "protect", "任务/VFX/音效运行时配置"
-    if "productname=string" in schema_lower and sum(
-        marker in schema_lower
-        for marker in ("idgoogleplay=string", "idamazon=string", "idios=string", "idmac=string", "idwindows=string")
-    ) >= 2:
-        return "protect", "IAP 商品查找配置"
-    if "companyname=string" in schema_lower and sum(
-        marker in schema_lower
-        for marker in ("privacylink=string", "termslink=string", "companylogo=pptr")
-    ) >= 2:
-        return "protect", "SDK 合规配置"
-
-    if any("DO NOT DELETE INFORMATION" in sample for sample in block.samples):
-        return "protect", "工具/配置保留标记"
-    if _all_samples_are_machine_values(block.samples):
-        return "protect", "机器配置值"
-    if _all_samples_have_no_language(block.samples):
-        return "protect", "样本不含语言文本"
-
-    return "unknown", "缺少足够的本地正反证据"
+    result = classify_local_string_field(
+        block.normalized_field,
+        block.samples,
+        block.sibling_schema,
+    )
+    return result.decision, result.reason
 
 
 def _filtered_header(original: str) -> str:
@@ -309,7 +86,9 @@ def _filtered_header(original: str) -> str:
             lines.append("# 安全规则: 只有存在明确玩家可见文本证据时才返回；不确定时不要返回。")
         else:
             lines.append(line)
-    lines.insert(0, "# 本文件已完成本地三态过滤，只包含仍需 AI 判断的 unknown 字段。")
+    marker = "# 本文件已完成本地三态过滤，只包含仍需 AI 判断的 unknown 字段。"
+    if marker not in lines:
+        lines.insert(0, marker)
     return "\n".join(lines).rstrip() + "\n\n"
 
 

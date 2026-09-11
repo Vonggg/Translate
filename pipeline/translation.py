@@ -10,18 +10,34 @@ import threading
 import time
 from fnmatch import fnmatchcase
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 from .shared import ScanRecord, atomic_write_json, collect_json_files, read_json, unique_preserve_order, write_json
 from .manifest_index import build_tmp_manifest_index, tmp_manifest_index_path
-from .embedded_text import apply_textasset_csv_translations, extract_textasset_csv_cells
+from .embedded_text import (
+    apply_textasset_csv_translations,
+    apply_textasset_json_translations,
+    extract_textasset_csv_cells,
+    extract_textasset_json_cells,
+)
+from .dynamic_translation_dictionary import (
+    DYNAMIC_DICTIONARY_CPP_FILENAME,
+    DYNAMIC_DICTIONARY_OUTPUT_SUBDIR,
+    STRINGLITERAL_TRANSLATIONS_FILENAME,
+    extract_native_unity_translation_dictionary_entries,
+    select_whole_text_dictionary_entries,
+)
 from .runtime_field_policy import runtime_field_exclusion_reason
+from .local_field_policy import classify_local_string_field
 from .ai_translation_strategy import get_strategy
 from .codex_cli_provider import (
+    codex_display_name,
     codex_cli_available,
+    codex_transport_models,
     field_selection_schema,
+    is_codex_transport,
     request_structured_output,
     single_translation_schema,
     translation_schema,
@@ -53,8 +69,6 @@ _IDENTIFIER_LIKE_TEXT_PATTERN = re.compile(
 TRUSTED_GLOBAL_AI_TEXT_LEAVES = {
     "m_Text",
     "m_text",
-    "mText",
-    "_text",
 }
 
 
@@ -231,6 +245,7 @@ def _scan_contract_fingerprint(cfg: PipelineConfig, json_files: list[Path]) -> s
         Path(__file__),
         Path(extract_textasset_csv_cells.__code__.co_filename),
         Path(runtime_field_exclusion_reason.__code__.co_filename),
+        Path(classify_local_string_field.__code__.co_filename),
         Path(run_bitmap_font_detection.__code__.co_filename),
         Path(infer_localization_bindings.__code__.co_filename),
     ]
@@ -1176,11 +1191,53 @@ def _write_string_field_stats(cfg: PipelineConfig, stats: dict[str, dict[str, An
         if not isinstance(contexts, dict):
             contexts = {}
             entry["contexts"] = contexts
-        context_sensitive = (
-            len(contexts) > 1
-            and str(entry.get("leaf_key", "")) not in TRUSTED_GLOBAL_AI_TEXT_LEAVES
+
+        decision_kinds: set[str] = set()
+        decision_reasons: set[str] = set()
+        for context in contexts.values():
+            if not isinstance(context, dict):
+                continue
+            if bool(entry.get("blacklisted", False)) or _is_blacklisted_string_field(cfg, field):
+                decision = "protect"
+                reason = "config string_field_blacklist"
+            else:
+                raw_samples = context.get("sample_values", [])
+                if not isinstance(raw_samples, (list, tuple)):
+                    raw_samples = []
+                raw_schema = context.get("sibling_schema", [])
+                if not isinstance(raw_schema, (str, list, tuple)):
+                    raw_schema = []
+                result = classify_local_string_field(
+                    field,
+                    (
+                        value
+                        for value in raw_samples
+                        if isinstance(value, str)
+                    ),
+                    raw_schema,
+                )
+                decision = result.decision
+                reason = result.reason
+            context["local_decision"] = decision
+            context["local_reason"] = reason
+            decision_kinds.add(decision)
+            decision_reasons.add(reason)
+
+        context_sensitive = len(contexts) > 1 and (
+            str(entry.get("leaf_key", "")) not in TRUSTED_GLOBAL_AI_TEXT_LEAVES
+            or len(decision_kinds) > 1
         )
         entry["context_sensitive"] = context_sensitive
+        entry["local_decision"] = (
+            next(iter(decision_kinds))
+            if len(decision_kinds) == 1
+            else ("mixed" if decision_kinds else "unknown")
+        )
+        entry["local_reason"] = (
+            next(iter(decision_reasons))
+            if len(decision_reasons) == 1
+            else ""
+        )
         for signature, context in contexts.items():
             if isinstance(context, dict):
                 context["selector"] = (
@@ -1188,19 +1245,21 @@ def _write_string_field_stats(cfg: PipelineConfig, stats: dict[str, dict[str, An
                     if context_sensitive
                     else field
                 )
+
     write_json(cfg.stage_record_dir / cfg.output_string_field_stats_json, ordered)
     review_lines = [
+        "# 本文件已完成本地三态过滤，只包含仍需 AI 判断的 unknown 字段。",
         "# 请帮我判断这些 Unity JSON 字符串字段是否像会显示给玩家的文本字段。",
         "# 判断依据: field 候选标识、normalized_field、资源类型、脚本类型、同级字段结构、来源文件和文本样本。",
         "# sample_values 规则: 如果样本超过 6 条，只显示前 6 条；单条样本过长会截断；sample_total 表示原本记录的样本总数，sample_shown 表示当前显示条数。",
         "# 字段路径规则: Array[数字] 已归一化为 Array[]；返回时必须逐字复制 field 行，而不是 normalized_field 行。",
         "# 上下文规则: 同一 normalized_field 只有在脚本类型或同级字段结构不同时才会拆成多个 field；带 @@context_ 的 field 必须按各自上下文独立判断。",
         "# 返回规则: 只返回可能展示给玩家的 field 候选标识；必须逐字复制 field 行的内容，不能去掉 @@context_ 后缀，也不能改成 leaf_key。",
-        "# 高召回规则: 只要当前 field 块的 sample_values 中存在明显可能展示给玩家的自然语言文本，就必须返回该 field；不确定时优先保留，避免漏选。",
+        "# 安全规则: 只有存在明确玩家可见文本证据时才返回；不确定时不要返回。",
         "# 多语言规则: 玩家可见文本可能是英文、中文、繁体中文或其它语言，不能只把英文样本视为待翻译文本。",
         "# 自检规则: 返回前逐块检查，确保所有玩家可见 field 都在结果中，也没有把场景名、Tag、输入轴、资源键、回调名等运行时标识选入。",
         "# 输出格式: 仅用英文逗号 ',' 隔开 field 候选标识；不要解释，不要编号，不要换行。",
-        "# 示例: m_Text,level@@context_0123456789abcdef",
+        "# 示例: caption,dialogueText@@context_0123456789abcdef",
         "",
     ]
     for field, entry in ordered.items():
@@ -1210,13 +1269,20 @@ def _write_string_field_stats(cfg: PipelineConfig, stats: dict[str, dict[str, An
         if not isinstance(contexts, dict) or not contexts:
             continue
         ordered_contexts = sorted(
-            (context for context in contexts.values() if isinstance(context, dict)),
+            (
+                context
+                for context in contexts.values()
+                if isinstance(context, dict)
+                and context.get("local_decision", "unknown") == "unknown"
+            ),
             key=lambda context: (
                 str(context.get("asset_type", "")),
                 str(context.get("script_type", "")),
                 str(context.get("signature", "")),
             ),
         )
+        if not ordered_contexts:
+            continue
         if not bool(entry.get("context_sensitive", False)) and len(ordered_contexts) > 1:
             asset_types = sorted({str(context.get("asset_type", "unknown")) for context in ordered_contexts})
             ordered_contexts = [
@@ -1229,6 +1295,8 @@ def _write_string_field_stats(cfg: PipelineConfig, stats: dict[str, dict[str, An
                     "file_count": int(entry.get("file_count", len(entry.get("files", [])))),
                     "files": list(entry.get("files", [])),
                     "sample_values": list(entry.get("sample_values", [])),
+                    "local_decision": "unknown",
+                    "local_reason": "缺少足够的本地正反证据",
                 }
             ]
         for context in ordered_contexts:
@@ -1259,9 +1327,10 @@ def _write_string_field_stats(cfg: PipelineConfig, stats: dict[str, dict[str, An
                     safe_sample = safe_sample[:AI_FIELD_REVIEW_MAX_SAMPLE_CHARS] + "...[truncated]"
                 review_lines.append(f"- {safe_sample}")
             review_lines.append("")
-    (cfg.stage_record_dir / cfg.output_string_field_review_txt).write_text("\n".join(review_lines), encoding="utf-8")
+    review_path = cfg.stage_record_dir / cfg.output_string_field_review_txt
+    review_path.write_text("\n".join(review_lines), encoding="utf-8")
     rows = [
-        "field\tnormalized_field\tcontext_sensitive\tasset_type\tscript_type\tsibling_schema\t"
+        "field\tnormalized_field\tcontext_sensitive\tlocal_decision\tlocal_reason\tasset_type\tscript_type\tsibling_schema\t"
         "count\tfile_count\tcurrent_text_key\tblacklisted\tsample_values\tfull_fields\tfiles"
     ]
     for field, entry in ordered.items():
@@ -1280,6 +1349,8 @@ def _write_string_field_stats(cfg: PipelineConfig, stats: dict[str, dict[str, An
                         str(context.get("selector", field)),
                         field,
                         str(bool(entry.get("context_sensitive", False))),
+                        str(context.get("local_decision", "unknown")),
+                        str(context.get("local_reason", "")),
                         str(context.get("asset_type", "")),
                         str(context.get("script_type", "")),
                         " | ".join(str(item) for item in context.get("sibling_schema", [])),
@@ -1297,16 +1368,38 @@ def _write_string_field_stats(cfg: PipelineConfig, stats: dict[str, dict[str, An
     context_sensitive_count = sum(
         bool(entry.get("context_sensitive", False)) for entry in ordered.values()
     )
-    candidate_count = sum(
-        len(entry.get("contexts", {}))
-        if bool(entry.get("context_sensitive", False))
-        else 1
-        for entry in ordered.values()
-        if not bool(entry.get("blacklisted", False))
+    selector_policy: dict[str, dict[str, str]] = {}
+    for field, entry in ordered.items():
+        if bool(entry.get("blacklisted", False)):
+            continue
+        contexts = entry.get("contexts", {})
+        if not isinstance(contexts, dict):
+            continue
+        for context in contexts.values():
+            if not isinstance(context, dict):
+                continue
+            selector = str(context.get("selector") or field)
+            decision = str(context.get("local_decision", "unknown"))
+            reason = str(context.get("local_reason", ""))
+            previous = selector_policy.get(selector)
+            if previous is not None and previous["decision"] != decision:
+                decision = "unknown"
+                reason = "同一 selector 的本地判断不一致"
+            selector_policy[selector] = {
+                "normalized_field": field,
+                "decision": decision,
+                "reason": reason,
+            }
+    decision_counts = Counter(
+        item["decision"] for item in selector_policy.values()
     )
     _log(
         f"[扫描] AI 字段上下文聚合: 普通字段={len(ordered) - context_sensitive_count}，"
-        f"自动升级上下文敏感字段={context_sensitive_count}，AI候选={candidate_count}"
+        f"自动升级上下文敏感字段={context_sensitive_count}，"
+        f"本地允许={decision_counts.get('allow', 0)}，"
+        f"本地保护={decision_counts.get('protect', 0)}，"
+        f"AI候选={decision_counts.get('unknown', 0)}，"
+        f"候选文件={review_path.stat().st_size} bytes"
     )
 
 
@@ -1652,6 +1745,17 @@ def _scan_one_translation_json(
     for embedded_cell in extract_textasset_csv_cells(data, json_path):
         field = embedded_cell["field"]
         source_text = embedded_cell["source_text"]
+        _add_string_field_stat(file_string_field_stats, cfg, json_path, data, field, source_text)
+        add_text_record(field, source_text, embedded_cell["locator"])
+
+    for embedded_cell in extract_textasset_json_cells(data, json_path):
+        field = embedded_cell["field"]
+        source_text = embedded_cell["source_text"]
+        runtime_reason = runtime_field_exclusion_reason(data, field, source_text)
+        if _is_blacklisted_string_field(cfg, field) or runtime_reason is not None:
+            if runtime_reason is not None:
+                file_runtime_exclusions[runtime_reason] = file_runtime_exclusions.get(runtime_reason, 0) + 1
+            continue
         _add_string_field_stat(file_string_field_stats, cfg, json_path, data, field, source_text)
         add_text_record(field, source_text, embedded_cell["locator"])
 
@@ -2097,12 +2201,12 @@ def _ai_translation_transport_chain(cfg: PipelineConfig) -> list[str]:
     if transport != "codex_cli":
         raise RuntimeError(f"不支持的 AI translation transport: {transport}")
 
-    chain: list[str] = []
-    codex_model = str(
+    codex_models = codex_transport_models(str(
         getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark")
-    ).strip()
-    if codex_model and codex_cli_available():
-        chain.append("codex_cli")
+    ))
+    chain: list[str] = []
+    if codex_models and codex_cli_available():
+        chain.extend(codex_models)
     if _ai_http_translation_configured(cfg):
         chain.append("http")
     return chain
@@ -2111,11 +2215,10 @@ def _ai_translation_transport_chain(cfg: PipelineConfig) -> list[str]:
 def _translate_ai_once(text: str, cfg: PipelineConfig, transport: str) -> str:
     base_url = cfg.ai_translation_base_url.strip().rstrip("/")
     api_key = cfg.ai_translation_api_key.strip()
-    model = (
-        str(getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark")).strip()
-        if transport == "codex_cli"
-        else cfg.ai_translation_model.strip()
+    codex_models = codex_transport_models(
+        str(getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark"))
     )
+    model = codex_models.get(transport, cfg.ai_translation_model.strip())
     system_prompt = (
         "你是游戏逆向汉化翻译助手。用户输入是从游戏资源中导出的文本，"
         "目标是制作简体中文汉化，不是只翻译英文；任何语言都要翻译成简体中文。"
@@ -2127,7 +2230,7 @@ def _translate_ai_once(text: str, cfg: PipelineConfig, transport: str) -> str:
         "保留换行、占位符、数字、货币符号、格式控制符和富文本标签。"
         "只输出译文，不要解释。"
     )
-    if transport == "codex_cli":
+    if is_codex_transport(transport):
         result, _usage = request_structured_output(
             model=model,
             reasoning_effort=str(getattr(cfg, "ai_translation_codex_reasoning_effort", "low")),
@@ -2183,12 +2286,19 @@ def _translate_ai_once(text: str, cfg: PipelineConfig, transport: str) -> str:
 def _translate_ai(text: str, cfg: PipelineConfig) -> str:
     transports = _ai_translation_transport_chain(cfg)
     if not transports:
-        raise RuntimeError("AI translation is enabled but Codex CLI and HTTP AI are not available/configured.")
+        raise RuntimeError("AI translation is enabled but Codex CLI and DeepSeek are not available/configured.")
 
     failures: list[str] = []
     max_attempts = AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS + 1
     for transport in transports:
-        display_name = "Codex CLI" if transport == "codex_cli" else "HTTP AI"
+        codex_models = codex_transport_models(
+            str(getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark"))
+        )
+        display_name = (
+            codex_display_name(transport, codex_models[transport])
+            if is_codex_transport(transport)
+            else "DeepSeek"
+        )
         for attempt in range(1, max_attempts + 1):
             try:
                 translated = _translate_ai_once(text, cfg, transport)
@@ -2197,11 +2307,16 @@ def _translate_ai(text: str, cfg: PipelineConfig) -> str:
                 raise RuntimeError("返回空译文")
             except Exception as exc:
                 failures.append(f"{display_name}: {exc}")
-                if transport == "codex_cli":
-                    next_step = "切换到 HTTP AI" if "http" in transports else "回落普通翻译"
+                if is_codex_transport(transport):
+                    remaining = transports[transports.index(transport) + 1 :]
+                    next_step = (
+                        f"切换到 {codex_display_name(remaining[0], codex_models[remaining[0]])}"
+                        if remaining and is_codex_transport(remaining[0])
+                        else "切换到 DeepSeek" if "http" in remaining else "回落普通翻译"
+                    )
                     _log(
-                        f"[翻译][Codex熔断] Codex CLI 请求失败，{next_step}，"
-                        f"不再重试 Codex: {_format_log_text(text)} ({exc})"
+                        f"[翻译][模型回退] {display_name} 请求失败，{next_step}: "
+                        f"{_format_log_text(text)} ({exc})"
                     )
                     break
                 if attempt < max_attempts:
@@ -2241,28 +2356,37 @@ def _translate_ai_batch(
         getattr(cfg, "ai_translation_transport", "http") or "http"
     ).strip().lower()
     transports = _ai_translation_transport_chain(cfg)
+    models = codex_transport_models(
+        str(getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark"))
+    )
+    models["http"] = cfg.ai_translation_model.strip()
     if codex_circuit is None:
         codex_circuit = {}
-    codex_skipped_by_circuit = bool(
-        codex_circuit.get("open") and "codex_cli" in transports
-    )
+    disabled_codex_models = {
+        str(model)
+        for model in codex_circuit.get("disabled_models", [])
+        if str(model).strip()
+    }
+    if codex_circuit.get("open") and not disabled_codex_models:
+        disabled_codex_models.update(
+            models[item] for item in transports if is_codex_transport(item)
+        )
+    original_transports = list(transports)
+    transports = [
+        item
+        for item in transports
+        if not (is_codex_transport(item) and models[item] in disabled_codex_models)
+    ]
+    codex_skipped_by_circuit = len(transports) != len(original_transports)
     if codex_skipped_by_circuit:
-        transports = [item for item in transports if item != "codex_cli"]
         _log_dark_green(
-            f"[翻译][Codex熔断] batch={batch_index}/{batch_count} 本次操作此前已发生 "
-            "Codex CLI 错误，直接跳过并进入 HTTP AI。"
+            f"[翻译][模型熔断] batch={batch_index}/{batch_count} 跳过本次操作中已失败的 "
+            f"Codex 模型: {', '.join(sorted(disabled_codex_models))}。"
         )
     if not transports:
         return {}
     base_url = cfg.ai_translation_base_url.strip().rstrip("/")
     api_key = cfg.ai_translation_api_key.strip()
-    models = {
-        "codex_cli": str(
-            getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark")
-        ).strip(),
-        "http": cfg.ai_translation_model.strip(),
-    }
-
     import requests
 
     cfg.stage_record_dir.mkdir(parents=True, exist_ok=True)
@@ -2321,7 +2445,7 @@ def _translate_ai_batch(
             request_saved = True
             _log(f"[翻译] AI 请求内容已写入: {request_path}")
 
-        if request_transport == "codex_cli":
+        if is_codex_transport(request_transport):
             structured, usage = request_structured_output(
                 model=model,
                 reasoning_effort=str(getattr(cfg, "ai_translation_codex_reasoning_effort", "low")),
@@ -2334,7 +2458,7 @@ def _translate_ai_batch(
             data = {
                 "object": "codex.cli.response",
                 "model": model,
-                "provider": "codex_cli",
+                "provider": request_transport,
                 "choices": [{
                     "index": 0,
                     "message": {
@@ -2346,7 +2470,8 @@ def _translate_ai_batch(
                 "usage": usage,
             }
             _log(
-                f"[翻译] Codex CLI 已响应: batch={batch_index}/{batch_count}, {label}"
+                f"[翻译] {codex_display_name(request_transport, model)} 已响应: "
+                f"batch={batch_index}/{batch_count}, {label}"
             )
         else:
             session = requests.Session()
@@ -2410,7 +2535,7 @@ def _translate_ai_batch(
     ):
         _log_dark_green(
             f"[翻译][AI回退] batch={batch_index}/{batch_count} Codex CLI 不可用，"
-            "直接切换到 HTTP AI。"
+            "直接切换到 DeepSeek。"
         )
 
     for transport_index, request_transport in enumerate(transports):
@@ -2421,11 +2546,21 @@ def _translate_ai_batch(
         ]
         if not missing_items:
             break
-        display_name = "Codex CLI" if request_transport == "codex_cli" else "HTTP AI"
+        display_name = (
+            codex_display_name(request_transport, models[request_transport])
+            if is_codex_transport(request_transport)
+            else "DeepSeek"
+        )
         if transport_index > 0:
+            previous_transport = transports[transport_index - 1]
+            previous_name = (
+                codex_display_name(previous_transport, models[previous_transport])
+                if is_codex_transport(previous_transport)
+                else "DeepSeek"
+            )
             _log_dark_green(
-                f"[翻译][AI回退] batch={batch_index}/{batch_count} Codex CLI 仍缺少 "
-                f"{len(missing_items)} 条，切换到 HTTP AI；同样最多重试 "
+                f"[翻译][AI回退] batch={batch_index}/{batch_count} {previous_name} 仍缺少 "
+                f"{len(missing_items)} 条，切换到 {display_name}；同样最多重试 "
                 f"{AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS} 次。"
             )
 
@@ -2461,13 +2596,26 @@ def _translate_ai_batch(
                     f"[翻译][AI重试] batch={batch_index}/{batch_count} "
                     f"{label}失败: {exc}"
                 )
-                if request_transport == "codex_cli":
-                    codex_circuit["open"] = True
+                if is_codex_transport(request_transport):
+                    disabled_codex_models.add(models[request_transport])
+                    codex_circuit["disabled_models"] = sorted(disabled_codex_models)
                     codex_circuit["reason"] = str(exc)
+                    remaining_codex = [
+                        item
+                        for item in transports[transport_index + 1 :]
+                        if is_codex_transport(item)
+                        and models[item] not in disabled_codex_models
+                    ]
+                    codex_circuit["open"] = not remaining_codex
+                    next_name = (
+                        codex_display_name(remaining_codex[0], models[remaining_codex[0]])
+                        if remaining_codex
+                        else "DeepSeek" if "http" in transports[transport_index + 1 :] else "普通翻译"
+                    )
                     _log_dark_green(
-                        f"[翻译][Codex熔断] batch={batch_index}/{batch_count} "
-                        "Codex CLI 进程请求失败；本批立即切换 HTTP AI，"
-                        "本次操作的后续批次将全部跳过 Codex。"
+                        f"[翻译][模型熔断] batch={batch_index}/{batch_count} "
+                        f"{display_name} 请求失败；本批切换到 {next_name}，"
+                        "后续批次仅跳过这个已失败模型。"
                     )
                     break
                 continue
@@ -2643,13 +2791,24 @@ def _start_wait_logger(prefix: str, interval_seconds: int = 30) -> tuple[threadi
     return stop_event, thread
 
 
-def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> OrderedDict[str, str]:
-    source_texts = unique_preserve_order(record.source_text for record in records)
-    cache_path = cfg.stage_record_dir / cfg.output_trans_json
-    maybe_title_path = cfg.stage_record_dir / MAYBE_TITLE_TRANS_FILENAME
+def build_translation_map_for_texts(
+    source_texts: Iterable[str],
+    cfg: PipelineConfig,
+    *,
+    cache_path: Path,
+    maybe_title_path: Path,
+    artifact_prefix: str = "ai_translation",
+    exclude_identifier_like: bool = True,
+    source_label: str = "records.json",
+    source_contexts: Mapping[str, Any] | None = None,
+) -> OrderedDict[str, str]:
+    source_texts = unique_preserve_order(source_texts)
+    cache_label = cache_path.name
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     maybe_title_texts = [
-        text for text in source_texts if _is_identifier_like_translation_key(text)
+        text
+        for text in source_texts
+        if exclude_identifier_like and _is_identifier_like_translation_key(text)
     ]
     maybe_title_set = set(maybe_title_texts)
     translatable_texts = [
@@ -2667,9 +2826,9 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
                     if isinstance(translated, str) and translated
                 }
             else:
-                _log_blue(f"[翻译][断点续跑] trans.json 不是 JSON 对象，将从头执行: {cache_path}")
+                _log_blue(f"[翻译][断点续跑] {cache_label} 不是 JSON 对象，将从头执行: {cache_path}")
         except Exception as exc:
-            _log_blue(f"[翻译][断点续跑] trans.json 读取失败，将从头执行: {exc}")
+            _log_blue(f"[翻译][断点续跑] {cache_label} 读取失败，将从头执行: {exc}")
     translations: OrderedDict[str, str] = OrderedDict(
         (text, existing_translations.get(text, "")) for text in translatable_texts
     )
@@ -2677,12 +2836,12 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
     resumed_count = sum(1 for translated in translations.values() if translated)
     if cache_was_present and resumed_count:
         _log_green(
-            f"[翻译][断点续跑] 已保留 trans.json 中 {resumed_count} 条非空译文，"
+            f"[翻译][断点续跑] 已保留 {cache_label} 中 {resumed_count} 条非空译文，"
             f"剩余={len(translations) - resumed_count}: {cache_path}"
         )
     else:
         _log(
-            f"[翻译] 已依据 records.json 生成 trans.json 任务表: "
+            f"[翻译] 已依据 {source_label} 生成 {cache_label} 任务表: "
             f"{cache_path}，键数={len(translations)}"
         )
     atomic_write_json(
@@ -2692,11 +2851,16 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
     if maybe_title_texts:
         _log_blue(
             f"[翻译] 本地识别到疑似资源键/标题键: {len(maybe_title_texts)} 条，"
-            "已从 trans.json 移除且不发送给 AI 或回落翻译。"
+            f"已从 {cache_label} 移除且不发送给 AI 或回落翻译。"
         )
         _log_blue(f"[翻译] 疑似资源键清单: {maybe_title_path}")
-    else:
+    elif exclude_identifier_like:
         _log(f"[翻译] 未发现由 _ 或 - 连接的疑似资源键，已写入空清单: {maybe_title_path}")
+    else:
+        _log(
+            f"[翻译] 当前任务已关闭资源键排除，保留全部候选字符串；"
+            f"空清单已写入: {maybe_title_path}"
+        )
 
     failed_fallbacks: OrderedDict[str, str] = OrderedDict()
     all_translation_items: list[tuple[int, str]] = [
@@ -2716,6 +2880,8 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
     if cfg.enable_ai_translation and pending_items:
         if _ai_translation_request_configured(cfg):
             strategy = get_strategy(cfg)
+            if source_contexts:
+                strategy.source_contexts = dict(source_contexts)
             # Always partition the complete task so batch numbers remain stable
             # across restarts. Only unresolved items within each original batch
             # are sent again.
@@ -2739,7 +2905,7 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
             skipped_batch_count = len(batches) - len(active_batches)
             _log(
                 f"[翻译] AI 分批翻译已启用: strategy={getattr(strategy, 'name', 'custom')}，"
-                f"待发送 trans key 数={len(pending_items)}，原始批次={len(batches)}，"
+                f"待发送 {cache_label} key 数={len(pending_items)}，原始批次={len(batches)}，"
                 f"待执行批次={len(active_batches)}，已跳过完整批次={skipped_batch_count}，"
                 f"输出安全除数={getattr(strategy, 'output_safety_divisor', 'unknown')}，"
                 f"单批预计输出预算={getattr(strategy, 'batch_output_budget_chars', 'unknown')}"
@@ -2762,6 +2928,7 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
                         strategy,
                         batch_index,
                         len(batches),
+                        artifact_prefix=artifact_prefix,
                         codex_circuit=codex_circuit,
                     )
                 except Exception as exc:
@@ -2770,10 +2937,16 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
                         f"[翻译] AI batch={batch_index}/{len(batches)} "
                         f"失败，将本批回落到 {cfg.translate_provider}: {exc}"
                     )
-                    _log_blue(
-                        f"[翻译][后续处理] 可在工具脚本中运行主菜单 3「AI 翻译单批补跑 / 修补 trans.json」，"
-                        f"选择失败的 batch {batch_index:03d}，使用选项 3 重发并立即修补。"
-                    )
+                    if artifact_prefix == "ai_translation":
+                        _log_blue(
+                            f"[翻译][后续处理] 可在工具脚本中运行主菜单 3「AI 翻译单批补跑 / 修补 trans.json」，"
+                            f"选择失败的 batch {batch_index:03d}，使用选项 3 重发并立即修补。"
+                        )
+                    else:
+                        _log_blue(
+                            f"[翻译][后续处理] {cache_label} 的 batch "
+                            f"{batch_index:03d} 未完成；重新执行当前脚本会断点续跑。"
+                        )
                     continue
                 finally:
                     wait_stop.set()
@@ -2794,12 +2967,19 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
                 if missing_batch_count:
                     if batch_index not in failed_ai_batches:
                         failed_ai_batches.append(batch_index)
-                    _log_blue(
-                        f"[翻译][后续处理] batch={batch_index}/{len(batches)} 返回不完整 "
-                        f"({len(returned_batch_ids)}/{len(expected_batch_ids)}，"
-                        f"缺少={missing_batch_count})。请在工具脚本中运行主菜单 3，"
-                        "选择该批次并使用选项 3 重发并立即修补。"
-                    )
+                    if artifact_prefix == "ai_translation":
+                        _log_blue(
+                            f"[翻译][后续处理] batch={batch_index}/{len(batches)} 返回不完整 "
+                            f"({len(returned_batch_ids)}/{len(expected_batch_ids)}，"
+                            f"缺少={missing_batch_count})。请在工具脚本中运行主菜单 3，"
+                            "选择该批次并使用选项 3 重发并立即修补。"
+                        )
+                    else:
+                        _log_blue(
+                            f"[翻译][后续处理] {cache_label} batch={batch_index}/{len(batches)} "
+                            f"返回不完整 ({len(returned_batch_ids)}/{len(expected_batch_ids)}，"
+                            f"缺少={missing_batch_count})；重新执行当前脚本会断点续跑。"
+                        )
                 ordered_cache = _ordered_translations(translatable_texts, translations)
                 atomic_write_json(cache_path, dict(ordered_cache))
                 _log_blue(
@@ -2816,10 +2996,15 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
                 _log_blue(
                     f"[翻译][补批提醒] 需要检查或重跑的 AI 批次: {batch_names}。"
                 )
-                _log_blue(
-                    "[翻译][补批提醒] 工具脚本选择主菜单 3 -> 选项 3；修补完成后，"
-                    "回到主菜单从脚本 3 开始继续执行。"
-                )
+                if artifact_prefix == "ai_translation":
+                    _log_blue(
+                        "[翻译][补批提醒] 工具脚本选择主菜单 3 -> 选项 3；修补完成后，"
+                        "回到主菜单从脚本 3 开始继续执行。"
+                    )
+                else:
+                    _log_blue(
+                        f"[翻译][补批提醒] 重新执行当前脚本会从 {cache_label} 断点续跑。"
+                    )
         else:
             _log(f"[翻译] AI 翻译已启用但配置不完整，将直接回落到 {cfg.translate_provider}。")
 
@@ -2849,6 +3034,15 @@ def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> Ord
 
     _log(f"[翻译] 翻译缓存已更新: {cache_path}")
     return translations
+
+
+def build_translation_map(records: list[ScanRecord], cfg: PipelineConfig) -> OrderedDict[str, str]:
+    return build_translation_map_for_texts(
+        (record.source_text for record in records),
+        cfg,
+        cache_path=cfg.stage_record_dir / cfg.output_trans_json,
+        maybe_title_path=cfg.stage_record_dir / MAYBE_TITLE_TRANS_FILENAME,
+    )
 
 
 def apply_translations_to_json(
@@ -3759,7 +3953,7 @@ def write_translation_outputs(
     write_json(cfg.stage_record_dir / cfg.output_ids_json, ids_map)
     write_json(cfg.stage_record_dir / cfg.output_font_map_json, font_map)
     write_json(cfg.stage_record_dir / cfg.output_ref_map_json, ref_map)
-    rebuild_game_text_outputs(cfg, translations)
+    rebuild_game_text_outputs(cfg, translations, include_dynamic=False)
     mapping_rows = ["source\ttranslated\tfile\tfield\tpath_id\tfont_path_id"]
     for record in records:
         mapping_rows.append(
@@ -3780,6 +3974,8 @@ def write_translation_outputs(
 def rebuild_game_text_outputs(
     cfg: PipelineConfig,
     translations: dict[str, str] | OrderedDict[str, str] | None = None,
+    *,
+    include_dynamic: bool = True,
 ) -> None:
     trans_path = cfg.stage_record_dir / cfg.output_trans_json
     game_txt_path = cfg.stage_record_dir / cfg.output_game_txt
@@ -3794,14 +3990,62 @@ def rebuild_game_text_outputs(
     else:
         _log("[重建文本] 使用内存中的翻译结果生成 game.txt/game_chars.txt")
 
+    dynamic_entries: list[tuple[str, str]] = []
+    dynamic_trans_path = cfg.stage_record_dir / STRINGLITERAL_TRANSLATIONS_FILENAME
+    output_root = Path(getattr(cfg, "stage_dir", cfg.stage_record_dir.parent / "output"))
+    dictionary_cpp_path = (
+        output_root / DYNAMIC_DICTIONARY_OUTPUT_SUBDIR / DYNAMIC_DICTIONARY_CPP_FILENAME
+    )
+    if include_dynamic and dictionary_cpp_path.is_file():
+        try:
+            dynamic_entries = extract_native_unity_translation_dictionary_entries(dictionary_cpp_path)
+        except Exception as exc:
+            raise ValueError(f"动态词典 C++ 读取失败: {dictionary_cpp_path}: {exc}") from exc
+        _log(
+            f"[重建文本] 已合并实际 Hook 动态词典: {dictionary_cpp_path}，"
+            f"词条={len(dynamic_entries)}"
+        )
+    elif include_dynamic and dynamic_trans_path.is_file():
+        try:
+            dynamic_payload = read_json(dynamic_trans_path)
+        except Exception as exc:
+            raise ValueError(f"动态词库读取失败: {dynamic_trans_path}: {exc}") from exc
+        if not isinstance(dynamic_payload, dict):
+            raise ValueError(f"动态词库必须是 JSON 对象: {dynamic_trans_path}")
+        dictionary_entries, _dictionary_skipped = select_whole_text_dictionary_entries(
+            dynamic_payload
+        )
+        dynamic_entries = dictionary_entries
+        _log(
+            f"[重建文本] 动态词典 C++ 尚未生成，回退合并动态缓存: {dynamic_trans_path}，"
+            f"有效词条={len(dynamic_entries)}"
+        )
+    elif include_dynamic:
+        _log(
+            "[重建文本] 动态词典 C++ 与动态缓存均未生成，本次只使用静态 trans.json: "
+            f"{dictionary_cpp_path}"
+        )
+    else:
+        _log("[重建文本] 当前为静态资源翻译步骤，动态 Hook 词库将在脚本 4 合并。")
+
+    static_texts = [
+        value for value in [*translations.keys(), *translations.values()]
+        if isinstance(value, str)
+    ]
+    dynamic_texts = [value for entry in dynamic_entries for value in entry]
     total = len(translations)
     empty_values = sum(1 for value in translations.values() if not str(value))
-    ordered_values = unique_preserve_order(translations.values())
-    char_text = "".join(unique_preserve_order("".join(translations.keys()) + "".join(translations.values())))
+    ordered_values = unique_preserve_order([*static_texts, *dynamic_texts])
+    char_text = "".join(
+        unique_preserve_order(
+            "".join(static_texts) + "".join(dynamic_texts)
+        )
+    )
 
     _log(
-        f"[重建文本] trans 条目={total}，game.txt 去重行={len(ordered_values)}，"
-        f"空译文={empty_values}，字符数={len(char_text)}"
+        f"[重建文本] 静态 trans 条目={total}，动态字典条目={len(dynamic_entries)}，"
+        f"game.txt 去重文本={len(ordered_values)}，空静态译文={empty_values}，"
+        f"字符数={len(char_text)}"
     )
     game_txt_path.parent.mkdir(parents=True, exist_ok=True)
     game_txt_path.write_text("\n".join(ordered_values), encoding="utf-8")
@@ -3809,7 +4053,7 @@ def rebuild_game_text_outputs(
     game_chars_path.write_text(char_text, encoding="utf-8")
     _log(f"[重建文本] 已写入 game_chars.txt: {game_chars_path}")
     if loaded_from_file:
-        _log("[重建文本] 完成: 已从 trans.json 重建 game.txt 和 game_chars.txt")
+        _log("[重建文本] 完成: 已从静态 trans.json 与动态 Hook 词库重建 game.txt 和 game_chars.txt")
 
 
 def _load_completed_translation_artifacts(cfg: PipelineConfig) -> tuple[OrderedDict[str, str], dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]] | None:
@@ -3926,18 +4170,83 @@ def _load_ai_field_context_index(
     return selectors, context_sensitive_fields
 
 
+def _load_local_field_selector_decisions(cfg: PipelineConfig) -> dict[str, str]:
+    """Load the persisted local decision for each exact field selector."""
+    stats_path = cfg.stage_record_dir / cfg.output_string_field_stats_json
+    if not stats_path.is_file():
+        return {}
+    try:
+        stats = read_json(stats_path)
+    except Exception:
+        return {}
+    if not isinstance(stats, dict):
+        return {}
+
+    decisions: dict[str, str] = {}
+    for raw_field, entry in stats.items():
+        if not isinstance(raw_field, str) or not isinstance(entry, dict):
+            continue
+        field = _normalize_field_path(raw_field)
+        contexts = entry.get("contexts", {})
+        if not isinstance(contexts, dict) or not contexts:
+            decision = str(entry.get("local_decision", "unknown"))
+            decisions[field] = decision if decision in {"allow", "protect", "unknown"} else "unknown"
+            continue
+        context_sensitive = bool(entry.get("context_sensitive", len(contexts) > 1))
+        for signature, context in contexts.items():
+            if not isinstance(signature, str) or not isinstance(context, dict):
+                continue
+            selector = context.get("selector")
+            if not isinstance(selector, str) or not selector:
+                selector = _contextual_field_selector(field, signature) if context_sensitive else field
+            selector = _normalize_field_path(selector)
+            decision = str(context.get("local_decision", "unknown"))
+            if decision not in {"allow", "protect", "unknown"}:
+                decision = "unknown"
+            previous = decisions.get(selector)
+            decisions[selector] = (
+                "unknown"
+                if previous is not None and previous != decision
+                else decision
+            )
+    return decisions
+
+
+def _load_ai_field_review_selectors(candidates_path: Path) -> set[str]:
+    if not candidates_path.is_file():
+        return set()
+    selectors: set[str] = set()
+    for line in candidates_path.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("field:"):
+            continue
+        selector = _normalize_field_path(line.split(":", 1)[1].strip())
+        if selector:
+            selectors.add(selector)
+    return selectors
+
+
 def _record_matches_ai_field_selection(
     cfg: PipelineConfig,
     record: ScanRecord,
     selected_fields: set[str],
     context_sensitive_fields: set[str],
     data_cache: dict[str, Any],
+    local_decisions: dict[str, str] | None = None,
 ) -> bool:
     if _is_blacklisted_string_field(cfg, record.field):
         return False
     normalized = _normalize_field_path(record.field)
+    decisions = local_decisions or {}
+    if runtime_field_exclusion_reason(None, record.field, record.source_text) is not None:
+        return False
     if normalized not in context_sensitive_fields and (
-        record.field in selected_fields or normalized in selected_fields
+        decisions.get(normalized) == "protect"
+    ):
+        return False
+    if normalized not in context_sensitive_fields and (
+        decisions.get(normalized) == "allow"
+        or record.field in selected_fields
+        or normalized in selected_fields
     ):
         return True
     if not any(selector.startswith(f"{normalized}@@context_") for selector in selected_fields):
@@ -3958,7 +4267,9 @@ def _record_matches_ai_field_selection(
     except Exception:
         return False
     selector = _contextual_field_selector(normalized, str(descriptor["signature"]))
-    return selector in selected_fields
+    if decisions.get(selector) == "protect":
+        return False
+    return decisions.get(selector) == "allow" or selector in selected_fields
 
 
 def _manual_ai_field_selection(
@@ -3983,7 +4294,7 @@ def _manual_ai_field_selection(
     )
     _log_blue("[AI字段][返回格式] 使用英文逗号分隔，不要编号、解释、JSON 或 Markdown 代码块。")
     _log_blue(
-        "[AI字段][返回示例] m_Text,Translations.Array[].Text,level@@context_0123456789abcdef"
+        "[AI字段][返回示例] caption,dialogueText@@context_0123456789abcdef"
     )
     raw = input(
         "\033[38;5;208m[AI字段] 请粘贴 AI 返回的英文逗号字段列表: \033[0m"
@@ -4069,8 +4380,8 @@ def _post_ai_field_review_batch(
         "必须综合 field、normalized_field、asset_type、script_type、sibling_schema、来源文件和 sample_values，"
         "判断当前上下文中的字段是否可能包含会展示给玩家的文本。"
         "每个 field 块必须独立判断；带 @@context_ 后缀的同名字段代表不同脚本或同级结构，禁止合并。"
-        "只要当前 field 块的样本中存在明显的玩家可见自然语言文本，就必须保留该 field；"
-        "不确定时优先保留，以避免汉化漏项。"
+        "只有当前 field 块存在明确的玩家可见自然语言文本证据时才保留；"
+        "不确定时不要选择，以避免翻译运行时字段。"
         "玩家可见文本可能使用任意语言，包括繁体中文和非英语文本。"
         "输入中的 Array[数字] 已归一化为 Array[]。"
         "只返回输入 field 行中出现过的候选标识，必须保留完整 @@context_ 后缀，"
@@ -4081,7 +4392,7 @@ def _post_ai_field_review_batch(
     transport = transport or str(
         getattr(cfg, "ai_field_review_transport", "http") or "http"
     ).strip().lower()
-    if transport == "codex_cli":
+    if is_codex_transport(transport):
         result, _usage = request_structured_output(
             model=model,
             reasoning_effort=str(getattr(cfg, "ai_field_review_codex_reasoning_effort", "medium")),
@@ -4094,9 +4405,7 @@ def _post_ai_field_review_batch(
         fields = result.get("fields", [])
         if not isinstance(fields, list):
             raise RuntimeError("Codex CLI 字段判断结果缺少 fields 数组。")
-        _log_green(
-            f"[AI字段] Codex CLI 已响应: batch={batch_index}/{batch_count}"
-        )
+        _log_green(f"[AI字段] {codex_display_name(transport, model)} 已响应: batch={batch_index}/{batch_count}")
         return [str(field).strip() for field in fields if str(field).strip()]
     if transport != "http":
         raise RuntimeError(f"不支持的 AI field review transport: {transport}")
@@ -4161,12 +4470,12 @@ def _ai_field_transport_chain(cfg: PipelineConfig) -> list[str]:
     if transport != "codex_cli":
         return []
 
-    chain: list[str] = []
-    codex_model = str(
+    codex_models = codex_transport_models(str(
         getattr(cfg, "ai_field_review_codex_model", "gpt-5.3-codex-spark")
-    ).strip()
-    if codex_model and codex_cli_available():
-        chain.append("codex_cli")
+    ))
+    chain: list[str] = []
+    if codex_models and codex_cli_available():
+        chain.extend(codex_models)
     if _ai_field_http_configured(cfg):
         chain.append("http")
     return chain
@@ -4181,12 +4490,10 @@ def _request_ai_field_selection(cfg: PipelineConfig, candidates_path: Path) -> l
     transports = _ai_field_transport_chain(cfg)
     if not transports:
         return _manual_ai_field_selection(cfg, candidates_path, "未配置 AI 接口 base_url/api_key/model，将使用人工判断。")
-    models = {
-        "codex_cli": str(
-            getattr(cfg, "ai_field_review_codex_model", "gpt-5.3-codex-spark")
-        ).strip(),
-        "http": cfg.ai_field_review_model.strip(),
-    }
+    models = codex_transport_models(
+        str(getattr(cfg, "ai_field_review_codex_model", "gpt-5.3-codex-spark"))
+    )
+    models["http"] = cfg.ai_field_review_model.strip()
     if not candidates_path.is_file():
         raise FileNotFoundError(f"字段候选文件不存在: {candidates_path}")
 
@@ -4202,7 +4509,7 @@ def _request_ai_field_selection(cfg: PipelineConfig, candidates_path: Path) -> l
         flush=True,
     )
     if configured_transport == "codex_cli" and transports[0] == "http":
-        _log_dark_green("[AI字段][AI回退] Codex CLI 不可用，直接切换到 HTTP AI。")
+        _log_dark_green("[AI字段][AI回退] Codex CLI 不可用，直接切换到 DeepSeek。")
     batches = _split_ai_field_review_batches(prompt)
     if len(batches) > 1:
         print(
@@ -4212,7 +4519,7 @@ def _request_ai_field_selection(cfg: PipelineConfig, candidates_path: Path) -> l
         )
     try:
         fields: list[str] = []
-        codex_circuit_open = False
+        disabled_codex_models: set[str] = set()
         for index, batch_prompt in enumerate(batches, start=1):
             batch_size = len(batch_prompt.encode("utf-8"))
             batch_field_count = sum(
@@ -4221,21 +4528,34 @@ def _request_ai_field_selection(cfg: PipelineConfig, candidates_path: Path) -> l
             )
             batch_fields: list[str] | None = None
             failures: list[Exception] = []
-            batch_transports = transports
-            if codex_circuit_open and "codex_cli" in batch_transports:
-                batch_transports = [
-                    item for item in batch_transports if item != "codex_cli"
-                ]
+            batch_transports = [
+                item for item in transports
+                if not (
+                    is_codex_transport(item)
+                    and models[item] in disabled_codex_models
+                )
+            ]
+            if len(batch_transports) != len(transports):
                 _log_dark_green(
-                    f"[AI字段][Codex熔断] batch={index}/{len(batches)} "
-                    "本次操作此前已发生 Codex CLI 错误，直接跳过并进入 HTTP AI。"
+                    f"[AI字段][模型熔断] batch={index}/{len(batches)} 跳过已失败的 "
+                    f"Codex 模型: {', '.join(sorted(disabled_codex_models))}。"
                 )
             for transport_index, request_transport in enumerate(batch_transports):
-                display_name = "Codex CLI" if request_transport == "codex_cli" else "HTTP AI"
+                display_name = (
+                    codex_display_name(request_transport, models[request_transport])
+                    if is_codex_transport(request_transport)
+                    else "DeepSeek"
+                )
                 if transport_index > 0:
+                    previous = batch_transports[transport_index - 1]
+                    previous_name = (
+                        codex_display_name(previous, models[previous])
+                        if is_codex_transport(previous)
+                        else "DeepSeek"
+                    )
                     _log_dark_green(
-                        f"[AI字段][AI回退] batch={index}/{len(batches)} Codex CLI 失败，"
-                        f"切换到 HTTP AI；同样最多重试 {AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS} 次。"
+                        f"[AI字段][AI回退] batch={index}/{len(batches)} {previous_name} 失败，"
+                        f"切换到 {display_name}；同样最多重试 {AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS} 次。"
                     )
                 for retry_round in range(0, AI_TRANSLATION_MAX_MISSING_RETRY_ROUNDS + 1):
                     label = (
@@ -4258,8 +4578,6 @@ def _request_ai_field_selection(cfg: PipelineConfig, candidates_path: Path) -> l
                             len(batches),
                             transport=request_transport,
                         )
-                        if not returned_fields:
-                            raise RuntimeError("AI 字段判断返回为空")
                         batch_fields = returned_fields
                         break
                     except Exception as exc:
@@ -4267,12 +4585,18 @@ def _request_ai_field_selection(cfg: PipelineConfig, candidates_path: Path) -> l
                         _log_dark_green(
                             f"[AI字段][AI重试] {display_name} {label}失败: {exc}"
                         )
-                        if request_transport == "codex_cli":
-                            codex_circuit_open = True
+                        if is_codex_transport(request_transport):
+                            disabled_codex_models.add(models[request_transport])
+                            remaining = batch_transports[transport_index + 1 :]
+                            next_name = (
+                                codex_display_name(remaining[0], models[remaining[0]])
+                                if remaining and is_codex_transport(remaining[0])
+                                else "DeepSeek" if "http" in remaining else "人工判断"
+                            )
                             _log_dark_green(
-                                f"[AI字段][Codex熔断] batch={index}/{len(batches)} "
-                                "Codex CLI 进程请求失败；本批立即切换 HTTP AI，"
-                                "本次操作的后续批次将全部跳过 Codex。"
+                                f"[AI字段][模型熔断] batch={index}/{len(batches)} "
+                                f"{display_name} 请求失败；本批切换到 {next_name}，"
+                                "后续批次仅跳过这个已失败模型。"
                             )
                             break
                 if batch_fields is not None:
@@ -4287,14 +4611,10 @@ def _request_ai_field_selection(cfg: PipelineConfig, candidates_path: Path) -> l
             for field in batch_fields:
                 if field not in fields:
                     fields.append(field)
-        if not fields:
-            return _manual_ai_field_selection(
-                cfg,
-                candidates_path,
-                "[返回为空] AI 接口没有返回任何可用字段，将改用人工判断。",
-                is_error=True,
-            )
-        _log_field_list("[AI字段] AI 自动返回字段", fields)
+        if fields:
+            _log_field_list("[AI字段] AI 自动返回字段", fields)
+        else:
+            _log("[AI字段] AI 已完成判断，本次没有选择任何 unknown 字段。")
         return fields
     except Exception as exc:
         return _manual_ai_field_selection(
@@ -4320,12 +4640,7 @@ def apply_ai_field_selection_to_records(cfg: PipelineConfig) -> None:
             "当 enable_ai_field_review=true 时，需要先运行脚本 0 扫描导出的 JSON，"
             "脚本 0 才会生成 string_field_review.txt。"
         )
-    selected_fields = _request_ai_field_selection(cfg, candidates_path)
-    if not selected_fields:
-        raise ValueError("AI 字段列表为空，未修改 records.json。")
 
-    selected_set = set(selected_fields)
-    valid_selectors, context_sensitive_fields = _load_ai_field_context_index(cfg)
     records, _ids_map, font_map, ref_map = scan_artifacts
     unfiltered_path = cfg.stage_record_dir / UNFILTERED_RECORDS_FILENAME
     if unfiltered_path.is_file():
@@ -4342,9 +4657,62 @@ def apply_ai_field_selection_to_records(cfg: PipelineConfig) -> None:
             f"[AI字段] 尚无 {UNFILTERED_RECORDS_FILENAME}；本次只能基于当前 records.json 筛选。"
             "重新运行脚本 0 后将自动生成完整备份。"
         )
+
+    valid_selectors, context_sensitive_fields = _load_ai_field_context_index(cfg)
+    local_decisions = _load_local_field_selector_decisions(cfg)
+    local_allowed = {
+        selector
+        for selector, decision in local_decisions.items()
+        if decision == "allow"
+    }
+    local_protected = {
+        selector
+        for selector, decision in local_decisions.items()
+        if decision == "protect"
+    }
+    review_selectors = _load_ai_field_review_selectors(candidates_path)
+    if records and not valid_selectors and not local_decisions:
+        raise RuntimeError(
+            "string_field_stats.json 缺失、损坏或与非空扫描记录不一致；"
+            "为避免空选择误删全部 records，请重新执行菜单 0 后再运行字段判断。"
+        )
+    if review_selectors:
+        selected_fields = _request_ai_field_selection(cfg, candidates_path)
+    else:
+        selected_fields = []
+        _log("[AI字段] 本地过滤后没有 unknown 字段，已跳过 AI 请求。")
+
+    accepted_ai_fields = [
+        field
+        for field in selected_fields
+        if field in review_selectors
+        and (not valid_selectors or field in valid_selectors)
+        and (
+            not local_decisions
+            or local_decisions.get(field, "unknown") == "unknown"
+        )
+    ]
+    invalid_selector_fields = [
+        field
+        for field in selected_fields
+        if valid_selectors and field not in valid_selectors
+    ]
+    rejected_ai_fields = [
+        field for field in selected_fields if field not in accepted_ai_fields
+    ]
+    if rejected_ai_fields:
+        _log_field_list(
+            "[AI字段] 已拒绝不属于本次 unknown 候选的 AI 返回字段",
+            rejected_ai_fields,
+        )
+    if selected_fields and not accepted_ai_fields:
+        raise RuntimeError(
+            "AI 返回字段与本次 unknown 候选完全不匹配，或返回了已被本地保护的字段。"
+            "请保留完整的 @@context_ 后缀后重试。"
+        )
+
+    selected_set = set(accepted_ai_fields) | local_allowed
     record_fields = unique_preserve_order(record.field for record in records)
-    matched_fields = [field for field in selected_fields if not valid_selectors or field in valid_selectors]
-    missing_fields = [field for field in selected_fields if valid_selectors and field not in valid_selectors]
     data_cache: dict[str, Any] = {}
     kept_records = [
         record for record in records
@@ -4354,22 +4722,19 @@ def apply_ai_field_selection_to_records(cfg: PipelineConfig) -> None:
             selected_set,
             context_sensitive_fields,
             data_cache,
+            local_decisions,
         )
     ]
     removed_count = len(records) - len(kept_records)
     _log(
         f"[AI字段] records 字段统计: 记录数={len(records)}，唯一字段={len(record_fields)}，"
-        f"上下文敏感字段={len(context_sensitive_fields)}，AI返回字段={len(selected_fields)}，"
-        f"命中字段={len(matched_fields)}，未命中字段={len(missing_fields)}"
+        f"上下文敏感字段={len(context_sensitive_fields)}，本地允许={len(local_allowed)}，"
+        f"本地保护={len(local_protected)}，AI候选={len(review_selectors)}，"
+        f"AI返回={len(selected_fields)}，AI采纳={len(accepted_ai_fields)}，"
+        f"拒绝字段={len(rejected_ai_fields)}"
     )
-    if missing_fields:
-        _log_field_list("[AI字段] AI 返回但 records 中未命中的字段", missing_fields)
-    if selected_fields and not matched_fields:
-        raise RuntimeError(
-            "AI 返回字段与本次字段候选完全不匹配。当前 records 很可能来自旧白名单扫描，"
-            "或上下文敏感字段的 @@context_ 后缀被删除。"
-            "请重新执行菜单 0，并选择清空旧记录后再执行菜单 1。"
-        )
+    if invalid_selector_fields:
+        _log_field_list("[AI字段] AI 返回但统计中不存在的字段", invalid_selector_fields)
     ids_map: dict[str, dict[str, Any]] = {}
     for record in kept_records:
         try:
@@ -4384,7 +4749,7 @@ def apply_ai_field_selection_to_records(cfg: PipelineConfig) -> None:
         f"[AI字段] 已按字段过滤 records.json: 原记录={len(records)}，"
         f"保留={len(kept_records)}，删除={removed_count}"
     )
-    _log_field_list("[AI字段] 本次保留字段", selected_fields)
+    _log_field_list("[AI字段] 本次保留字段", sorted(selected_set))
 
 
 def _load_ids_target_paths(cfg: PipelineConfig) -> list[Path]:
@@ -4432,6 +4797,20 @@ def _is_localization_shared_data_json(data: Any) -> bool:
         and "m_KeyGenerator" in data
         and "m_TableData" not in data
     )
+
+
+def _should_log_file_progress(index: int, total: int) -> bool:
+    if index <= 1 or index >= total:
+        return True
+    if total <= 20:
+        interval = 1
+    elif total <= 200:
+        interval = 10
+    elif total <= 2000:
+        interval = 50
+    else:
+        interval = 100
+    return index % interval == 0
 
 
 def _export_translated_files(
@@ -4497,20 +4876,38 @@ def _export_translated_files(
             file_records,
             final_translations,
         )
+        embedded_json_changes = apply_textasset_json_translations(
+            translated,
+            file_records,
+            final_translations,
+        )
         if embedded_changes:
             _log(
                 f"[导出][TextAsset CSV] {json_path.relative_to(cfg.resource_input_root)} "
                 f"已回写单元格: {embedded_changes}"
             )
+        if embedded_json_changes:
+            _log(
+                f"[导出][TextAsset JSON] {json_path.relative_to(cfg.resource_input_root)} "
+                f"已回写字段: {embedded_json_changes}"
+            )
         if translated == original:
-            _log(f"[导出] {index}/{len(json_files)} 无变化，跳过: {json_path.relative_to(cfg.resource_input_root)}")
+            if _should_log_file_progress(index, len(json_files)):
+                _log(
+                    f"[导出进度] {index}/{len(json_files)}，已写出={written_count}，"
+                    f"当前无变化: {json_path.relative_to(cfg.resource_input_root)}"
+                )
             continue
         relative = json_path.relative_to(cfg.resource_input_root)
         output_path = cfg.translated_dump_dir / relative
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(translated, ensure_ascii=False, indent=2), encoding="utf-8")
         written_count += 1
-        _log(f"[导出] {index}/{len(json_files)} {relative}")
+        if _should_log_file_progress(index, len(json_files)):
+            _log(
+                f"[导出进度] {index}/{len(json_files)}，已写出={written_count}，"
+                f"当前: {relative}"
+            )
     _log(f"[导出] 实际写出待替换 JSON: {written_count}/{len(json_files)}")
 
 
@@ -4583,7 +4980,7 @@ def disable_translated_text_effect_components(
         _log_blue(
             "[阴影描边][运行时绑定] 检测到 "
             f"{len(runtime_sources)} 个运行时文本来源（{', '.join(kinds)}）。"
-            "I2 TMP 字体和材质已由脚本 9 统一处理。"
+            "I2 TMP 字体和材质已由脚本 10 统一处理。"
         )
 
     component_paths: set[Path] = set()
@@ -4620,7 +5017,7 @@ def disable_translated_text_effect_components(
         _log_blue(
             "[材质阴影描边][I2保护] 已识别 "
             f"{len(i2_bound_material_sources)} 个 I2 绑定 TMP 材质；"
-            "脚本 5 将排除这些共享材质；I2 TMP 字体和材质由脚本 9 统一处理。"
+            "脚本 6 将排除这些共享材质；I2 TMP 字体和材质由脚本 10 统一处理。"
         )
 
     def add_game_object_components(key: tuple[str, int]) -> None:
@@ -4697,7 +5094,7 @@ def disable_translated_text_effect_components(
         if material_paths:
             _log(
                 f"[材质阴影描边] 已识别候选文本材质: {len(material_paths)} 个；"
-                "脚本 5 默认不写 Material 覆盖层，避免被 SDF 字体替换覆盖或影响共享材质。"
+                "脚本 6 默认不写 Material 覆盖层，避免被 SDF 字体替换覆盖或影响共享材质。"
             )
         material_paths = set()
     else:
@@ -5228,6 +5625,7 @@ def scan_and_record(cfg: PipelineConfig) -> None:
                     cfg,
                     str(scan_snapshot.get("input_fingerprint", "")),
                     fail_on_confirmed=True,
+                    json_files=json_files,
                 )
                 _log("[扫描] 输入与扫描规则未变化，已恢复未过滤 records 并直接复用完整扫描结果")
                 return
@@ -5248,6 +5646,7 @@ def scan_and_record(cfg: PipelineConfig) -> None:
                         cfg,
                         str(scan_snapshot.get("input_fingerprint", "")),
                         fail_on_confirmed=True,
+                        json_files=json_files,
                     )
                     return
                 else:
@@ -5270,6 +5669,7 @@ def scan_and_record(cfg: PipelineConfig) -> None:
                         cfg,
                         str(scan_snapshot.get("input_fingerprint", "")),
                         fail_on_confirmed=True,
+                        json_files=json_files,
                     )
                     _log("[扫描] 状态已完成，直接复用已保存的扫描记录")
                     return
@@ -5297,6 +5697,7 @@ def scan_and_record(cfg: PipelineConfig) -> None:
         cfg,
         str(scan_snapshot.get("input_fingerprint", "")),
         fail_on_confirmed=True,
+        json_files=json_files,
     )
     _log("[完成] 扫描和记录文件写入已结束")
 

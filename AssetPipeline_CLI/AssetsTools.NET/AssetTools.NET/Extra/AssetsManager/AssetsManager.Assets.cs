@@ -177,6 +177,7 @@ namespace AssetsTools.NET.Extra
 
             if (Files.Contains(fileInst))
             {
+                templateFieldCaches.TryRemove(fileInst, out _);
                 monoTypeTreeTemplateFieldCache.TryRemove(fileInst, out _);
                 monoCldbTemplateFieldCache.TryRemove(fileInst, out _);
                 refTypeManagerCache.TryRemove(fileInst, out _);
@@ -205,7 +206,7 @@ namespace AssetsTools.NET.Extra
         {
             if (clearCache)
             {
-                templateFieldCache.Clear();
+                templateFieldCaches.Clear();
                 monoTemplateFieldCache.Clear();
             }
 

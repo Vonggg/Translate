@@ -191,7 +191,10 @@ class AITranslationBatchToolTests(unittest.TestCase):
                 circuit_file,
             )
 
-        self.assertEqual(codex_request.call_count, 1)
+            self.assertEqual(
+                [call.kwargs["model"] for call in codex_request.call_args_list],
+                ["codex-model", "gpt-5.6-luna"],
+            )
         self.assertEqual(http_request.call_count, 2)
         self.assertTrue(circuit_file.is_file())
         self.assertTrue(self.response_path.is_file())

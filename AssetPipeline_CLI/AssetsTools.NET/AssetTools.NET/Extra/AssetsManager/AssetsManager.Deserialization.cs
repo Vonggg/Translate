@@ -58,10 +58,17 @@ namespace AssetsTools.NET.Extra
             int typeId, ushort scriptIndex, AssetReadFlags readFlags)
         {
             AssetTypeTemplateField baseField = null;
+            // Different files can carry different Unity versions or embedded
+            // type trees for the same ClassID. Never share their native template.
+            if (!templateFieldCaches.TryGetValue(inst, out ConcurrentDictionary<int, AssetTypeTemplateField> templateFieldCache))
+            {
+                templateFieldCaches[inst] = templateFieldCache = new ConcurrentDictionary<int, AssetTypeTemplateField>();
+            }
+            bool useTemplateCache = UseTemplateFieldCache && readFlags == AssetReadFlags.None;
 
             // if non-monobehaviour type is in cache, return the cached item
             bool isMonoBehaviourTypeId = typeId == (int)AssetClassID.MonoBehaviour || typeId < 0;
-            if (UseTemplateFieldCache && !isMonoBehaviourTypeId && templateFieldCache.TryGetValue(typeId, out baseField))
+            if (useTemplateCache && !isMonoBehaviourTypeId && templateFieldCache.TryGetValue(typeId, out baseField))
             {
                 return baseField;
             }
@@ -106,7 +113,7 @@ namespace AssetsTools.NET.Extra
 
                     if (baseField != null)
                     {
-                        if (UseTemplateFieldCache && !isMonoBehaviourTypeId)
+                        if (useTemplateCache && !isMonoBehaviourTypeId)
                         {
                             templateFieldCache[typeId] = baseField;
                         }
@@ -125,7 +132,7 @@ namespace AssetsTools.NET.Extra
             }
 
             // if we cached a monobehaviour from a class database, clone a copy
-            if (UseTemplateFieldCache && isMonoBehaviourTypeId)
+            if (useTemplateCache && isMonoBehaviourTypeId)
             {
                 if (templateFieldCache.TryGetValue((int)AssetClassID.MonoBehaviour, out baseField))
                 {
@@ -145,7 +152,14 @@ namespace AssetsTools.NET.Extra
 
                 int fixedTypeId = isMonoBehaviourTypeId ? (int)AssetClassID.MonoBehaviour : typeId;
 
-                ClassDatabaseType cldbType = ClassDatabase.FindAssetClassByID(fixedTypeId);
+                ClassDatabaseFile database = ClassDatabase;
+                if (ClassPackage != null && !string.IsNullOrEmpty(file.Metadata.UnityVersion))
+                {
+                    var fileVersion = new UnityVersion(file.Metadata.UnityVersion);
+                    if (database.Header.Version.ToUInt64() != fileVersion.ToUInt64())
+                        database = ClassPackage.GetClassDatabase(fileVersion);
+                }
+                ClassDatabaseType cldbType = database.FindAssetClassByID(fixedTypeId);
                 if (cldbType == null)
                 {
                     return null;
@@ -154,9 +168,9 @@ namespace AssetsTools.NET.Extra
                 bool preferEditor = Net35Polyfill.HasFlag(readFlags, AssetReadFlags.PreferEditor);
 
                 baseField = new AssetTypeTemplateField();
-                baseField.FromClassDatabase(ClassDatabase, cldbType, preferEditor);
+                baseField.FromClassDatabase(database, cldbType, preferEditor);
 
-                if (UseTemplateFieldCache)
+                if (useTemplateCache)
                 {
                     if (fixedTypeId == (int)AssetClassID.MonoBehaviour)
                     {

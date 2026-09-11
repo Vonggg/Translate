@@ -48,7 +48,7 @@ namespace AssetsTools.NET
             writer.Write(TypeFlags);
             writer.Write(MetaFlag);
 
-            writer.Write(SubNodes.Length);
+            writer.Write(checked((ushort)SubNodes.Length));
             for (int i = 0; i < SubNodes.Length; i++)
             {
                 writer.Write(SubNodes[i]);

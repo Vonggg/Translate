@@ -153,14 +153,7 @@ def _detect_ngui_node(value: Any) -> tuple[str, list[str]] | None:
     return None
 
 
-def _detect_json(path: Path, root: Path) -> list[dict[str, Any]]:
-    if not _contains_prefilter_marker(path):
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return []
-
+def _detect_json_data(data: Any, path: Path, root: Path) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for field_path, value in _iter_nodes(data):
@@ -199,6 +192,16 @@ def _detect_json(path: Path, root: Path) -> list[dict[str, Any]]:
                     }
                 )
     return results
+
+
+def _detect_json(path: Path, root: Path) -> list[dict[str, Any]]:
+    if not _contains_prefilter_marker(path):
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    return _detect_json_data(data, path, root)
 
 
 def _detect_fnt(path: Path, root: Path) -> list[dict[str, Any]]:
@@ -362,6 +365,89 @@ def detect_ngui_dynamic_ttf_labels(
     }
 
 
+def _detect_all_exported_font_features(
+    input_root: Path,
+    json_candidates: Iterable[Path] | None = None,
+) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+    """Detect all exported font modes with one directory walk and one read per JSON."""
+    candidates = (
+        list(json_candidates)
+        if json_candidates is not None
+        else collect_json_files(input_root)
+    )
+    detections: list[dict[str, Any]] = []
+    tmp_sdf_sources: list[str] = []
+    references: dict[tuple[int, int], dict[str, Any]] = {}
+    label_count = 0
+
+    for path in candidates:
+        parent_type = path.parent.name.lower()
+        if parent_type not in BITMAP_FONT_JSON_TYPES:
+            continue
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        lowered = raw.lower()
+        check_bitmap = any(marker in lowered for marker in _PREFILTER_MARKERS)
+        check_tmp = parent_type == "monobehaviour" and all(
+            marker in lowered
+            for marker in (b'"m_charactertable"', b'"m_glyphtable"', b'"m_faceinfo"')
+        )
+        check_dynamic_ttf = parent_type == "monobehaviour" and all(
+            marker in lowered
+            for marker in (b'"mtruetypefont"', b'"mfontsize"', b'"mtext"')
+        )
+        if not (check_bitmap or check_tmp or check_dynamic_ttf):
+            continue
+        try:
+            data = json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeError, json.JSONDecodeError):
+            continue
+
+        if check_bitmap:
+            detections.extend(_detect_json_data(data, path, input_root))
+        if check_tmp and any(
+            _looks_like_tmp_sdf_font(value) for _field_path, value in _iter_nodes(data)
+        ):
+            tmp_sdf_sources.append(_relative(path, input_root))
+        if (
+            check_dynamic_ttf
+            and isinstance(data, dict)
+            and isinstance(data.get("mText"), str)
+            and "mFontSize" in data
+            and "mTrueTypeFont" in data
+        ):
+            file_id, path_id = _pointer_ids(data.get("mTrueTypeFont"))
+            if path_id:
+                label_count += 1
+                row = references.setdefault(
+                    (file_id, path_id),
+                    {
+                        "file_id": file_id,
+                        "path_id": path_id,
+                        "component_count": 0,
+                        "sample_sources": [],
+                    },
+                )
+                row["component_count"] += 1
+                if len(row["sample_sources"]) < 10:
+                    row["sample_sources"].append(_relative(path, input_root))
+
+    for path in sorted(input_root.rglob("*.fnt")):
+        detections.extend(_detect_fnt(path, input_root))
+
+    rows = sorted(
+        references.values(),
+        key=lambda row: (-int(row["component_count"]), int(row["file_id"]), int(row["path_id"])),
+    )
+    return detections, tmp_sdf_sources, {
+        "label_count": label_count,
+        "reference_count": len(rows),
+        "references": rows,
+    }
+
+
 def _print_ngui_dynamic_ttf_notice(summary: dict[str, Any], *, reused: bool = False) -> None:
     label_count = int(summary.get("label_count", 0) or 0)
     if not label_count:
@@ -374,7 +460,7 @@ def _print_ngui_dynamic_ttf_notice(summary: dict[str, Any], *, reused: bool = Fa
         flush=True,
     )
     print(
-        "\033[93m[字体类型检测][NGUI动态TTF][后续需要] 汉化需要执行步骤 6 替换 TTF，"
+        "\033[93m[字体类型检测][NGUI动态TTF][后续需要] 汉化需要执行步骤 7 替换 TTF，"
         "并确认模板字体包含全部译文字符；不需要生成 NGUI 位图字形表或 UIAtlas。\033[0m",
         flush=True,
     )
@@ -425,6 +511,7 @@ def run_bitmap_font_detection(
     input_fingerprint: str = "",
     *,
     fail_on_confirmed: bool = False,
+    json_files: Iterable[Path] | None = None,
 ) -> Path:
     report_path = cfg.stage_record_dir / REPORT_FILENAME
     if input_fingerprint and report_path.is_file():
@@ -477,14 +564,9 @@ def run_bitmap_font_detection(
                 raise UnsupportedBitmapFontError(unsupported_count, report_path)
             return report_path
 
-    detections = detect_bitmap_fonts(cfg.resource_input_root, exported_resources_only=True)
-    tmp_sdf_sources = detect_tmp_sdf_font_assets(
+    detections, tmp_sdf_sources, dynamic_ttf_summary = _detect_all_exported_font_features(
         cfg.resource_input_root,
-        exported_resources_only=True,
-    )
-    dynamic_ttf_summary = detect_ngui_dynamic_ttf_labels(
-        cfg.resource_input_root,
-        exported_resources_only=True,
+        json_files,
     )
     summary = _summarize_detections(detections)
     confirmed = summary["confirmed_count"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import math
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -199,6 +200,57 @@ class ObjectHierarchyPreviewLayoutTests(unittest.TestCase):
         self.assertIn("command=lambda item=region: show_resource_names(item)", source)
         self.assertNotIn('text="屏蔽此层级"', source)
         self.assertNotIn('text="取消屏蔽此层级"', source)
+
+    def test_hierarchy_field_editor_stages_scalar_override_for_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "input"
+            source = source_root / "bundle" / "MonoBehaviour" / "114_7_7.json"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                json.dumps(
+                    {
+                        "m_Script": {"m_FileID": 1, "m_PathID": 2},
+                        "mText": "50",
+                        "mFontSize": 24,
+                        "mColor": {"r": 1.0, "g": 0.5},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            import_root = root / "output" / "Object" / "ToImport"
+            with patch.object(TOOLS, "DEFAULT_SOURCE_ROOT", source_root), patch.object(
+                TOOLS, "DEFAULT_OBJECT_TO_IMPORT_ROOT", import_root
+            ):
+                target, old_value, new_value = TOOLS.write_object_component_field_override(
+                    source, "mText", "2"
+                )
+                TOOLS.write_object_component_field_override(source, "mFontSize", "30")
+
+            self.assertEqual((old_value, new_value), ("50", "2"))
+            self.assertEqual(target, import_root / "bundle" / "MonoBehaviour" / "114_7_7.json")
+            staged = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(staged["mText"], "2")
+            self.assertEqual(staged["mFontSize"], 30)
+            self.assertEqual(staged["m_Script"], {"m_FileID": 1, "m_PathID": 2})
+
+    def test_hierarchy_field_editor_excludes_object_pointers(self) -> None:
+        fields = dict(
+            TOOLS._iter_editable_object_fields(
+                {
+                    "mText": "50",
+                    "mScript": {"m_FileID": 1, "m_PathID": 2},
+                    "mColor": {"r": 1.0},
+                    "m_Items": {"Array": ["not editable"]},
+                }
+            )
+        )
+        self.assertEqual(fields, {"mText": "50", "mColor.r": 1.0})
+        source = (Path(__file__).resolve().parents[1] / "工具脚本.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('label="修改此层级显示文本…"', source)
+        self.assertIn("write_object_component_field_override", source)
 
     def test_preview_resource_query_reports_sprite_and_texture_names(self) -> None:
         scope = {
@@ -593,6 +645,20 @@ class ObjectHierarchyPreviewLayoutTests(unittest.TestCase):
             TOOLS._rect_transform_child_rect(transform, (0, 0, 800, 600)),
             (360.0, 300.0, 100.0, 40.0),
         )
+
+    def test_rect_transform_replaces_serialized_nan_with_field_defaults(self) -> None:
+        transform = {
+            "m_AnchorMin": {"x": "NaN", "y": "NaN"},
+            "m_AnchorMax": {"x": "NaN", "y": "NaN"},
+            "m_AnchoredPosition": {"x": "NaN", "y": "NaN"},
+            "m_SizeDelta": {"x": 100, "y": 40},
+            "m_Pivot": {"x": "NaN", "y": "NaN"},
+        }
+
+        rect = TOOLS._rect_transform_child_rect(transform, (0, 0, 800, 600))
+
+        self.assertEqual(rect, (350.0, 280.0, 100.0, 40.0))
+        self.assertTrue(all(math.isfinite(value) for value in rect))
 
     def test_stretched_rect_uses_anchor_span_and_negative_size_delta(self) -> None:
         transform = {

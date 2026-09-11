@@ -66,6 +66,7 @@ def build_command(args: argparse.Namespace, repo_root: Path) -> list[str]:
     if args.mode == "import":
         command.extend(["--import-workers", str(args.import_workers)])
         command.extend(["--save-samples", str(args.save_samples).lower()])
+        command.extend(["--verbose-import-assets", str(args.verbose_import_assets).lower()])
     return command
 
 
@@ -147,6 +148,11 @@ def parse_args() -> argparse.Namespace:
         "--save-samples",
         action="store_true",
         help="Save diagnostic samples. Disabled by default because samples can be very large.",
+    )
+    parser.add_argument(
+        "--verbose-import-assets",
+        action="store_true",
+        help="Print one log line for every imported asset. Disabled by default.",
     )
     parser.add_argument(
         "--export-profile",

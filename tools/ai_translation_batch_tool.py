@@ -14,7 +14,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from support.config import load_config
 from pipeline.ai_translation_strategy import get_strategy
-from pipeline.codex_cli_provider import request_structured_output, translation_schema
+from pipeline.codex_cli_provider import (
+    codex_display_name,
+    codex_transport_models,
+    is_codex_transport,
+    request_structured_output,
+    translation_schema,
+)
 from pipeline.shared import atomic_write_json, read_json, write_json
 from pipeline.translation import _ai_translation_transport_chain
 
@@ -259,30 +265,44 @@ def resend_batch(
         getattr(cfg, "ai_translation_transport", "http") or "http"
     ).strip().lower()
     transports = _ai_translation_transport_chain(cfg)
-    codex_skipped_by_circuit = bool(
-        codex_circuit_file is not None
-        and codex_circuit_file.is_file()
-        and "codex_cli" in transports
+    models = codex_transport_models(
+        str(getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark"))
     )
+    models["http"] = str(cfg.ai_translation_model).strip()
+    disabled_codex_models: set[str] = set()
+    if codex_circuit_file is not None and codex_circuit_file.is_file():
+        try:
+            circuit_data = read_json(codex_circuit_file)
+            disabled_codex_models.update(
+                str(model)
+                for model in circuit_data.get("disabled_models", [])
+                if str(model).strip()
+            )
+            if circuit_data.get("open") and not disabled_codex_models:
+                disabled_codex_models.update(
+                    models[item] for item in transports if is_codex_transport(item)
+                )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            disabled_codex_models.update(
+                models[item] for item in transports if is_codex_transport(item)
+            )
+    original_transports = list(transports)
+    transports = [
+        item for item in transports
+        if not (is_codex_transport(item) and models[item] in disabled_codex_models)
+    ]
+    codex_skipped_by_circuit = len(transports) != len(original_transports)
     if codex_skipped_by_circuit:
-        transports = [item for item in transports if item != "codex_cli"]
         log(
-            "[AI补批][Codex熔断] 本次批量操作此前已发生 Codex CLI 错误，"
-            "直接跳过并进入 HTTP AI。"
+            "[AI补批][模型熔断] 跳过本次批量操作中已失败的 Codex 模型: "
+            + ", ".join(sorted(disabled_codex_models))
         )
     base_url = cfg.ai_translation_base_url.strip().rstrip("/")
     api_key = cfg.ai_translation_api_key.strip()
     if not transports:
-        raise RuntimeError("Codex CLI 和 HTTP AI 均不可用或配置不完整，无法重发批次。")
+        raise RuntimeError("Codex CLI 和 DeepSeek 均不可用或配置不完整，无法重发批次。")
 
     original_payload = read_json(request_path)
-    models = {
-        "codex_cli": str(
-            getattr(cfg, "ai_translation_codex_model", "gpt-5.3-codex-spark")
-        ).strip(),
-        "http": str(cfg.ai_translation_model).strip(),
-    }
-
     proxies = {
         key: value
         for key, value in {
@@ -303,7 +323,7 @@ def resend_batch(
         and transports[0] == "http"
         and not codex_skipped_by_circuit
     ):
-        log("[AI补批][AI回退] Codex CLI 不可用，直接切换到 HTTP AI。")
+        log("[AI补批][AI回退] Codex CLI 不可用，直接切换到 DeepSeek。")
 
     id_to_source = load_request_items(request_path)
     pending_items = list(id_to_source.items())
@@ -335,7 +355,7 @@ def resend_batch(
             f"条目={len(sub_batch)}，输入字符={user_content_size}，预计输出={estimated_output}"
         )
         payload = make_batch_payload(cfg, strategy, model, sub_batch, sub_index, sub_count)
-        if request_transport == "codex_cli":
+        if is_codex_transport(request_transport):
             started_at = time.monotonic()
             structured, usage = request_structured_output(
                 model=model,
@@ -361,7 +381,10 @@ def resend_batch(
                 "usage": usage,
             }
             elapsed = int(time.monotonic() - started_at)
-            log_green(f"[AI补批] {label} Codex CLI 已响应，耗时={elapsed} 秒")
+            log_green(
+                f"[AI补批] {label} {codex_display_name(request_transport, model)} "
+                f"已响应，耗时={elapsed} 秒"
+            )
         else:
             data = post_ai_payload(
                 payload,
@@ -402,11 +425,21 @@ def resend_batch(
         ]
         if not missing_items:
             break
-        display_name = "Codex CLI" if request_transport == "codex_cli" else "HTTP AI"
+        display_name = (
+            codex_display_name(request_transport, models[request_transport])
+            if is_codex_transport(request_transport)
+            else "DeepSeek"
+        )
         if transport_index > 0:
+            previous = transports[transport_index - 1]
+            previous_name = (
+                codex_display_name(previous, models[previous])
+                if is_codex_transport(previous)
+                else "DeepSeek"
+            )
             log(
-                f"[AI补批][AI回退] Codex CLI 仍缺少 {len(missing_items)} 条，"
-                f"切换到 HTTP AI；同样最多重试 {MAX_MISSING_RETRY_ROUNDS} 次。"
+                f"[AI补批][AI回退] {previous_name} 仍缺少 {len(missing_items)} 条，"
+                f"切换到 {display_name}；同样最多重试 {MAX_MISSING_RETRY_ROUNDS} 次。"
             )
         codex_transport_failed = False
         for retry_round in range(0, MAX_MISSING_RETRY_ROUNDS + 1):
@@ -440,16 +473,31 @@ def resend_batch(
                 except Exception as exc:
                     last_error = exc
                     log(f"[AI补批][AI重试] {label}失败: {exc}")
-                    if request_transport == "codex_cli":
+                    if is_codex_transport(request_transport):
                         codex_transport_failed = True
+                        disabled_codex_models.add(models[request_transport])
                         if codex_circuit_file is not None:
                             atomic_write_json(
                                 codex_circuit_file,
-                                {"open": True, "reason": str(exc)},
+                                {
+                                    "open": not any(
+                                        is_codex_transport(item)
+                                        and models[item] not in disabled_codex_models
+                                        for item in transports[transport_index + 1 :]
+                                    ),
+                                    "disabled_models": sorted(disabled_codex_models),
+                                    "reason": str(exc),
+                                },
                             )
+                        remaining = transports[transport_index + 1 :]
+                        next_name = (
+                            codex_display_name(remaining[0], models[remaining[0]])
+                            if remaining and is_codex_transport(remaining[0])
+                            else "DeepSeek" if "http" in remaining else "失败"
+                        )
                         log(
-                            "[AI补批][Codex熔断] Codex CLI 进程请求失败；"
-                            "本批立即切换 HTTP AI，本次操作的后续批次将全部跳过 Codex。"
+                            f"[AI补批][模型熔断] {display_name} 请求失败；"
+                            f"本批切换到 {next_name}，后续批次仅跳过这个已失败模型。"
                         )
                         break
                     continue

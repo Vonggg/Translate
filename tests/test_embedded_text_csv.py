@@ -54,6 +54,153 @@ class EmbeddedTextCsvTests(unittest.TestCase):
             self.assertIsNotNone(restored)
             self.assertEqual(restored.embedded_locator, result["records"][0].embedded_locator)
 
+    def test_textasset_json_is_scanned_and_runtime_identifiers_are_protected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cfg = self._cfg(root)
+            json_path = cfg.resource_input_root / "bundle" / "TextAsset" / "QwestData_1.json"
+            json_path.parent.mkdir(parents=True)
+            script_payload = {
+                "$content": [
+                    {
+                        "QwestTitle": "Kill fatso",
+                        "TasksList": [
+                            {
+                                "TaskText": "Find the target",
+                                "SpecificVehicleName": "ZBird",
+                            }
+                        ],
+                        "$type": "Game.GlobalComponent.Qwest.Qwest",
+                    }
+                ]
+            }
+            json_path.write_text(
+                json.dumps(
+                    {
+                        "m_Name": "QwestData",
+                        "m_Script": json.dumps(script_payload, separators=(",", ":")),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = _scan_one_translation_json(cfg, json_path, {}, {}, {})
+
+            self.assertIsNone(result["error"])
+            sources = {record.source_text for record in result["records"]}
+            self.assertIn("Kill fatso", sources)
+            self.assertIn("Find the target", sources)
+            self.assertNotIn("ZBird", sources)
+            title_record = next(
+                record for record in result["records"] if record.source_text == "Kill fatso"
+            )
+            self.assertEqual(
+                title_record.field,
+                "m_Script.json.$content[].QwestTitle",
+            )
+
+    def test_export_rewrites_only_selected_textasset_json_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cfg = self._cfg(root)
+            json_path = cfg.resource_input_root / "bundle" / "TextAsset" / "QwestData_1.json"
+            json_path.parent.mkdir(parents=True)
+            script_payload = {
+                "$content": [
+                    {
+                        "QwestTitle": "Kill fatso",
+                        "TaskText": "Find the target",
+                        "SpecificVehicleName": "ZBird",
+                    }
+                ]
+            }
+            json_path.write_text(
+                json.dumps(
+                    {
+                        "m_Name": "QwestData",
+                        "m_Script": json.dumps(script_payload, separators=(",", ":")),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            scan_result = _scan_one_translation_json(cfg, json_path, {}, {}, {})
+            title_record = next(
+                record
+                for record in scan_result["records"]
+                if record.source_text == "Kill fatso"
+            )
+
+            _export_translated_files(
+                cfg,
+                {
+                    "Kill fatso": "杀死胖子",
+                    "Find the target": "不应写回",
+                    "ZBird": "不应修改逻辑标识",
+                },
+                [json_path],
+                [title_record],
+            )
+
+            output_path = cfg.translated_dump_dir / json_path.relative_to(cfg.resource_input_root)
+            output = json.loads(output_path.read_text(encoding="utf-8"))
+            rebuilt = json.loads(output["m_Script"])
+            row = rebuilt["$content"][0]
+            self.assertEqual(row["QwestTitle"], "杀死胖子")
+            self.assertEqual(row["TaskText"], "Find the target")
+            self.assertEqual(row["SpecificVehicleName"], "ZBird")
+
+    def test_nested_json_strings_are_scanned_and_rebuilt_by_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cfg = self._cfg(root)
+            json_path = cfg.resource_input_root / "bundle" / "TextAsset" / "QwestData_2.json"
+            json_path.parent.mkdir(parents=True)
+            nested_dialog = json.dumps(
+                {
+                    "DialogName": "start_1",
+                    "Replics": [{"Actor": "Jackson", "Replica": "Get in the car."}],
+                    "$type": "Game.DialogSystem.Dialog",
+                },
+                separators=(",", ":"),
+            )
+            json_path.write_text(
+                json.dumps(
+                    {
+                        "m_Name": "QwestData",
+                        "m_Script": json.dumps(
+                            {"$content": [{"StartDialog": nested_dialog}]},
+                            separators=(",", ":"),
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = _scan_one_translation_json(cfg, json_path, {}, {}, {})
+            sources = {record.source_text for record in result["records"]}
+            self.assertEqual(sources, {"Jackson", "Get in the car."})
+            replica_record = next(
+                record for record in result["records"] if record.source_text == "Get in the car."
+            )
+            self.assertEqual(
+                replica_record.field,
+                "m_Script.json.$content[].StartDialog.json.Replics[].Replica",
+            )
+
+            _export_translated_files(
+                cfg,
+                {"Get in the car.": "上车。", "Jackson": "杰克逊"},
+                [json_path],
+                [replica_record],
+            )
+            output_path = cfg.translated_dump_dir / json_path.relative_to(cfg.resource_input_root)
+            output = json.loads(output_path.read_text(encoding="utf-8"))
+            outer = json.loads(output["m_Script"])
+            dialog = json.loads(outer["$content"][0]["StartDialog"])
+            self.assertEqual(dialog["Replics"][0]["Replica"], "上车。")
+            self.assertEqual(dialog["Replics"][0]["Actor"], "Jackson")
+            self.assertEqual(dialog["DialogName"], "start_1")
+
     def test_export_rewrites_only_selected_csv_cells(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

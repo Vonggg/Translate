@@ -5,13 +5,54 @@ import os
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
 
+DEFAULT_CODEX_PRIMARY_MODEL = "gpt-5.3-codex-spark"
+DEFAULT_CODEX_FALLBACK_MODEL = "gpt-5.6-luna"
+CODEX_PRIMARY_TRANSPORT = "codex_cli"
+CODEX_FALLBACK_TRANSPORT = "codex_cli_fallback"
+
+
+def is_codex_transport(transport: str) -> bool:
+    return transport in {CODEX_PRIMARY_TRANSPORT, CODEX_FALLBACK_TRANSPORT}
+
+
+def codex_transport_models(
+    primary_model: str | None,
+    fallback_model: str | None = None,
+) -> dict[str, str]:
+    """Return the global Codex priority chain, de-duplicated by model id."""
+
+    primary = str(primary_model or DEFAULT_CODEX_PRIMARY_MODEL).strip()
+    fallback = str(fallback_model or DEFAULT_CODEX_FALLBACK_MODEL).strip()
+    result: dict[str, str] = {}
+    if primary:
+        result[CODEX_PRIMARY_TRANSPORT] = primary
+    if fallback and fallback not in result.values():
+        result[CODEX_FALLBACK_TRANSPORT] = fallback
+    return result
+
+
+def codex_display_name(transport: str, model: str) -> str:
+    if transport == CODEX_PRIMARY_TRANSPORT:
+        return f"Codex 5.3 ({model})"
+    if transport == CODEX_FALLBACK_TRANSPORT:
+        return f"Codex 5.6 ({model})"
+    return "DeepSeek"
+
+
 class CodexCLIError(RuntimeError):
     """Raised when a non-interactive Codex CLI request cannot be completed."""
+
+
+class CodexCLISkipped(CodexCLIError):
+    """Raised when the operator asks to skip the active Codex model."""
 
 
 def find_codex_cli() -> str | None:
@@ -80,6 +121,26 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
         pass
 
 
+def _user_requested_model_skip() -> bool:
+    """Consume a pending S/N key from an interactive Windows console."""
+
+    if os.name != "nt" or not getattr(sys.stdin, "isatty", lambda: False)():
+        return False
+    try:
+        import msvcrt
+
+        if not msvcrt.kbhit():
+            return False
+        key = msvcrt.getwch()
+        if key in {"\x00", "\xe0"}:
+            if msvcrt.kbhit():
+                msvcrt.getwch()
+            return False
+        return key.lower() in {"s", "n"}
+    except (ImportError, OSError):
+        return False
+
+
 def _run_codex_process(
     command: list[str],
     prompt: str,
@@ -100,14 +161,53 @@ def _run_codex_process(
 
     process = subprocess.Popen(command, **popen_kwargs)
     print(
-        f"[Codex CLI] 已启动 PID={process.pid}，最长等待={timeout} 秒；超时将自动终止并停止后续流程。",
+        f"[Codex CLI] 已启动 PID={process.pid}，最长等待={timeout} 秒；"
+        "等待期间按 S 或 N 可跳过当前模型并立即尝试下一模型。",
         flush=True,
     )
+
+    result: dict[str, Any] = {}
+    finished = threading.Event()
+
+    def communicate() -> None:
+        try:
+            result["streams"] = process.communicate(input=prompt, timeout=timeout)
+        except BaseException as exc:  # Propagate worker failures in the calling thread.
+            result["error"] = exc
+        finally:
+            finished.set()
+
+    worker = threading.Thread(
+        target=communicate,
+        name=f"codex-cli-{process.pid}",
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + timeout
     try:
-        stdout, stderr = process.communicate(input=prompt, timeout=timeout)
-    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        while not finished.wait(timeout=0.1):
+            if _user_requested_model_skip():
+                print(
+                    f"[Codex CLI][手动跳过] 正在终止 PID={process.pid}；将切换到下一模型。",
+                    flush=True,
+                )
+                _terminate_process_tree(process)
+                finished.wait(timeout=5)
+                raise CodexCLISkipped("用户手动跳过当前 Codex 模型。")
+            if time.monotonic() >= deadline:
+                _terminate_process_tree(process)
+                finished.wait(timeout=5)
+                raise subprocess.TimeoutExpired(command, timeout)
+    except KeyboardInterrupt:
         _terminate_process_tree(process)
         raise
+
+    error = result.get("error")
+    if isinstance(error, BaseException):
+        if isinstance(error, subprocess.TimeoutExpired):
+            _terminate_process_tree(process)
+        raise error
+    stdout, stderr = result.get("streams", ("", ""))
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import difflib
 import json
 import hashlib
@@ -12,10 +13,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-from support.config import activate_config_path, load_config
+from support.config import activate_config_path, load_config, resolve_config_path
 from support.image_restore import load_allpng_map
 from support.menu_selection import parse_number_ranges
 from support.script_output_cleanup import (
@@ -27,12 +29,26 @@ from support.script_output_cleanup import (
     load_script_output_manifest,
     target_size,
 )
+from support.suspicious_encoded_data_scan import scan_project_suspicious_encoded_data
+from support.image_color_filter import (
+    COMMON_COLOR_RANGES,
+    HsvRange,
+    filter_images_by_hsv_ranges,
+)
 from pipeline.ai_translation_strategy import get_strategy
 from pipeline.codex_cli_provider import (
+    codex_display_name,
     codex_cli_available,
+    codex_transport_models,
+    is_codex_transport,
     request_structured_output,
 )
 from pipeline.shared import atomic_write_json
+from pipeline.dynamic_translation_dictionary import (
+    DYNAMIC_DICTIONARY_CPP_FILENAME,
+    DYNAMIC_DICTIONARY_OUTPUT_SUBDIR,
+    write_trans_json_to_whole_text_dictionary,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -104,7 +120,9 @@ DEFAULT_ALL_SPRITE_PNG_ROOT = DEFAULT_ALL_SPRITE_ROOT / "PNG"
 DEFAULT_ALL_SPRITE_MAP = DEFAULT_ALL_SPRITE_ROOT / "_allsprite_map.json"
 DEFAULT_MISSING_TTF_CHARS_FILE = DEFAULT_RECORD_ROOT / "translation_chars_missing_from_ttf.txt"
 DEFAULT_TRANS_JSON = DEFAULT_RECORD_ROOT / "trans.json"
+DEFAULT_DYNAMIC_TRANS_JSON = DEFAULT_RECORD_ROOT / "stringliteral_trans.json"
 DEFAULT_RECORDS_JSON = DEFAULT_RECORD_ROOT / "records.json"
+DEFAULT_UNFILTERED_RECORDS_JSON = DEFAULT_RECORD_ROOT / "records_unfiltered.json"
 FIND_PATH_ID_SCRIPT = SCRIPT_DIR / "support" / "查找PathID文件.py"
 FIND_ASSET_NAME_SCRIPT = SCRIPT_DIR / "support" / "查找资源名文件.py"
 AI_TRANSLATION_BATCH_TOOL = SCRIPT_DIR / "tools" / "ai_translation_batch_tool.py"
@@ -225,6 +243,192 @@ def prompt_text(label: str) -> str:
         print("输入不能为空，请重新输入。")
 
 
+def project_text_search_roots(cfg) -> list[tuple[str, Path]]:
+    """Return the workspace and raw-project roots useful for text discovery."""
+    project_root = cfg.project_dir / "game-name"
+    assets_root = cfg.resource_source_root
+    while assets_root.name.casefold() != "assets" and assets_root.parent != assets_root:
+        assets_root = assets_root.parent
+    candidates = [
+        ("工作区导出 input", DEFAULT_SOURCE_ROOT),
+        ("工作区记录", DEFAULT_RECORD_ROOT),
+        ("原始游戏 assets", assets_root),
+        ("渠道游戏 assets", project_root / "GAME_hongtu_L" / "assets"),
+        ("IL2CPP 备份/文本记录", project_root / "bak" / "64"),
+    ]
+    roots: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    for label, path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if not resolved.is_dir() or resolved in seen:
+            continue
+        seen.add(resolved)
+        roots.append((label, resolved))
+    return roots
+
+
+def _configured_python_executable() -> Path:
+    """Read python_executable from the active launcher config when available."""
+    try:
+        config_path = resolve_config_path()
+        config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        configured = Path(str(config_data.get("python_executable", "") or ""))
+        if configured and not configured.is_absolute():
+            configured = SCRIPT_DIR / configured
+        if configured.is_file():
+            return configured
+    except (OSError, ValueError, json.JSONDecodeError, AttributeError):
+        pass
+    return Path(sys.executable)
+
+
+def _ensure_virtualenv_ripgrep() -> str | None:
+    """Use rg.exe installed beside the configured virtualenv Python only."""
+    python_executable = _configured_python_executable()
+    executable_name = "rg.exe" if os.name == "nt" else "rg"
+    rg_executable = python_executable.parent / executable_name
+    if rg_executable.is_file():
+        return str(rg_executable)
+    print(
+        f"[全项目搜索] 当前虚拟环境缺少 {executable_name}，正在安装 ripgrep-bin: "
+        f"{python_executable}",
+        flush=True,
+    )
+    try:
+        result = subprocess.run(
+            [str(python_executable), "-m", "pip", "install", "ripgrep-bin"],
+            check=False,
+        )
+    except OSError as exc:
+        print(f"[全项目搜索][错误] 无法调用虚拟环境 pip: {exc}")
+        return None
+    if result.returncode != 0 or not rg_executable.is_file():
+        print(
+            "[全项目搜索][错误] ripgrep-bin 安装失败，"
+            "将回退 Python 搜索。"
+        )
+        return None
+    print(f"[全项目搜索] 已安装虚拟环境 rg: {rg_executable}", flush=True)
+    return str(rg_executable)
+
+
+def _python_project_text_search(
+    needle: str,
+    roots: list[tuple[str, Path]],
+) -> list[str]:
+    """Small dependency-free fallback for exact project text lookup."""
+    needle_bytes = needle.encode("utf-8")
+    folded_needle = needle_bytes.lower()
+    case_sensitive = any("A" <= char <= "Z" for char in needle)
+    text_suffixes = {
+        ".csv", ".tsv", ".txt", ".json", ".xml", ".yaml", ".yml",
+        ".ini", ".cfg", ".config", ".cs", ".cpp", ".c", ".h", ".md",
+    }
+    matches: list[str] = []
+    scanned = 0
+    for _label, root in roots:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            scanned += 1
+            if scanned == 1 or scanned % 2000 == 0:
+                print(f"[全项目搜索][回退] 已扫描文件: {scanned}，命中: {len(matches)}", flush=True)
+            try:
+                if path.suffix.casefold() in text_suffixes:
+                    with path.open("rb") as stream:
+                        for line_number, line in enumerate(stream, start=1):
+                            haystack = line if case_sensitive else line.lower()
+                            if folded_needle in haystack:
+                                preview = line.decode("utf-8", errors="replace").rstrip()
+                                matches.append(f"{path}:{line_number}:{preview}")
+                    continue
+                # A resource/binary can contain a useful plain UTF-8 literal.
+                # Report its byte position instead of attempting to treat a
+                # potentially gigantic binary section as one text line.
+                with path.open("rb") as stream:
+                    previous = b""
+                    offset = 0
+                    while True:
+                        chunk = stream.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        haystack = previous + chunk
+                        probe = haystack if case_sensitive else haystack.lower()
+                        position = probe.find(folded_needle)
+                        if position >= 0:
+                            byte_offset = offset - len(previous) + position
+                            matches.append(f"{path}:byte {byte_offset}: [二进制文本命中]")
+                            break
+                        keep = max(0, len(needle_bytes) - 1)
+                        previous = haystack[-keep:] if keep else b""
+                        offset += len(chunk)
+            except OSError:
+                continue
+    return matches
+
+
+def run_project_text_search() -> None:
+    """Search exported data and raw project assets with one exact rg query."""
+    print()
+    print("全项目文本搜索")
+    print("说明: 先查 workspace/input 与记录，再查原始 game assets、渠道 assets 和 bak/64。")
+    print("      支持原始二进制文本扫描；结果仅用于定位，原项目目录命中不会自动加入导入。")
+    print()
+    needle = prompt_text("请输入要精确搜索的文本")
+    try:
+        cfg = load_config(quiet=True)
+    except Exception as exc:
+        print(f"[全项目搜索][错误] 无法读取当前项目配置: {exc}")
+        return
+    roots = project_text_search_roots(cfg)
+    if not roots:
+        print("[全项目搜索][错误] 没有可搜索的工作区或项目目录。")
+        return
+    print("[全项目搜索] 范围:")
+    for label, root in roots:
+        print(f"  - {label}: {root}")
+    rg_executable = _ensure_virtualenv_ripgrep()
+    if rg_executable:
+        command = [
+            rg_executable, "-a", "-n", "-S", "-F", "--no-heading", "--color", "never",
+            needle,
+            *(str(root) for _label, root in roots),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as exc:
+            print(f"[全项目搜索][提示] rg 无法启动，回退 Python 搜索: {exc}")
+            lines = _python_project_text_search(needle, roots)
+        else:
+            if result.returncode not in {0, 1}:
+                print(f"[全项目搜索][提示] rg 失败，回退 Python 搜索: {result.stderr.strip()}")
+                lines = _python_project_text_search(needle, roots)
+            else:
+                lines = [line for line in result.stdout.splitlines() if line]
+    else:
+        print("[全项目搜索][提示] 未找到 rg.exe，回退 Python 搜索。")
+        lines = _python_project_text_search(needle, roots)
+    if not lines:
+        print("[全项目搜索] 未找到匹配文本。")
+        return
+    preview_limit = 300
+    print(f"[全项目搜索] 命中 {len(lines)} 行:")
+    for line in lines[:preview_limit]:
+        print(line)
+    if len(lines) > preview_limit:
+        print(f"[全项目搜索] 其余 {len(lines) - preview_limit} 行已省略。")
+
+
 def run_search_copy() -> None:
     print()
     print("查找 JSON 并复制到手动替换")
@@ -339,11 +543,23 @@ def reset_allpng_generated_content(
     allpng_root: Path,
     edited_root: Path,
     block_image_root: Path | None = None,
+    sprite_root: Path | None = None,
 ) -> None:
-    """Clear generated AllPNG content without deleting user-maintained work directories."""
+    """Refresh flat exports while retaining editable work and Sprite mappings.
+
+    A translated Sprite in ``修改后的图片目录`` is only a cropped image; its
+    reassembly coordinates live under ``AllPNG/Sprite``.  Retain that mapping
+    when refreshing the ordinary Texture2D export, otherwise an image import
+    can no longer put existing Sprite edits back into their atlas.
+    """
     allpng_root.mkdir(parents=True, exist_ok=True)
     block_image_root = block_image_root or (allpng_root / "屏蔽object")
-    preserved_roots = {edited_root.resolve(), block_image_root.resolve()}
+    sprite_root = sprite_root or (allpng_root / "Sprite")
+    preserved_roots = {
+        edited_root.resolve(),
+        block_image_root.resolve(),
+        sprite_root.resolve(),
+    }
     for child in allpng_root.iterdir():
         if child.resolve() in preserved_roots:
             continue
@@ -355,7 +571,7 @@ def reset_allpng_generated_content(
     block_image_root.mkdir(parents=True, exist_ok=True)
 
 
-def run_copy_all_images() -> None:
+def run_copy_all_images() -> int:
     print()
     print("一键复制导出图片到 AllPNG")
     print(f"源目录: {DEFAULT_SOURCE_ROOT}")
@@ -366,7 +582,7 @@ def run_copy_all_images() -> None:
 
     if not DEFAULT_SOURCE_ROOT.is_dir():
         print(f"源目录不存在: {DEFAULT_SOURCE_ROOT}")
-        return
+        return 1
 
     if DEFAULT_ALL_IMAGE_ROOT.exists():
         print(f"正在刷新生成内容（保留用户工作目录）: {DEFAULT_ALL_IMAGE_ROOT}")
@@ -374,13 +590,17 @@ def run_copy_all_images() -> None:
         DEFAULT_ALL_IMAGE_ROOT,
         DEFAULT_EDITED_IMAGE_ROOT,
         DEFAULT_BLOCK_IMAGE_ROOT,
+        DEFAULT_ALL_SPRITE_ROOT,
     )
     DEFAULT_ALL_IMAGE_PNG_ROOT.mkdir(parents=True, exist_ok=True)
     copied = copy_all_images(DEFAULT_SOURCE_ROOT, DEFAULT_ALL_IMAGE_PNG_ROOT, DEFAULT_ALL_IMAGE_MAP)
     print(f"完成，已复制 {copied} 个图片到: {DEFAULT_ALL_IMAGE_PNG_ROOT}")
     print(f"映射已写入: {DEFAULT_ALL_IMAGE_MAP}")
+    if DEFAULT_ALL_SPRITE_MAP.is_file():
+        print("已保留已拆分 Sprite 图集及映射；资源内容更新后请再执行菜单 2 刷新拆分结果。")
     print(f"修改后的图片请放到: {DEFAULT_EDITED_IMAGE_ROOT}")
     print(f"需要按图片屏蔽对象时，请把图片放到: {DEFAULT_BLOCK_IMAGE_ROOT}")
+    return 0
 
 
 def _manifest_value(data: dict, *names: str, default=None):
@@ -699,9 +919,10 @@ def _sprite_render_data_with_scope(
 
 def _number(value: object, default: float = 0.0) -> float:
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return default
+    return parsed if math.isfinite(parsed) else default
 
 
 def _ngui_atlas_sprite_rows(data: dict | None) -> list[dict]:
@@ -806,12 +1027,12 @@ def _resolve_ngui_atlas(scope: dict, atlas_path_id: int) -> dict | None:
     }
 
 
-def run_split_sprite_atlases() -> None:
+def run_split_sprite_atlases() -> int:
     try:
         from PIL import Image
     except ImportError:
         print("[图集拆分][错误] 当前 Python 环境缺少 Pillow。")
-        return
+        return 1
 
     print()
     print("拆分 Sprite / NGUI UIAtlas 图集")
@@ -864,13 +1085,46 @@ def run_split_sprite_atlases() -> None:
             y = round(_number(rect.get("y")))
             width = round(_number(rect.get("width")))
             height = round(_number(rect.get("height")))
+            downscale_multiplier = _number(
+                render_data.get("downscaleMultiplier")
+                or render_data.get("m_DownscaleMultiplier"),
+                1.0,
+            )
+            if downscale_multiplier <= 0:
+                downscale_multiplier = 1.0
             if width <= 0 or height <= 0:
                 skipped += 1
                 continue
             try:
                 with Image.open(texture_path) as atlas:
-                    top = atlas.height - y - height
-                    cropped = atlas.crop((x, top, x + width, top + height))
+                    # SpriteAtlas variants keep textureRect in the master
+                    # atlas coordinate system.  The packed Texture2D can be
+                    # smaller (commonly 0.5x), as indicated by
+                    # downscaleMultiplier.  Scale both rectangle edges so
+                    # half-pixel coordinates do not accumulate size errors.
+                    left = round(x * downscale_multiplier)
+                    right = round((x + width) * downscale_multiplier)
+                    bottom = round(y * downscale_multiplier)
+                    upper_from_bottom = round(
+                        (y + height) * downscale_multiplier
+                    )
+                    top = atlas.height - upper_from_bottom
+                    bottom_edge = atlas.height - bottom
+                    if (
+                        left < 0
+                        or top < 0
+                        or right > atlas.width
+                        or bottom_edge > atlas.height
+                        or right <= left
+                        or bottom_edge <= top
+                    ):
+                        skipped += 1
+                        print(
+                            "[图集拆分][跳过] Sprite "
+                            f"PathID={sprite_path_id}: 缩放后的矩形超出图集范围"
+                        )
+                        continue
+                    cropped = atlas.crop((left, top, right, bottom_edge))
                     settings_raw = int(render_data.get("settingsRaw", 0) or 0)
                     rotation = (settings_raw >> 2) & 0xF
                     if rotation == 1:
@@ -881,6 +1135,14 @@ def run_split_sprite_atlases() -> None:
                         cropped = cropped.transpose(Image.Transpose.ROTATE_180)
                     elif rotation == 4:
                         cropped = cropped.transpose(Image.Transpose.ROTATE_90)
+                    expected_size = (
+                        (height, width) if rotation == 4 else (width, height)
+                    )
+                    if cropped.size != expected_size:
+                        cropped = cropped.resize(
+                            expected_size,
+                            Image.Resampling.LANCZOS,
+                        )
                     asset_name = str(
                         _manifest_value(sprite_entry["item"], "AssetName", "assetName", default="")
                         or f"Sprite_{sprite_path_id}"
@@ -913,6 +1175,7 @@ def run_split_sprite_atlases() -> None:
                     "sprite_json": str(sprite_entry["path"]),
                     "texture_png": str(texture_path),
                     "rect": {"x": x, "y": y, "width": width, "height": height},
+                    "downscale_multiplier": downscale_multiplier,
                     "packing_rotation": rotation,
                     "render_data_source": render_data_source,
                 }
@@ -924,10 +1187,41 @@ def run_split_sprite_atlases() -> None:
 
     # NGUI does not create Unity Sprite assets. UIAtlas stores top-left based
     # rectangles in mSprites and UISprite refers to them by mAtlas+mSpriteName.
+    # Step 0 has already scanned every string field. Use that result as a cheap
+    # file-level prefilter so large projects do not reopen and parse every
+    # MonoBehaviour JSON here. Old/incomplete workspaces still fall back to the
+    # exhaustive scan below.
+    ngui_candidate_paths: set[Path] | None = None
+    if DEFAULT_UNFILTERED_RECORDS_JSON.is_file():
+        try:
+            unfiltered_records = json.loads(
+                DEFAULT_UNFILTERED_RECORDS_JSON.read_text(encoding="utf-8-sig")
+            )
+            if isinstance(unfiltered_records, list):
+                ngui_candidate_paths = {
+                    Path(str(row.get("file_path", ""))).resolve()
+                    for row in unfiltered_records
+                    if isinstance(row, dict)
+                    and "msprites" in str(row.get("field", "")).casefold()
+                    and row.get("file_path")
+                }
+                print(
+                    "[图集拆分] 复用步骤 0 字段索引预筛选 NGUI UIAtlas："
+                    f"候选文件={len(ngui_candidate_paths)}",
+                    flush=True,
+                )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            print(f"[图集拆分][提示] NGUI 字段索引无法读取，将回退全量扫描: {exc}")
+
     ngui_groups: dict[tuple[str, str, int, int, int, int], dict] = {}
     for scope_key, scope in scopes.items():
         for (type_name, atlas_path_id), atlas_entry in scope["items"].items():
             if type_name != "MonoBehaviour":
+                continue
+            if (
+                ngui_candidate_paths is not None
+                and atlas_entry["path"].resolve() not in ngui_candidate_paths
+            ):
                 continue
             atlas_data = _entry_data(atlas_entry)
             if not _ngui_atlas_sprite_rows(atlas_data):
@@ -1084,6 +1378,7 @@ def run_split_sprite_atlases() -> None:
             print(f"  ... 其余 {len(unresolved_runtime_atlases) - 10} 张")
     print(f"[图集拆分] 输出目录: {png_root}")
     print(f"[图集拆分] 映射文件: {DEFAULT_ALL_SPRITE_MAP}")
+    return 0
 
 
 def _game_object_name(scope: dict, path_id: int) -> str:
@@ -2911,13 +3206,34 @@ def _preview_sprite_image(scope: dict, sprite_path_id: int):
     y = round(_number(rect.get("y")))
     width = round(_number(rect.get("width")))
     height = round(_number(rect.get("height")))
+    downscale_multiplier = _number(
+        render_data.get("downscaleMultiplier")
+        or render_data.get("m_DownscaleMultiplier"),
+        1.0,
+    )
+    if downscale_multiplier <= 0:
+        downscale_multiplier = 1.0
     if width <= 0 or height <= 0:
         return None
     try:
         with Image.open(texture_entry["path"]) as atlas:
             atlas = atlas.convert("RGBA")
-            top = atlas.height - y - height
-            cropped = atlas.crop((x, top, x + width, top + height))
+            left = round(x * downscale_multiplier)
+            right = round((x + width) * downscale_multiplier)
+            bottom = round(y * downscale_multiplier)
+            upper_from_bottom = round((y + height) * downscale_multiplier)
+            top = atlas.height - upper_from_bottom
+            bottom_edge = atlas.height - bottom
+            if (
+                left < 0
+                or top < 0
+                or right > atlas.width
+                or bottom_edge > atlas.height
+                or right <= left
+                or bottom_edge <= top
+            ):
+                return None
+            cropped = atlas.crop((left, top, right, bottom_edge))
         rotation = (int(render_data.get("settingsRaw", 0) or 0) >> 2) & 0xF
         if rotation == 1:
             cropped = cropped.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
@@ -2927,6 +3243,9 @@ def _preview_sprite_image(scope: dict, sprite_path_id: int):
             cropped = cropped.transpose(Image.Transpose.ROTATE_180)
         elif rotation == 4:
             cropped = cropped.transpose(Image.Transpose.ROTATE_90)
+        expected_size = (height, width) if rotation == 4 else (width, height)
+        if cropped.size != expected_size:
+            cropped = cropped.resize(expected_size, Image.Resampling.LANCZOS)
         return cropped
     except (OSError, ValueError):
         return None
@@ -4482,6 +4801,149 @@ def _preview_visible_tree_nodes(
     return visible
 
 
+def _iter_editable_object_fields(
+    value: object,
+    prefix: str = "",
+    depth: int = 0,
+) -> list[tuple[str, object]]:
+    """Return scalar component fields that are safe to expose in the UI.
+
+    Object pointers and arrays are deliberately excluded: changing them as
+    text would easily corrupt Unity references.  Scalar fields, including NGUI
+    ``mText`` values and numeric layout/style values, remain editable.
+    """
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return [(prefix, value)] if prefix else []
+    if not isinstance(value, dict) or depth >= 4 or _is_serialized_pointer(value):
+        return []
+    result: list[tuple[str, object]] = []
+    for key, child in value.items():
+        key_text = str(key)
+        if key_text in {"m_Script", "m_Name"}:
+            continue
+        child_path = f"{prefix}.{key_text}" if prefix else key_text
+        result.extend(_iter_editable_object_fields(child, child_path, depth + 1))
+    return result
+
+
+def _read_object_field(data: object, field_path: str) -> object:
+    current = data
+    for key in field_path.split("."):
+        if not isinstance(current, dict) or key not in current:
+            raise KeyError(field_path)
+        current = current[key]
+    return current
+
+
+def _write_object_field(data: dict, field_path: str, value: object) -> None:
+    keys = [key for key in field_path.split(".") if key]
+    if not keys:
+        raise ValueError("字段路径不能为空")
+    parent: object = data
+    for key in keys[:-1]:
+        if not isinstance(parent, dict) or key not in parent:
+            raise KeyError(field_path)
+        parent = parent[key]
+    if not isinstance(parent, dict) or keys[-1] not in parent:
+        raise KeyError(field_path)
+    parent[keys[-1]] = value
+
+
+def _parse_object_field_value(raw_value: str, template: object) -> object:
+    if isinstance(template, bool):
+        normalized = raw_value.strip().casefold()
+        if normalized in {"1", "true", "yes", "是"}:
+            return True
+        if normalized in {"0", "false", "no", "否"}:
+            return False
+        raise ValueError("布尔字段请输入 true/false、1/0 或 是/否")
+    if isinstance(template, int) and not isinstance(template, bool):
+        return int(raw_value.strip(), 0)
+    if isinstance(template, float):
+        return float(raw_value.strip())
+    if template is None:
+        if raw_value.strip().casefold() in {"null", "none", "空"}:
+            return None
+        return raw_value
+    return raw_value
+
+
+def _component_editable_field_rows(scope: dict, game_object_path_id: int) -> list[dict]:
+    game_object_entry = _scope_entry(scope, ("GameObject",), game_object_path_id)
+    game_object_data = _entry_data(game_object_entry) if game_object_entry else None
+    if not isinstance(game_object_data, dict):
+        return []
+    rows: list[dict] = []
+    component_types = ("MonoBehaviour", "Transform", "RectTransform", "SpriteRenderer")
+    for component_path_id in _game_object_component_path_ids(game_object_data):
+        component_entry = _scope_entry(scope, component_types, component_path_id)
+        component_data = _entry_data(component_entry) if component_entry else None
+        if not isinstance(component_data, dict) or component_entry is None:
+            continue
+        component_type = str(component_entry.get("item", {}).get("TypeName", "Component"))
+        source_json = Path(component_entry["path"])
+        try:
+            staged_json = DEFAULT_OBJECT_TO_IMPORT_ROOT / source_json.relative_to(
+                DEFAULT_SOURCE_ROOT
+            )
+        except ValueError:
+            staged_json = Path()
+        staged_data = _safe_read_json(staged_json) if staged_json.is_file() else None
+        for field_path, value in _iter_editable_object_fields(component_data):
+            # The dialog is also an editor for already staged changes.  Display
+            # the pending value when one exists instead of misleading the user
+            # with the original source value.
+            if isinstance(staged_data, dict):
+                try:
+                    value = _read_object_field(staged_data, field_path)
+                except KeyError:
+                    pass
+            rows.append(
+                {
+                    "component_path_id": int(component_path_id),
+                    "component_type": component_type,
+                    "source_json": source_json,
+                    "field_path": field_path,
+                    "value": value,
+                }
+            )
+    return rows
+
+
+def write_object_component_field_override(
+    source_json: Path,
+    field_path: str,
+    raw_value: str,
+) -> tuple[Path, object, object]:
+    """Stage one scalar component-field modification for resource import."""
+    source_json = Path(source_json)
+    source_data = _safe_read_json(source_json)
+    if not isinstance(source_data, dict):
+        raise ValueError(f"组件 JSON 不存在或无效: {source_json}")
+    try:
+        relative = source_json.relative_to(DEFAULT_SOURCE_ROOT)
+    except ValueError as exc:
+        raise ValueError("组件 JSON 不在 workspace/input 中") from exc
+    source_value = _read_object_field(source_data, field_path)
+    if not isinstance(source_value, (str, int, float, bool)) and source_value is not None:
+        raise ValueError(f"只支持修改标量字段: {field_path}")
+    target = DEFAULT_OBJECT_TO_IMPORT_ROOT / relative
+    target_data = _safe_read_json(target)
+    patched = copy.deepcopy(target_data) if isinstance(target_data, dict) else copy.deepcopy(source_data)
+    old_value = _read_object_field(patched, field_path)
+    new_value = _parse_object_field_value(raw_value, source_value)
+    _write_object_field(patched, field_path, new_value)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(target, patched)
+    print(
+        f"[字段修改][完成] {source_json.name} | {field_path}: "
+        f"{old_value!r} -> {new_value!r}",
+        flush=True,
+    )
+    print(f"[字段修改] 待导入 JSON: {target}", flush=True)
+    return target, old_value, new_value
+
+
 def _preview_nodes_at_point(nodes: list[dict], x: float, y: float) -> list[dict]:
     hits: list[dict] = []
     for node in nodes:
@@ -4501,7 +4963,7 @@ def _preview_nodes_at_point(nodes: list[dict], x: float, y: float) -> list[dict]
     )
 
 
-def _show_interactive_object_preview(target: Path) -> dict:
+def _show_interactive_object_preview(target: Path, scopes: dict | None = None) -> dict:
     import tkinter as tk
     from tkinter import messagebox, ttk
     from PIL import Image, ImageTk
@@ -4544,7 +5006,7 @@ def _show_interactive_object_preview(target: Path) -> dict:
     hidden_overlay_path_ids: set[int] = set()
 
     window = tk.Tk()
-    window.title(f"对象层级预览 - {target.name}（左侧选择；右键管理层级）")
+    window.title(f"对象层级预览 - {target.name}（左侧选择；右键管理层级/字段）")
     screen_width = window.winfo_screenwidth()
     screen_height = window.winfo_screenheight()
     source_image = Image.open(target).convert("RGB")
@@ -4603,11 +5065,11 @@ def _show_interactive_object_preview(target: Path) -> dict:
     image_item = canvas.create_image(0, 0, anchor="nw")
 
     status = tk.StringVar(
-        value="左侧选择层级；右键仅显示层级时会同时隐藏其它同级分支及其下级图片"
+        value="左侧选择层级；右键可修改字段、管理层级或隔离层级图片"
     )
     ttk.Label(window, textvariable=status, anchor="w").pack(fill="x")
     selected_region: dict[str, dict | None] = {"value": None}
-    action_result = {"blocked": False, "path_id": 0, "name": ""}
+    action_result = {"blocked": False, "edited": False, "path_id": 0, "name": ""}
     view_origin: dict[str, int] = {"x": 0, "y": 0}
     zoom: dict[str, float] = {
         "value": max(
@@ -5012,6 +5474,134 @@ def _show_interactive_object_preview(target: Path) -> dict:
             f"对象层级: {object_name}\n\n{detail}",
         )
 
+    def edit_preview_region_fields(region: dict) -> None:
+        if not isinstance(scopes, dict):
+            status.set("当前预览未提供对象索引，无法修改字段")
+            return
+        scope = _match_scope(scopes, metadata)
+        if scope is None:
+            status.set("无法定位当前层级所在资源，未写入字段修改")
+            return
+        object_path_id = int(region.get("path_id", 0) or 0)
+        all_rows = _component_editable_field_rows(scope, object_path_id)
+        display_text_fields = {"mtext", "m_text", "m_textvalue", "text"}
+        rows = [
+            row for row in all_rows
+            if isinstance(row.get("value"), str)
+            and str(row.get("field_path", "")).casefold() in display_text_fields
+        ]
+        if not rows:
+            status.set("该层级没有可修改的显示文本字段")
+            return
+
+        dialog = tk.Toplevel(window)
+        dialog.title(
+            f"修改显示文本 - {region.get('name', '')} (PathID={object_path_id})"
+        )
+        dialog.geometry("920x360" if len(rows) > 1 else "760x250")
+        dialog.transient(window)
+        dialog.grab_set()
+        ttk.Label(
+            dialog,
+            text=(
+                "仅显示当前层级用于界面显示的文本字段，已自动定位；保存后立即写入 "
+                "output/Object/ToImport，可由资源菜单 Object 导入。"
+            ),
+            wraplength=940,
+            justify="left",
+        ).pack(fill="x", padx=12, pady=(12, 8))
+        table_frame = ttk.Frame(dialog)
+        table_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        field_table = ttk.Treeview(
+            table_frame,
+            columns=("component", "field", "value"),
+            show="headings",
+            selectmode="browse",
+        )
+        field_table.heading("component", text="组件")
+        field_table.heading("field", text="字段")
+        field_table.heading("value", text="当前值")
+        field_table.column("component", width=190, stretch=False)
+        field_table.column("field", width=300, stretch=True)
+        field_table.column("value", width=440, stretch=True)
+        field_scrollbar = ttk.Scrollbar(
+            table_frame, orient="vertical", command=field_table.yview
+        )
+        field_table.configure(yscrollcommand=field_scrollbar.set)
+        field_table.pack(side="left", fill="both", expand=True)
+        field_scrollbar.pack(side="right", fill="y")
+        for index, row in enumerate(rows):
+            field_table.insert(
+                "", "end", iid=str(index),
+                values=(
+                    f"{row['component_type']} #{row['component_path_id']}",
+                    row["field_path"],
+                    repr(row["value"]),
+                ),
+            )
+
+        value_frame = ttk.Frame(dialog)
+        value_frame.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Label(value_frame, text="新值：").pack(side="left")
+        new_value = tk.StringVar()
+        value_entry = ttk.Entry(value_frame, textvariable=new_value)
+        value_entry.pack(side="left", fill="x", expand=True, padx=(4, 8))
+
+        def selected_row() -> dict | None:
+            selected = field_table.selection()
+            if not selected:
+                return None
+            try:
+                return rows[int(selected[0])]
+            except (ValueError, IndexError):
+                return None
+
+        def populate_value(_event=None) -> None:
+            row = selected_row()
+            if row is not None:
+                new_value.set(str(row["value"]))
+
+        def save_field() -> None:
+            row = selected_row()
+            if row is None:
+                messagebox.showwarning("修改字段", "请先选择一个字段。", parent=dialog)
+                return
+            try:
+                target_path, old_value, written_value = write_object_component_field_override(
+                    row["source_json"],
+                    str(row["field_path"]),
+                    new_value.get(),
+                )
+            except (OSError, ValueError, KeyError) as exc:
+                messagebox.showerror("修改字段失败", str(exc), parent=dialog)
+                return
+            action_result["edited"] = True
+            action_result["path_id"] = object_path_id
+            action_result["name"] = str(region.get("name", ""))
+            field_table.set(
+                field_table.selection()[0], "value", repr(written_value)
+            )
+            row["value"] = written_value
+            status.set(
+                f"已写入字段：{region.get('name', '')} | {row['field_path']} "
+                f"{old_value!r} -> {written_value!r}"
+            )
+            messagebox.showinfo(
+                "字段已写入",
+                f"{row['field_path']}: {old_value!r} -> {written_value!r}\n\n"
+                f"待导入文件：\n{target_path}\n\n"
+                "关闭预览后，在资源菜单一键导入时选择 Object 或 全部即可落地。",
+                parent=dialog,
+            )
+
+        field_table.bind("<<TreeviewSelect>>", populate_value)
+        ttk.Button(value_frame, text="写入待导入 Object", command=save_field).pack(side="right")
+        if rows:
+            field_table.selection_set("0")
+            field_table.focus("0")
+            populate_value()
+        value_entry.focus_set()
+
     def set_zoom(value: float, keep_center: bool = True) -> None:
         nonlocal preview_photo
         old_zoom = zoom["value"]
@@ -5325,6 +5915,10 @@ def _show_interactive_object_preview(target: Path) -> dict:
             command=lambda: unblock_preview_region(region),
             state="normal" if blocked else "disabled",
         )
+        menu.add_command(
+            label="修改此层级显示文本…",
+            command=lambda: edit_preview_region_fields(region),
+        )
         menu.add_separator()
         menu.add_command(
             label="仅显示此层级（隐藏其它同级分支及其下级图片）",
@@ -5376,6 +5970,10 @@ def _show_interactive_object_preview(target: Path) -> dict:
                 label="取消屏蔽此层级 Object",
                 command=lambda item=region: unblock_preview_region(item),
                 state="normal" if blocked else "disabled",
+            )
+            submenu.add_command(
+                label="修改此层级显示文本…",
+                command=lambda item=region: edit_preview_region_fields(item),
             )
             submenu.add_separator()
             submenu.add_command(
@@ -5675,12 +6273,12 @@ def _open_object_hierarchy_preview(match: dict, root_level: int, scopes: dict) -
         "管理标注或隔离层级图片。"
     )
     try:
-        result = _show_interactive_object_preview(target)
-        if result.get("completed") or result.get("blocked"):
+        result = _show_interactive_object_preview(target, scopes)
+        if result.get("completed") or result.get("blocked") or result.get("edited"):
             blocked_suffix = (
                 f"，最后操作 {result.get('name', '')} "
                 f"(PathID={result.get('path_id', 0)})"
-                if result.get("blocked")
+                if result.get("blocked") or result.get("edited")
                 else ""
             )
             print(
@@ -7146,12 +7744,12 @@ def _dynamic_list_ai_transport_chain(cfg) -> list[str]:
         return ["http"] if http_ready else []
     if transport != "codex_cli":
         return []
+    codex_models = codex_transport_models(str(
+        getattr(cfg, "ai_dynamic_list_codex_model", "gpt-5.3-codex-spark")
+    ))
     chain: list[str] = []
-    if (
-        str(getattr(cfg, "ai_dynamic_list_codex_model", "gpt-5.3-codex-spark")).strip()
-        and codex_cli_available()
-    ):
-        chain.append("codex_cli")
+    if codex_models and codex_cli_available():
+        chain.extend(codex_models)
     if http_ready:
         chain.append("http")
     return chain
@@ -7159,11 +7757,14 @@ def _dynamic_list_ai_transport_chain(cfg) -> list[str]:
 
 def _dynamic_list_ai_cache_signature() -> str:
     cfg = load_config(quiet=True)
+    codex_models = list(codex_transport_models(str(
+        getattr(cfg, "ai_dynamic_list_codex_model", "gpt-5.3-codex-spark")
+    )).values())
     payload = {
-        "prompt_version": 4,
+        "prompt_version": 5,
         "enabled": bool(getattr(cfg, "enable_ai_dynamic_list_review", False)),
         "transport": str(getattr(cfg, "ai_dynamic_list_transport", "")),
-        "codex_model": str(getattr(cfg, "ai_dynamic_list_codex_model", "")),
+        "codex_models": codex_models,
         "codex_reasoning": str(getattr(
             cfg, "ai_dynamic_list_codex_reasoning_effort", ""
         )),
@@ -7290,9 +7891,11 @@ def _dynamic_list_ai_review_context(
         for candidate in candidates
     ]
     fingerprint_payload = {
-        "version": 4,
+        "version": 5,
         "candidates": compact_candidates,
-        "codex_model": str(getattr(cfg, "ai_dynamic_list_codex_model", "")),
+        "codex_models": list(codex_transport_models(str(
+            getattr(cfg, "ai_dynamic_list_codex_model", "gpt-5.3-codex-spark")
+        )).values()),
         "http_model": str(getattr(cfg, "ai_dynamic_list_model", "")),
     }
     fingerprint = hashlib.sha256(
@@ -7377,12 +7980,20 @@ def _request_dynamic_list_ai_review(rejected_candidates: list[dict]) -> set[str]
         {"candidates": compact_candidates}, ensure_ascii=False, indent=2
     )
     allowed_public_ids = set(public_id_to_candidate_id)
+    models = codex_transport_models(str(
+        getattr(cfg, "ai_dynamic_list_codex_model", "gpt-5.3-codex-spark")
+    ))
+    models["http"] = str(getattr(cfg, "ai_dynamic_list_model", "")).strip()
     failures: list[str] = []
     result: dict | None = None
     used_transport = ""
     for transport in transports:
-        display_name = "Codex 5.3" if transport == "codex_cli" else "DeepSeek"
-        attempts = 1 if transport == "codex_cli" else 4
+        display_name = (
+            codex_display_name(transport, models[transport])
+            if is_codex_transport(transport)
+            else "DeepSeek"
+        )
+        attempts = 1 if is_codex_transport(transport) else 4
         for attempt in range(1, attempts + 1):
             try:
                 print(
@@ -7391,11 +8002,9 @@ def _request_dynamic_list_ai_review(rejected_candidates: list[dict]) -> set[str]
                     + (f"，重试 {attempt}/{attempts}" if attempt > 1 else ""),
                     flush=True,
                 )
-                if transport == "codex_cli":
+                if is_codex_transport(transport):
                     result, _usage = request_structured_output(
-                        model=str(getattr(
-                            cfg, "ai_dynamic_list_codex_model", "gpt-5.3-codex-spark"
-                        )),
+                        model=models[transport],
                         reasoning_effort=str(getattr(
                             cfg, "ai_dynamic_list_codex_reasoning_effort", "medium"
                         )),
@@ -7447,8 +8056,14 @@ def _request_dynamic_list_ai_review(rejected_candidates: list[dict]) -> set[str]
             except Exception as exc:
                 failures.append(f"{display_name}: {exc}")
                 print(f"[动态列表][AI] {display_name} 请求失败: {exc}")
-                if transport == "codex_cli":
-                    print("[动态列表][AI] Codex 5.3 不可用，立即回退 DeepSeek。")
+                if is_codex_transport(transport):
+                    remaining = transports[transports.index(transport) + 1 :]
+                    next_name = (
+                        codex_display_name(remaining[0], models[remaining[0]])
+                        if remaining and is_codex_transport(remaining[0])
+                        else "DeepSeek" if "http" in remaining else "确定性扫描结果"
+                    )
+                    print(f"[动态列表][AI] {display_name} 不可用，立即回退 {next_name}。")
                     break
         if result is not None:
             break
@@ -7481,7 +8096,7 @@ def _request_dynamic_list_ai_review(rejected_candidates: list[dict]) -> set[str]
     atomic_write_json(
         DEFAULT_DYNAMIC_LIST_AI_REVIEW,
         {
-            "version": 4,
+            "version": 5,
             "fingerprint": fingerprint,
             "transport": used_transport,
             "candidate_count": len(candidates),
@@ -11599,7 +12214,7 @@ def run_compatibility_check() -> None:
         for warning in warnings:
             print(f"  - {warning}")
     else:
-        print("[兼容性检查] 结论: 当前导出状态适合继续执行脚本 0/4。")
+        print("[兼容性检查] 结论: 当前导出状态适合继续执行脚本 0/5。")
 
 
 def _default_ai_records_dir() -> Path:
@@ -11614,6 +12229,13 @@ def _default_response_path_for_ai_request(request_path: Path) -> Path:
     if "request" in name:
         return request_path.with_name(name.replace("request", "response", 1))
     return request_path.with_name("ai_translation_response.json")
+
+
+def _translation_cache_path_for_ai_request(request_path: Path) -> Path:
+    name = request_path.name.casefold()
+    if name.startswith("ai_stringliteral_translation_request"):
+        return DEFAULT_DYNAMIC_TRANS_JSON
+    return DEFAULT_TRANS_JSON
 
 
 def _ai_request_item_count(request_path: Path) -> int | None:
@@ -11706,6 +12328,7 @@ def run_ai_translation_batch_tool(
     response_path: Path | None = None,
     patch_after: bool = False,
     codex_circuit_file: Path | None = None,
+    trans_path: Path | None = None,
 ) -> int:
     if not AI_TRANSLATION_BATCH_TOOL.is_file():
         print(f"AI 补批工具不存在: {AI_TRANSLATION_BATCH_TOOL}")
@@ -11725,6 +12348,8 @@ def run_ai_translation_batch_tool(
         command.extend(["--response", str(response_path)])
     if codex_circuit_file is not None:
         command.extend(["--codex-circuit-file", str(codex_circuit_file)])
+    if trans_path is not None:
+        command.extend(["--trans", str(trans_path)])
     result = subprocess.run(command, check=False)
     if result.returncode != 0:
         return result.returncode
@@ -11739,8 +12364,68 @@ def run_ai_translation_batch_tool(
         ]
         if response_path is not None:
             patch_command.extend(["--response", str(response_path)])
+        if trans_path is not None:
+            patch_command.extend(["--trans", str(trans_path)])
         return subprocess.run(patch_command, check=False).returncode
     return 0
+
+
+def run_retry_failed_ai_batches(request_paths: list[Path]) -> int:
+    unique_paths: list[Path] = []
+    seen: set[str] = set()
+    for raw_path in request_paths:
+        request_path = raw_path.resolve()
+        key = str(request_path).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_paths.append(request_path)
+
+    strategy = get_strategy(load_config(quiet=True))
+    retry_paths: list[Path] = []
+    for request_path in unique_paths:
+        if not request_path.is_file():
+            print(f"[AI自动补批][跳过] request 不存在: {request_path}")
+            continue
+        response_path = _default_response_path_for_ai_request(request_path)
+        state = _ai_response_state(request_path, response_path, strategy)
+        if state.startswith("可解析:"):
+            print(f"[AI自动补批][已有完整响应] {request_path.name}: {state}")
+            continue
+        print(f"[AI自动补批][需要重试] {request_path.name}: {state}")
+        retry_paths.append(request_path)
+
+    if not retry_paths:
+        print("[AI自动补批] 没有需要重试的批次。")
+        return 0
+
+    failed: list[tuple[Path, int]] = []
+    with tempfile.TemporaryDirectory(prefix="translate_auto_retry_") as circuit_dir:
+        codex_circuit_file = Path(circuit_dir) / "open.json"
+        for index, request_path in enumerate(retry_paths, start=1):
+            response_path = _default_response_path_for_ai_request(request_path)
+            trans_path = _translation_cache_path_for_ai_request(request_path)
+            print(
+                f"[AI自动补批] {index}/{len(retry_paths)}: {request_path.name} -> "
+                f"{trans_path.name}"
+            )
+            result = run_ai_translation_batch_tool(
+                "resend-and-patch",
+                request_path,
+                response_path,
+                codex_circuit_file=codex_circuit_file,
+                trans_path=trans_path,
+            )
+            if result != 0:
+                failed.append((request_path, result))
+
+    print(
+        f"[AI自动补批][汇总] 需要重试={len(retry_paths)}，"
+        f"成功={len(retry_paths) - len(failed)}，失败={len(failed)}"
+    )
+    for request_path, result in failed:
+        print(f"  失败: {request_path.name}（返回码={result}）")
+    return 1 if failed else 0
 
 
 def run_ai_translation_batch_menu() -> None:
@@ -11788,6 +12473,7 @@ def run_ai_translation_batch_menu() -> None:
                 request_path,
                 response_path,
                 codex_circuit_file=codex_circuit_file,
+                trans_path=_translation_cache_path_for_ai_request(request_path),
             )
             if result != 0:
                 failed.append((request_path, result))
@@ -11816,8 +12502,8 @@ def run_ai_translation_batch_menu() -> None:
         return
     print("\033[92m[AI补批] 成功批次已修补 trans.json。\033[0m")
     print(
-        "\033[94m[AI补批][下一步] 请回到主菜单运行脚本 3，"
-        "从 trans.json 重建 game.txt 和 game_chars.txt；之后继续运行脚本 4-9。\033[0m"
+        "\033[94m[AI补批][下一步] 请回到主菜单运行脚本 4，"
+        "从 trans.json 重建 game.txt 和 game_chars.txt；之后继续运行脚本 5-10。\033[0m"
     )
 
 
@@ -11860,6 +12546,65 @@ def load_trans_json(path: Path) -> dict[str, str]:
     if not isinstance(data, dict):
         raise ValueError(f"trans.json 不是 JSON 对象: {path}")
     return {str(key): str(value) for key, value in data.items()}
+
+
+def run_clean_all_unsupported_ttf_chars(
+    missing_path: Path = DEFAULT_MISSING_TTF_CHARS_FILE,
+    translation_paths: list[Path] | None = None,
+) -> int:
+    try:
+        missing_chars = read_missing_chars(missing_path)
+    except FileNotFoundError as exc:
+        print(f"[清理字符][自动][失败] {exc}")
+        return 1
+    if not missing_chars:
+        print(f"[清理字符][自动] 不支持字符清单为空，无需修改: {missing_path}")
+        return 0
+
+    paths = translation_paths or [DEFAULT_TRANS_JSON, DEFAULT_DYNAMIC_TRANS_JSON]
+    missing_set = set(missing_chars)
+    translation_table = str.maketrans("", "", "".join(missing_chars))
+    loaded = 0
+    total_changed = 0
+    total_removed = 0
+    for trans_path in paths:
+        if not trans_path.is_file():
+            print(f"[清理字符][自动][跳过] 翻译缓存不存在: {trans_path}")
+            continue
+        try:
+            trans_data = load_trans_json(trans_path)
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"[清理字符][自动][失败] {exc}")
+            return 1
+        loaded += 1
+        changed = 0
+        removed = 0
+        for source, translated in list(trans_data.items()):
+            occurrence_count = sum(1 for char in translated if char in missing_set)
+            if occurrence_count == 0:
+                continue
+            cleaned = translated.translate(translation_table)
+            if not cleaned and trans_path.name.casefold() == DEFAULT_DYNAMIC_TRANS_JSON.name.casefold():
+                cleaned = source
+            trans_data[source] = cleaned
+            changed += 1
+            removed += occurrence_count
+        atomic_write_json_file(trans_path, trans_data)
+        total_changed += changed
+        total_removed += removed
+        print(
+            f"[清理字符][自动] {trans_path.name}: "
+            f"更新译文={changed}，删除字符出现次数={removed}"
+        )
+
+    if loaded == 0:
+        print("[清理字符][自动][失败] 静态和动态翻译缓存均不存在。")
+        return 1
+    print(
+        f"[清理字符][自动][完成] 不支持字符={len(missing_chars)}，"
+        f"更新译文总数={total_changed}，删除字符出现总次数={total_removed}"
+    )
+    return 0
 
 
 def find_trans_values_containing_char(trans_data: dict[str, str], char: str) -> list[tuple[str, str]]:
@@ -11960,8 +12705,8 @@ def run_clean_unsupported_ttf_chars() -> None:
             f"删除字符出现次数={occurrence_total}: {trans_path}\033[0m"
         )
         print(
-            "\033[94m[清理字符][下一步] 请运行主菜单脚本 3 重建 game.txt 和 "
-            "game_chars.txt，然后重新运行主菜单脚本 7。\033[0m"
+            "\033[94m[清理字符][下一步] 请运行主菜单脚本 4 重建 game.txt 和 "
+            "game_chars.txt，然后重新运行主菜单脚本 8。\033[0m"
         )
         return
 
@@ -12004,8 +12749,8 @@ def run_clean_unsupported_ttf_chars() -> None:
     print(f"[清理字符] 已写回: {trans_path}")
     if changed_total:
         print(
-            "\033[94m[清理字符][下一步] 请运行主菜单脚本 3 重建 game.txt 和 "
-            "game_chars.txt，然后重新运行主菜单脚本 7。\033[0m"
+            "\033[94m[清理字符][下一步] 请运行主菜单脚本 4 重建 game.txt 和 "
+            "game_chars.txt，然后重新运行主菜单脚本 8。\033[0m"
         )
 
 
@@ -12100,7 +12845,7 @@ def run_clean_script_outputs() -> None:
     print()
     print("按脚本清理生成文件")
     print(f"\033[94m[脚本产物清理] 清单: {SCRIPT_OUTPUT_MANIFEST_PATH}\033[0m")
-    print("支持 1-2、4-7 或逗号组合；输入 a 会包含脚本 0 至 9。")
+    print("支持 1-2、4-7 或逗号组合；输入 a 会包含脚本 0 至 10。")
     ordered_script_ids = sorted(
         scripts,
         key=lambda value: (value == "a", int(value) if value.isdigit() else 0),
@@ -12122,7 +12867,7 @@ def run_clean_script_outputs() -> None:
         print("[脚本产物清理] 已取消。")
         return
     try:
-        script_ids = ["a"] if raw == "a" else parse_number_ranges(raw, set(range(10)))
+        script_ids = ["a"] if raw == "a" else parse_number_ranges(raw, set(range(11)))
     except ValueError as exc:
         print(f"\033[91m[脚本产物清理] {exc}\033[0m")
         return
@@ -12167,6 +12912,33 @@ def run_clean_script_outputs() -> None:
     print(f"\033[92m[脚本产物清理] 已删除 {len(removed)} 个清单目标。\033[0m")
 
 
+def run_write_trans_to_hook_dictionary() -> int:
+    cfg = load_config()
+    trans_path = cfg.stage_record_dir / "trans.json"
+    output_root = Path(getattr(cfg, "stage_dir", cfg.stage_record_dir.parent / "output"))
+    dictionary_path = (
+        output_root / DYNAMIC_DICTIONARY_OUTPUT_SUBDIR / DYNAMIC_DICTIONARY_CPP_FILENAME
+    )
+    try:
+        report = write_trans_json_to_whole_text_dictionary(trans_path, dictionary_path)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError, OSError) as exc:
+        print(f"\033[91m[Hook整字词典][失败] {exc}\033[0m", flush=True)
+        return 1
+
+    skipped = report["skipped"]
+    skipped_count = sum(int(value) for value in skipped.values())
+    print(
+        f"\033[92m[Hook整字词典] 已从 trans.json 写入 {report['entry_count']} 条，"
+        f"跳过={skipped_count}: {dictionary_path}\033[0m",
+        flush=True,
+    )
+    if skipped:
+        detail = "，".join(f"{key}={value}" for key, value in sorted(skipped.items()))
+        print(f"[Hook整字词典] 跳过原因: {detail}", flush=True)
+    print("[Hook整字词典] kSubstringDictionary 已保留不变。", flush=True)
+    return 0
+
+
 def run_search_tools_menu() -> None:
     while True:
         print()
@@ -12174,6 +12946,7 @@ def run_search_tools_menu() -> None:
         print("1. 查找字符串并复制 JSON")
         print("2. 查找 PathID 对应文件路径")
         print("3. 查找资源名对应文件路径")
+        print("4. 全项目文本搜索（工作区 + 原项目目录）")
         print("b. 返回主菜单")
         try:
             choice = prompt_input("请选择搜索工具: ").strip().lower().lstrip("\ufeff")
@@ -12189,9 +12962,139 @@ def run_search_tools_menu() -> None:
         if choice == "3":
             run_find_asset_name()
             continue
+        if choice == "4":
+            run_project_text_search()
+            continue
         if choice in {"b", "q", "back", "quit", "exit"}:
             return
-        print("无效选择，请输入 1-3 或 b。")
+        print("无效选择，请输入 1-4 或 b。")
+
+
+def run_suspicious_encoded_data_scan() -> int:
+    """Write a reviewable candidate list; never decrypt or modify resources."""
+
+    cfg = load_config()
+    try:
+        output_path, report = scan_project_suspicious_encoded_data(cfg)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"\033[91m[疑似编码数据扫描][失败] {exc}\033[0m", flush=True)
+        return 1
+
+    stats = report["stats"]
+    print(
+        f"\033[92m[疑似编码数据扫描] MonoBehaviour={stats['monobehaviour_json_file_count']}，"
+        f"深度检查={stats['json_files_selected_for_deep_scan']}，"
+        f"疑似字段={stats['encoded_json_field_count']}，"
+        f"Metadata 高熵区段={stats['high_entropy_metadata_segment_count']}\033[0m",
+        flush=True,
+    )
+    print(f"[疑似编码数据扫描] 报告: {output_path}", flush=True)
+    print("[疑似编码数据扫描] 仅表示值得逆向核对，不会自动解密或加入翻译词库。", flush=True)
+    return 0
+
+
+def _parse_custom_hsv_ranges(raw: str) -> list[HsvRange]:
+    """Parse ``Hmin-Hmax,Smin-Smax,Vmin-Vmax`` ranges separated by ``;``."""
+
+    result: list[HsvRange] = []
+    normalized = raw.replace("，", ",").replace("；", ";").strip()
+    if not normalized:
+        return result
+    for index, item in enumerate(normalized.split(";"), start=1):
+        parts = [part.strip() for part in item.split(",")]
+        if len(parts) != 3:
+            raise ValueError(
+                f"自定义区间 {index} 格式错误，应为 H最小-H最大,S最小-S最大,V最小-V最大"
+            )
+
+        def parse_pair(value: str, maximum: int, label: str) -> tuple[int, int]:
+            match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", value)
+            if not match:
+                raise ValueError(f"自定义区间 {index} 的 {label} 范围无效: {value}")
+            minimum, upper = (int(match.group(1)), int(match.group(2)))
+            if not (0 <= minimum <= maximum and 0 <= upper <= maximum):
+                raise ValueError(f"自定义区间 {index} 的 {label} 必须在 0-{maximum} 内")
+            return minimum, upper
+
+        hue_min, hue_max = parse_pair(parts[0], 359, "H")
+        saturation_min, saturation_max = parse_pair(parts[1], 100, "S")
+        value_min, value_max = parse_pair(parts[2], 100, "V")
+        if saturation_min > saturation_max or value_min > value_max:
+            raise ValueError(f"自定义区间 {index} 的 S/V 最小值不能大于最大值")
+        result.append(
+            HsvRange(
+                f"自定义{index}",
+                hue_min,
+                hue_max,
+                saturation_min,
+                saturation_max,
+                value_min,
+                value_max,
+            )
+        )
+    return result
+
+
+def run_filter_split_sprites_by_color() -> int:
+    """Copy Sprite PNGs that contain every selected colour range."""
+
+    source_root = DEFAULT_ALL_SPRITE_PNG_ROOT
+    print()
+    print("按颜色筛选拆分后的 Sprite 图片")
+    print(f"筛选源（固定）: {source_root}")
+    print("规则：多个颜色区间合并累计占比；透明像素不算颜色，但计入整张图片总像素。")
+    print("按总占比分为 51-100%、10-50%、1-10% 三个输出子目录；不足 1% 不输出。")
+    print("HSV：H 为 0-359°，S/V 为 0-100%。红色 H=345-15 表示跨越 0°。")
+    print("常见颜色区间：")
+    for index, color_range in enumerate(COMMON_COLOR_RANGES, start=1):
+        print(
+            f"{index}. {color_range.label}: "
+            f"H {color_range.hue_min}-{color_range.hue_max}, "
+            f"S {color_range.saturation_min}-{color_range.saturation_max}, "
+            f"V {color_range.value_min}-{color_range.value_max}"
+        )
+    try:
+        selected_raw = prompt_input("选择常见颜色编号（可多选，如 1,4；回车跳过）: ").strip()
+        selected: list[HsvRange] = []
+        if selected_raw:
+            indexes = parse_number_ranges(
+                selected_raw, set(range(1, len(COMMON_COLOR_RANGES) + 1))
+            )
+            selected.extend(COMMON_COLOR_RANGES[int(index) - 1] for index in indexes)
+        custom_raw = prompt_input(
+            "追加自定义 HSV 区间（可多条；例 30-60,50-100,40-100；直接回车跳过）: "
+        )
+        selected.extend(_parse_custom_hsv_ranges(custom_raw))
+    except (EOFError, ValueError) as exc:
+        print(f"[颜色筛选][取消] {exc}")
+        return 1
+
+    if not selected:
+        print("[颜色筛选][取消] 至少选择一个常见颜色或输入一个自定义区间。")
+        return 1
+    if not source_root.is_dir():
+        print(f"[颜色筛选][失败] 拆分后的 Sprite 图片目录不存在: {source_root}")
+        return 1
+
+    output_root = DEFAULT_WORKSPACE_ROOT / "temp"
+    destination = output_root / f"Sprite颜色筛选_{datetime.now():%Y%m%d_%H%M%S}"
+    try:
+        result = filter_images_by_hsv_ranges(source_root, destination, selected)
+    except (OSError, ValueError) as exc:
+        print(f"[颜色筛选][失败] {exc}")
+        return 1
+    labels = "、".join(color_range.label for color_range in selected)
+    print(
+        f"[颜色筛选][完成] 颜色={labels}；扫描 {result.scanned_count} 张，"
+        f"命中 {result.matched_count} 张，不可读取 {result.unreadable_count} 张。"
+    )
+    print(
+        f"[颜色筛选][占比] 51-100%：{result.high_coverage_count} 张；"
+        f"10-50%：{result.medium_coverage_count} 张；"
+        f"1-10%：{result.low_coverage_count} 张。"
+    )
+    print(f"[颜色筛选][输出] {result.destination}")
+    return 0
 
 
 def run_test_tools_menu() -> None:
@@ -12201,6 +13104,8 @@ def run_test_tools_menu() -> None:
         print("1. Unity 资源兼容性/导出状态检查")
         print("2. 按 trans_maybe_title.json 清理 trans.json")
         print("3. 从完整备份按字段恢复 records，并补译到 trans")
+        print("4. 扫描疑似加密/编码数据（熵、Base64、字段结构）")
+        print("5. 按 HSV 颜色筛选拆分后的 Sprite 图片")
         print("b. 返回主菜单")
         try:
             choice = prompt_input("请选择测试工具: ").strip().lower().lstrip("\ufeff")
@@ -12216,9 +13121,15 @@ def run_test_tools_menu() -> None:
         if choice == "3":
             run_restore_records_by_field()
             continue
+        if choice == "4":
+            run_suspicious_encoded_data_scan()
+            continue
+        if choice == "5":
+            run_filter_split_sprites_by_color()
+            continue
         if choice in {"b", "q", "back", "quit", "exit"}:
             return
-        print("无效选择，请输入 1-3 或 b。")
+        print("无效选择，请输入 1-5 或 b。")
 
 
 def main() -> int:
@@ -12234,12 +13145,33 @@ def main() -> int:
             if len(entry_args) < 2:
                 print(f"用法: python {Path(__file__).name} patch-ai-batch <ai_translation_request_batch_XXX.json>")
                 return 1
-            return run_ai_translation_batch_tool("patch-trans", Path(entry_args[1]))
+            request_path = Path(entry_args[1])
+            return run_ai_translation_batch_tool(
+                "patch-trans",
+                request_path,
+                trans_path=_translation_cache_path_for_ai_request(request_path),
+            )
         if command in {"resend-and-patch-ai-batch", "ai-batch-resend-and-patch"}:
             if len(entry_args) < 2:
                 print(f"用法: python {Path(__file__).name} resend-and-patch-ai-batch <ai_translation_request_batch_XXX.json>")
                 return 1
-            return run_ai_translation_batch_tool("resend-and-patch", Path(entry_args[1]))
+            request_path = Path(entry_args[1])
+            return run_ai_translation_batch_tool(
+                "resend-and-patch",
+                request_path,
+                trans_path=_translation_cache_path_for_ai_request(request_path),
+            )
+        if command in {"retry-failed-ai-batches", "auto-retry-ai-batches"}:
+            request_paths = [Path(value) for value in entry_args[1:]]
+            if not request_paths:
+                request_paths = sorted(
+                    _default_ai_records_dir().glob("ai_*translation_request*.json")
+                )
+            return run_retry_failed_ai_batches(request_paths)
+        if command in {"clean-unsupported-ttf-chars-all", "auto-clean-ttf-chars"}:
+            return run_clean_all_unsupported_ttf_chars()
+        if command in {"copy-all-images", "export-all-images"}:
+            return run_copy_all_images()
         if command in {"clean-unsupported-ttf-chars", "clean-ttf-chars"}:
             run_clean_unsupported_ttf_chars()
             return 0
@@ -12255,9 +13187,14 @@ def main() -> int:
         if command in {"restore-blocked-objects", "undo-blocked-objects"}:
             run_restore_blocked_objects()
             return 0
+        if command in {"write-trans-hook-dictionary", "rebuild-hook-whole-dictionary"}:
+            return run_write_trans_to_hook_dictionary()
+        if command in {"scan-suspicious-encoded-data", "scan-encoded-data"}:
+            return run_suspicious_encoded_data_scan()
+        if command in {"filter-sprites-by-color", "filter-images-by-color"}:
+            return run_filter_split_sprites_by_color()
         if command in {"split-sprite-atlases", "split-sprites"}:
-            run_split_sprite_atlases()
-            return 0
+            return run_split_sprite_atlases()
         if command in {"restore-records-by-field", "restore-field"}:
             run_restore_records_by_field()
             return 0
@@ -12278,10 +13215,17 @@ def main() -> int:
         print(f"用法: python {Path(__file__).name} resend-ai-batch <ai_translation_request_batch_XXX.json>")
         print(f"或: python {Path(__file__).name} patch-ai-batch <ai_translation_request_batch_XXX.json>")
         print(f"或: python {Path(__file__).name} resend-and-patch-ai-batch <ai_translation_request_batch_XXX.json>")
+        print(f"或: python {Path(__file__).name} retry-failed-ai-batches [request.json ...]")
         print(f"或: python {Path(__file__).name} clean-unsupported-ttf-chars")
+        print(f"或: python {Path(__file__).name} clean-unsupported-ttf-chars-all")
+        print(f"或: python {Path(__file__).name} copy-all-images")
+        print(f"或: python {Path(__file__).name} split-sprite-atlases")
         print(f"或: python {Path(__file__).name} clean-script-outputs")
         print(f"或: python {Path(__file__).name} clean-trans-maybe-title")
         print(f"或: python {Path(__file__).name} block-dynamic-lists")
+        print(f"或: python {Path(__file__).name} write-trans-hook-dictionary")
+        print(f"或: python {Path(__file__).name} scan-suspicious-encoded-data")
+        print(f"或: python {Path(__file__).name} filter-sprites-by-color")
         return 1
 
     print(f"当前项目工作区: {DEFAULT_WORKSPACE_ROOT}")
@@ -12298,6 +13242,7 @@ def main() -> int:
         print("7. 按 Object 名称获取链路并选择层级屏蔽")
         print("8. 动态列表索引与选择性屏蔽（测试阶段）")
         print("9. 统一撤销已记录的 Object/动态条目屏蔽")
+        print("10. 将 records/trans.json 写入 Hook 整字匹配词典")
         print()
         print("S. 搜索\t\tT. 测试\t\tC. 清理主脚本产物\t\tq. 退出")
         try:
@@ -12335,6 +13280,9 @@ def main() -> int:
         if choice == "9":
             run_restore_blocked_objects()
             continue
+        if choice == "10":
+            run_write_trans_to_hook_dictionary()
+            continue
         if choice == "s":
             run_search_tools_menu()
             continue
@@ -12347,7 +13295,7 @@ def main() -> int:
         if choice in {"q", "quit", "exit"}:
             return 0
 
-        print("无效选择，请输入 0-9、S、T、C 或 q。")
+        print("无效选择，请输入 0-10、S、T、C 或 q。")
     return 0
 
 

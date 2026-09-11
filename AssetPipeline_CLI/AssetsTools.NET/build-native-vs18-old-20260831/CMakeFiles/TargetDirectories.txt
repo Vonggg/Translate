@@ -1,0 +1,4 @@
+D:/user/von/NewTools/Translate/AssetPipeline_CLI/AssetsTools.NET/build-native/CMakeFiles/ALL_BUILD.dir
+D:/user/von/NewTools/Translate/AssetPipeline_CLI/AssetsTools.NET/build-native/CMakeFiles/ZERO_CHECK.dir
+D:/user/von/NewTools/Translate/AssetPipeline_CLI/AssetsTools.NET/build-native/TextureEncoder/CMakeFiles/TextureEncoder.dir
+D:/user/von/NewTools/Translate/AssetPipeline_CLI/AssetsTools.NET/build-native/TextureEncoder/CMakeFiles/PVRTexLibStub.dir

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 from pathlib import Path
 from typing import Any, Iterable
 
 
 TEXTASSET_CSV_KIND = "textasset_csv"
+TEXTASSET_JSON_KIND = "textasset_json"
 TEXTASSET_SCRIPT_FIELD = "m_Script"
+_NESTED_JSON_STEP_KEY = "embedded_json"
 
 _KEY_COLUMN_NAMES = ("key", "term", "id")
 _SOURCE_COLUMN_NAMES = ("en", "english", "source", "source_text", "sourcetext", "text")
@@ -128,6 +131,69 @@ def extract_textasset_csv_cells(data: Any, json_path: Path) -> list[dict[str, An
     return cells
 
 
+def _detect_json(text: str) -> Any | None:
+    stripped = text.lstrip("\ufeff \t\r\n")
+    if not stripped.startswith(("{", "[")):
+        return None
+    try:
+        payload = json.loads(stripped)
+    except (json.JSONDecodeError, UnicodeError):
+        return None
+    return payload if isinstance(payload, (dict, list)) else None
+
+
+def extract_textasset_json_cells(data: Any, json_path: Path) -> list[dict[str, Any]]:
+    """Extract scalar strings from JSON serialized inside TextAsset.m_Script."""
+    if not _is_textasset_path(json_path) or not isinstance(data, dict):
+        return []
+    script = data.get(TEXTASSET_SCRIPT_FIELD)
+    if not isinstance(script, str):
+        return []
+    payload = _detect_json(script)
+    if payload is None:
+        return []
+
+    cells: list[dict[str, Any]] = []
+
+    def walk(node: Any, segments: list[Any]) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                walk(value, [*segments, str(key)])
+            return
+        if isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, [*segments, index])
+            return
+        if not isinstance(node, str) or not node.strip():
+            return
+        nested_payload = _detect_json(node)
+        if nested_payload is not None:
+            walk(nested_payload, [*segments, {_NESTED_JSON_STEP_KEY: True}])
+            return
+        field_parts = [TEXTASSET_SCRIPT_FIELD, "json"]
+        for segment in segments:
+            if isinstance(segment, int):
+                field_parts[-1] += "[]"
+            elif isinstance(segment, dict) and segment.get(_NESTED_JSON_STEP_KEY) is True:
+                field_parts.append("json")
+            else:
+                field_parts.append(str(segment))
+        cells.append(
+            {
+                "field": ".".join(field_parts),
+                "source_text": node,
+                "locator": {
+                    "kind": TEXTASSET_JSON_KIND,
+                    "container_field": TEXTASSET_SCRIPT_FIELD,
+                    "path": segments,
+                },
+            }
+        )
+
+    walk(payload, [])
+    return cells
+
+
 def _find_target_row(
     rows: list[list[str]],
     locator: dict[str, Any],
@@ -222,4 +288,107 @@ def apply_textasset_csv_translations(
     if not had_trailing_newline and rebuilt.endswith(line_ending):
         rebuilt = rebuilt[: -len(line_ending)]
     data[TEXTASSET_SCRIPT_FIELD] = rebuilt
+    return changes
+
+
+def apply_textasset_json_translations(
+    data: Any,
+    records: Iterable[Any],
+    translations: dict[str, str],
+) -> int:
+    """Apply selected embedded-JSON records and rebuild TextAsset.m_Script."""
+    if not isinstance(data, dict):
+        return 0
+    script = data.get(TEXTASSET_SCRIPT_FIELD)
+    if not isinstance(script, str):
+        return 0
+    payload = _detect_json(script)
+    if payload is None:
+        return 0
+    embedded_records = [
+        record
+        for record in records
+        if isinstance(getattr(record, "embedded_locator", None), dict)
+        and record.embedded_locator.get("kind") == TEXTASSET_JSON_KIND
+        and record.source_text in translations
+    ]
+    def replace_at_path(
+        node: Any,
+        path: list[Any],
+        source_text: str,
+        replacement: str,
+    ) -> tuple[Any, bool]:
+        if not path:
+            if node != source_text:
+                return node, False
+            return replacement, True
+
+        segment = path[0]
+        remaining = path[1:]
+        if isinstance(segment, dict) and segment.get(_NESTED_JSON_STEP_KEY) is True:
+            if not isinstance(node, str):
+                return node, False
+            nested_payload = _detect_json(node)
+            if nested_payload is None:
+                return node, False
+            rebuilt_payload, changed = replace_at_path(
+                nested_payload,
+                remaining,
+                source_text,
+                replacement,
+            )
+            if not changed:
+                return node, False
+            return (
+                json.dumps(rebuilt_payload, ensure_ascii=False, separators=(",", ":")),
+                True,
+            )
+
+        if isinstance(segment, int):
+            if not isinstance(node, list) or not 0 <= segment < len(node):
+                return node, False
+            rebuilt_child, changed = replace_at_path(
+                node[segment], remaining, source_text, replacement
+            )
+            if changed:
+                node[segment] = rebuilt_child
+            return node, changed
+
+        if not isinstance(segment, str) or not isinstance(node, dict) or segment not in node:
+            return node, False
+        rebuilt_child, changed = replace_at_path(
+            node[segment], remaining, source_text, replacement
+        )
+        if changed:
+            node[segment] = rebuilt_child
+        return node, changed
+
+    changes = 0
+    changed_paths: set[str] = set()
+    for record in embedded_records:
+        raw_path = record.embedded_locator.get("path")
+        if not isinstance(raw_path, list) or not raw_path:
+            continue
+        path_key = json.dumps(raw_path, ensure_ascii=False, separators=(",", ":"))
+        if path_key in changed_paths:
+            continue
+        replacement = translations.get(record.source_text)
+        if not isinstance(replacement, str) or replacement == record.source_text:
+            continue
+        payload, changed = replace_at_path(
+            payload,
+            raw_path,
+            record.source_text,
+            replacement,
+        )
+        if not changed:
+            continue
+        changed_paths.add(path_key)
+        changes += 1
+    if changes:
+        data[TEXTASSET_SCRIPT_FIELD] = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
     return changes

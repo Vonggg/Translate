@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="D:\user\von\NewTools\Translate\AssetPipeline_CLI\AssetsTools.NET\TextureEncoder\pvrtlstub.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="D:\user\von\NewTools\Translate\AssetPipeline_CLI\AssetsTools.NET\TextureEncoder\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{F00427FF-B2E8-3634-B5BA-26D6772FFE1A}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

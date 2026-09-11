@@ -166,6 +166,38 @@ class RuntimeFieldPolicyTests(unittest.TestCase):
             self.assertEqual(r"mm\:ss", repaired["_textFormat"])
             self.assertEqual("剩余时间", repaired["m_text"])
 
+    def test_manual_object_edit_wins_after_all_static_text_postprocessing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            input_root = workspace / "input"
+            text_root = workspace / "output" / "Text"
+            object_root = workspace / "output" / "Object" / "ToImport"
+            relative = Path("bin") / "Data" / "level2" / "MonoBehaviour" / "114_7_7.json"
+
+            for root, payload in (
+                (input_root, {"_textFormat": r"mm\:ss", "m_Text": "ACHIEVEMENTS"}),
+                (text_root, {"_textFormat": "错误格式", "m_Text": "自动汉化"}),
+                (object_root, {"_textFormat": "手动格式", "m_Text": "看广告获取10钻石"}),
+            ):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            cfg = SimpleNamespace(
+                workspace_root=workspace,
+                root_dir=Path(temp_dir),
+                resource_input_root=input_root,
+                stage_dir=workspace / "output",
+                object_import_dir=object_root,
+            )
+
+            overlay_root = resource_menu.build_import_overlay(cfg, {"text", "object"})
+
+            self.assertIsNotNone(overlay_root)
+            merged = json.loads((overlay_root / relative).read_text(encoding="utf-8"))
+            self.assertEqual("手动格式", merged["_textFormat"])
+            self.assertEqual("看广告获取10钻石", merged["m_Text"])
+
     def test_legacy_input_and_startup_lookup_names_are_preserved(self) -> None:
         cases = [
             ({"horizontalAxisName": "Horizontal"}, "horizontalAxisName", "Horizontal"),

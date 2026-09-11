@@ -13,6 +13,10 @@ from typing import Any
 
 from support.config import PipelineConfig
 from support.process_lock import interprocess_file_lock
+from .dynamic_translation_dictionary import (
+    STRINGLITERAL_TRANSLATIONS_FILENAME,
+    select_whole_text_dictionary_entries,
+)
 from .manifest_index import load_tmp_manifest_index, tmp_manifest_index_path
 from .shared import collect_json_files, is_visible_char, read_json, unique_preserve_order, write_json
 
@@ -83,6 +87,8 @@ TMP_SDF_MATERIAL_FLOAT_KEYS = {
     "_WeightNormal",
 }
 
+TMP_BOLD_STRENGTH_SCALE = 0.5
+
 RICH_TEXT_TAG_RE = re.compile(r"<[^>]*>")
 
 
@@ -140,40 +146,10 @@ def _supported_codepoints_from_ttf(font_path: Path) -> set[int] | None:
         return None
 
 
-def _is_cjk_codepoint(codepoint: int) -> bool:
-    return (
-        0x3400 <= codepoint <= 0x4DBF
-        or 0x4E00 <= codepoint <= 0x9FFF
-        or 0xF900 <= codepoint <= 0xFAFF
-        or 0x20000 <= codepoint <= 0x2A6DF
-        or 0x2A700 <= codepoint <= 0x2B73F
-        or 0x2B740 <= codepoint <= 0x2B81F
-        or 0x2B820 <= codepoint <= 0x2CEAF
-        or 0x2CEB0 <= codepoint <= 0x2EBEF
-        or 0x30000 <= codepoint <= 0x3134F
-    )
-
-
 def _is_tmp_char_candidate(char: str) -> bool:
     if not char:
         return False
     return not unicodedata.category(char).startswith("C")
-
-
-def _non_chinese_chars_from_supported_ttf(supported: set[int] | None) -> str:
-    if supported is None:
-        return ""
-    chars: list[str] = []
-    for codepoint in sorted(supported):
-        if _is_cjk_codepoint(codepoint):
-            continue
-        try:
-            char = chr(codepoint)
-        except ValueError:
-            continue
-        if _is_tmp_char_candidate(char):
-            chars.append(char)
-    return "".join(chars)
 
 
 def _chars_from_supported_codepoints(supported: set[int] | None) -> str:
@@ -264,26 +240,53 @@ def _report_translation_chars_missing_from_ttf(
     if supported is None:
         return ""
 
-    trans_path = cfg.stage_record_dir / cfg.output_trans_json
-    if not trans_path.is_file():
-        print(f"[TMP] 未找到 trans.json，跳过译文 TTF 字符支持检查: {trans_path}", flush=True)
-        return ""
-
-    try:
-        translations = read_json(trans_path)
-    except Exception as exc:
-        print(f"[TMP] 读取 trans.json 失败，跳过译文 TTF 字符支持检查: {exc}", flush=True)
-        return ""
-    if not isinstance(translations, dict):
-        print("[TMP] trans.json 不是键值表，跳过译文 TTF 字符支持检查。", flush=True)
+    translation_paths = [
+        ("静态", cfg.stage_record_dir / cfg.output_trans_json),
+        ("动态", cfg.stage_record_dir / STRINGLITERAL_TRANSLATIONS_FILENAME),
+    ]
+    translation_items: list[tuple[str, str]] = []
+    loaded_labels: list[str] = []
+    for translation_kind, trans_path in translation_paths:
+        if not trans_path.is_file():
+            continue
+        try:
+            translations = read_json(trans_path)
+        except Exception as exc:
+            print(
+                f"[TMP] 读取{translation_kind}词库失败，跳过该词库字符支持检查: "
+                f"{trans_path} ({exc})",
+                flush=True,
+            )
+            continue
+        if not isinstance(translations, dict):
+            print(
+                f"[TMP] {trans_path.name} 不是键值表，跳过该词库字符支持检查。",
+                flush=True,
+            )
+            continue
+        loaded_labels.append(translation_kind)
+        if translation_kind == "动态":
+            dynamic_entries, _dynamic_skipped = select_whole_text_dictionary_entries(
+                translations
+            )
+            translation_items.extend(dynamic_entries)
+        else:
+            translation_items.extend(
+                (source_text, translated_text)
+                for source_text, translated_text in translations.items()
+                if isinstance(source_text, str)
+                and isinstance(translated_text, str)
+                and translated_text
+                and source_text != translated_text
+            )
+    if not loaded_labels:
+        print("[TMP] 未找到可用的静态/动态翻译词库，跳过译文 TTF 字符支持检查。", flush=True)
         return ""
 
     missing_chars: list[str] = []
     rows = ["source\ttranslated\tcode\tchar"]
     seen_rows: set[tuple[str, str, str]] = set()
-    for source_text, translated_text in translations.items():
-        if not isinstance(source_text, str) or not isinstance(translated_text, str):
-            continue
+    for source_text, translated_text in translation_items:
         visible_translated_text = RICH_TEXT_TAG_RE.sub("", translated_text)
         for char in unique_preserve_order(visible_translated_text):
             if not is_visible_char(char) or ord(char) in supported:
@@ -309,24 +312,27 @@ def _report_translation_chars_missing_from_ttf(
         for stale_path in (missing_path, missing_detail_path):
             if stale_path.exists():
                 stale_path.unlink()
-        _log_green(f"[TMP] {label} 已覆盖 trans.json 中全部译文字符。")
+        _log_green(f"[TMP] {label} 已覆盖静态/动态词库中的全部有效译文字符。")
         return ""
 
     missing_path.write_text(missing_text, encoding="utf-8")
     missing_detail_path.write_text("\n".join(rows), encoding="utf-8")
     print("", flush=True)
-    _log_red(f"[TMP][需要处理] trans.json 的译文包含{label}不支持的字符。")
+    _log_red(f"[TMP][需要处理] 静态/动态词库的译文包含{label}不支持的字符。")
     _log_red(f"[TMP][需要处理] 不支持字符数: {len(missing_text)}")
     _log_red(f"[TMP][需要处理] 字符: {missing_text}")
     _log_red(f"[TMP][需要处理] 清单: {missing_path}")
     _log_red(f"[TMP][需要处理] 详情: {missing_detail_path}")
     if stop_on_missing:
-        _log_red(f"[TMP][停止] 请先修改 trans.json 中对应译文，或更换包含这些字符的{label}，然后重新执行菜单 7。")
+        _log_red(
+            f"[TMP][停止] 请先修改 trans.json 或 {STRINGLITERAL_TRANSLATIONS_FILENAME} 中对应译文，"
+            f"或更换包含这些字符的{label}，然后重新执行菜单 8。"
+        )
         if output_prefix == "translation_chars_missing_from_ttf":
             print("[TMP][提示] 可运行 工具脚本.py -> 主菜单 4. 清理 trans.json 中模板 TTF 不支持的字符。", flush=True)
             print(f"[TMP][提示] 命令行: python {cfg.root_dir / '工具脚本.py'} clean-unsupported-ttf-chars", flush=True)
     else:
-        print(f"[TMP][提示] 这只影响{label}兼容性，不中断当前菜单 7 后续流程。", flush=True)
+        print(f"[TMP][提示] 这只影响{label}兼容性，不中断当前菜单 8 后续流程。", flush=True)
     return missing_text
 
 
@@ -346,7 +352,7 @@ def _filter_merged_chars_by_ttf_support(
         return chars, ""
 
     source_label = (
-        "模板 TTF 非中文字符 + "
+        "模板 TTF 全部字符 + "
         f"{'老工具 SDF 模板字符 + ' if cfg.include_old_sdf_template_chars else ''}"
         "原游戏字体字符 + 译文字符"
     )
@@ -496,10 +502,10 @@ def build_merged_tmp_chars(cfg: PipelineConfig) -> Path:
             stale_path.unlink()
     if missing_translation_chars:
         raise SystemExit(1)
-    template_non_chinese_chars = _non_chinese_chars_from_supported_ttf(supported_ttf_chars)
+    template_ttf_chars = _chars_from_supported_codepoints(supported_ttf_chars)
     all_old_sdf_template_chars = _chars_from_supported_codepoints(supported_old_sdf_chars)
     old_sdf_template_chars = all_old_sdf_template_chars if cfg.include_old_sdf_template_chars else ""
-    print(f"[TMP] 模板 TTF 非中文字符: {len(template_non_chinese_chars)} 个，将参与 tmp_chars.txt 合并。", flush=True)
+    print(f"[TMP] 模板 TTF 全部字符: {len(template_ttf_chars)} 个，将参与 tmp_chars.txt 合并。", flush=True)
     if cfg.include_old_sdf_template_chars:
         print(f"[TMP] 老工具 SDF 模板字符: {len(old_sdf_template_chars)} 个，将参与 tmp_chars.txt 合并。", flush=True)
     else:
@@ -512,7 +518,7 @@ def build_merged_tmp_chars(cfg: PipelineConfig) -> Path:
     if old_tmp_chars:
         print(f"[TMP] 已从资源导出目录提取原 TMP 字符: {len(old_tmp_chars)} 个", flush=True)
     old_tmp_char_set = set(old_tmp_chars)
-    merged = "".join(unique_preserve_order(template_non_chinese_chars + old_sdf_template_chars + old_tmp_chars + source_chars))
+    merged = "".join(unique_preserve_order(template_ttf_chars + old_sdf_template_chars + old_tmp_chars + source_chars))
     merged = "".join(char for char in merged if _is_tmp_char_candidate(char))
     merged_before_filter_count = len(merged)
     merged, missing_from_ttf = _filter_merged_chars_by_ttf_support(cfg, merged, supported_ttf_chars)
@@ -525,7 +531,7 @@ def build_merged_tmp_chars(cfg: PipelineConfig) -> Path:
     output_path = cfg.stage_record_dir / cfg.output_tmp_chars_txt
     output_path.write_text(merged, encoding="utf-8")
     print(
-        f"[TMP] 模板 TTF 非中文字符 + "
+        f"[TMP] 模板 TTF 全部字符 + "
         f"{'老工具 SDF 模板字符 + ' if cfg.include_old_sdf_template_chars else ''}"
         f"原游戏字体字符 + 译文字符: {merged_before_filter_count} 个；"
         f"写入 tmp_chars.txt: {len(merged)} 个；删除模板 TTF 不支持字符: {len(missing_from_ttf)} 个",
@@ -612,6 +618,10 @@ def _build_tmp_font_replacement(template: dict[str, Any], old: dict[str, Any]) -
     # data. This preserves fallback tables, source font references, face metrics,
     # material identity and other runtime structure from the game asset.
     new = copy.deepcopy(old)
+
+    # Always derive from the source FontAsset, never the previous ToImport output.
+    if isinstance(old.get("boldStyle"), (int, float)):
+        new["boldStyle"] = old["boldStyle"] * TMP_BOLD_STRENGTH_SCALE
 
     for key in (
         "m_GlyphTable",
@@ -763,6 +773,12 @@ def _apply_generated_sdf_material_floats(
         if not isinstance(item, dict):
             continue
         name = item.get("first")
+        if name == "_WeightBold" and "second" in item:
+            value = generated_values.get(name, item["second"])
+            if isinstance(value, (int, float)):
+                item["second"] = value * TMP_BOLD_STRENGTH_SCALE
+                updated.append(name)
+            continue
         if name not in generated_values or "second" not in item:
             continue
         item["second"] = copy.deepcopy(generated_values[name])
@@ -1308,6 +1324,28 @@ def prepare_generated_tmp_import_replacements(
         print(f"[TMP替换][提示] 未读取到生成字体材质参数，仅执行材质阴影/描边清理。", flush=True)
 
     used_tmp_font_paths = _used_tmp_font_paths_from_font_map(cfg)
+    reported_tmp_paths: set[Path] | None = None
+    bitmap_report_path = cfg.stage_record_dir / "bitmap_font_detection.json"
+    if bitmap_report_path.is_file():
+        try:
+            bitmap_report = read_json(bitmap_report_path)
+            reported_sources = bitmap_report.get("tmp_sdf_sources")
+            reported_count = int(bitmap_report.get("tmp_sdf_count", 0) or 0)
+            if (
+                isinstance(reported_sources, list)
+                and (reported_sources or reported_count == 0)
+            ):
+                reported_tmp_paths = {
+                    (cfg.resource_input_root / str(relative)).resolve()
+                    for relative in reported_sources
+                    if str(relative).strip()
+                }
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            print(
+                f"[TMP替换][提示] 字体检测报告无法用于候选预筛选，将回退全量扫描: {exc}",
+                flush=True,
+            )
+
     all_items = list(_iter_manifest_items(cfg))
     texture_items: dict[tuple[Path, str, int], tuple[Path, dict[str, Any]]] = {}
     material_items: dict[tuple[Path, str, int], tuple[Path, dict[str, Any]]] = {}
@@ -1320,6 +1358,10 @@ def prepare_generated_tmp_import_replacements(
         elif type_name == "Material" and path_id is not None:
             material_items[(manifest_path, _item_bundle_entry(item), path_id)] = (manifest_dir, item)
         elif type_name == "MonoBehaviour":
+            if reported_tmp_paths is not None:
+                item_path = _resolve_manifest_item_path(manifest_dir, item)
+                if item_path is None or item_path.resolve() not in reported_tmp_paths:
+                    continue
             mono_items.append((manifest_path, manifest_dir, item))
 
     path_id_map = _load_path_id_map_for_tmp(cfg)
@@ -1359,6 +1401,12 @@ def prepare_generated_tmp_import_replacements(
         print(
             "[TMP替换] font_map 直接引用仅用于诊断，不再排除其他 TMP FontAsset；"
             f"候选 MonoBehaviour={len(mono_items)}",
+            flush=True,
+        )
+    if reported_tmp_paths is not None:
+        print(
+            "[TMP替换] 复用脚本 0 字体检测报告预筛选 TMP FontAsset："
+            f"报告源={len(reported_tmp_paths)}，manifest 命中={len(mono_items)}",
             flush=True,
         )
 
@@ -1580,7 +1628,7 @@ def prepare_generated_tmp_import_replacements(
 
         replacement = source_material
         updated: list[str] = []
-        if target.get("sync_sdf_material") and generated_values:
+        if target.get("sync_sdf_material"):
             replacement, updated = _apply_generated_sdf_material_floats(replacement, generated_values)
 
         disabled = 0

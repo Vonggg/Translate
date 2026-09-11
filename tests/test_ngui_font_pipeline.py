@@ -13,6 +13,7 @@ from pipeline.ngui_font import (
     GENERATION_MANIFEST_NAME,
     REMOVED_UNSUPPORTED_CHARS_NAME,
     REMOVED_UNSUPPORTED_DETAILS_NAME,
+    _translated_characters,
     generate_ngui_fonts,
     prepare_generated_ngui_import_replacements,
 )
@@ -187,6 +188,7 @@ class NguiFontPipelineTests(unittest.TestCase):
             encoding="utf-8",
         )
         (records / "trans.json").write_text(json.dumps({"hello": "你好"}), encoding="utf-8")
+        (records / "tmp_chars.txt").write_text("你好", encoding="utf-8")
 
         return SimpleNamespace(
             resource_input_root=input_root,
@@ -260,6 +262,14 @@ class NguiFontPipelineTests(unittest.TestCase):
             self.assertTrue((cfg.ngui_import_dir / original_texture.relative_to(cfg.resource_input_root)).is_file())
             self.assertTrue((cfg.ngui_generated_dir / GENERATION_MANIFEST_NAME).is_file())
 
+    def test_ngui_uses_tmp_chars_not_earlier_game_chars(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = self._fixture(Path(temp_dir))
+            (cfg.stage_record_dir / "game_chars.txt").write_text("旧字符", encoding="utf-8")
+            (cfg.stage_record_dir / "tmp_chars.txt").write_text("最终", encoding="utf-8")
+
+            self.assertEqual(_translated_characters(cfg), ["最", "终"])
+
     def test_shared_atlas_fonts_reuse_one_generated_glyph_bitmap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cfg = self._fixture(Path(temp_dir))
@@ -325,6 +335,54 @@ class NguiFontPipelineTests(unittest.TestCase):
                     positions.append((glyph["x"], glyph["y"], glyph["width"], glyph["height"]))
                 self.assertEqual(positions[0], positions[1])
 
+    def test_trimmed_source_font_sprite_is_replaced_by_untrimmed_generated_page(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = self._fixture(Path(temp_dir))
+            atlas_path = (
+                cfg.resource_input_root
+                / "bin" / "Data" / "demo" / "bundle" / "shared.assets"
+                / "MonoBehaviour" / "MainAtlas_30.json"
+            )
+            atlas = json.loads(atlas_path.read_text(encoding="utf-8"))
+            source_sprite = atlas["mSprites"]["Array"][0]
+            source_sprite.update(
+                {
+                    "width": 63,
+                    "height": 63,
+                    "paddingRight": 1,
+                    "paddingTop": 1,
+                }
+            )
+            atlas_path.write_text(json.dumps(atlas), encoding="utf-8")
+
+            generate_ngui_fonts(cfg)
+
+            generated_atlas = json.loads(
+                (cfg.ngui_generated_dir / atlas_path.relative_to(cfg.resource_input_root)).read_text(
+                    encoding="utf-8"
+                )
+            )
+            generated_font_path = (
+                cfg.ngui_generated_dir
+                / "bin" / "Data" / "demo" / "bundle" / "shared.assets"
+                / "MonoBehaviour" / "TestFont_40.json"
+            )
+            generated_font = json.loads(generated_font_path.read_text(encoding="utf-8"))
+            page_name = generated_font["mFont"]["mSpriteName"]
+            sprites = {sprite["name"]: sprite for sprite in generated_atlas["mSprites"]["Array"]}
+
+            self.assertEqual(1, sprites["TestFont"]["paddingRight"])
+            self.assertEqual(1, sprites["TestFont"]["paddingTop"])
+            generated_page = sprites[page_name]
+            self.assertEqual((0, 0, 256, 256), tuple(
+                generated_page[key] for key in ("x", "y", "width", "height")
+            ))
+            for field in (
+                "paddingLeft", "paddingRight", "paddingTop", "paddingBottom",
+                "borderLeft", "borderRight", "borderTop", "borderBottom",
+            ):
+                self.assertEqual(0, generated_page[field])
+
     def test_unsupported_source_glyph_is_reported_and_removed_like_sdf(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cfg = self._fixture(Path(temp_dir))
@@ -362,6 +420,7 @@ class NguiFontPipelineTests(unittest.TestCase):
                 json.dumps({"hello": "😀"}),
                 encoding="utf-8",
             )
+            (cfg.stage_record_dir / "tmp_chars.txt").write_text("😀", encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "译文字符"):
                 generate_ngui_fonts(cfg)

@@ -51,6 +51,28 @@ class ResourceMenuExportProfileTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(prompt.call_count, 3)
 
+    def test_export_all_command_is_noninteractive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            cfg = SimpleNamespace(
+                resource_input_root=workspace / "input",
+                resource_managed_root=workspace / "Managed",
+                import_overlay_dir=workspace / "ToImport",
+                workspace_root=workspace,
+                log_dir=workspace / "logs",
+            )
+            with (
+                patch.object(resource_menu, "load_config", return_value=cfg),
+                patch.object(resource_menu.sys, "argv", ["resource_menu.py", "export-all"]),
+                patch.object(resource_menu, "run_export_profile", return_value=0) as run_export,
+                patch.object(resource_menu, "prompt_input") as prompt,
+            ):
+                result = resource_menu.main()
+
+            self.assertEqual(result, 0)
+            run_export.assert_called_once_with(cfg, "all")
+            prompt.assert_not_called()
+
     def test_monobehaviour_summary_reports_safely_preserved_objects(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             input_root = Path(temp_dir)

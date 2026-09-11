@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\user\von\NewTools\Translate\AssetPipeline_CLI\AssetsTools.NET\build-native\CMakeFiles\29f5f35549cbda65d4b5603d4d43fca0\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{C7807721-3BFB-3F27-891A-D147A858F15B}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

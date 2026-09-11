@@ -215,6 +215,39 @@ class SplitSpriteSelectionTests(unittest.TestCase):
             self.assertIsNotNone(preview)
             self.assertEqual(preview.size, (4, 3))
 
+    def test_preview_sprite_applies_atlas_downscale_multiplier(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            texture_path = Path(temp_dir) / "atlas.png"
+            atlas = Image.new("RGBA", (4, 4), (255, 0, 0, 255))
+            atlas.paste((0, 255, 0, 255), (1, 1, 3, 2))
+            atlas.save(texture_path)
+            scope = {
+                "items": {
+                    ("Texture2D", 64): {"data": {}, "path": texture_path},
+                    ("Sprite", 7): {
+                        "data": {
+                            "m_RD": {
+                                "texture": {"m_FileID": 0, "m_PathID": 64},
+                                "textureRect": {
+                                    "x": 2, "y": 4, "width": 4, "height": 2,
+                                },
+                                "downscaleMultiplier": 0.5,
+                                "settingsRaw": 0,
+                            }
+                        }
+                    },
+                }
+            }
+            scope["pointer_scopes"] = {0: scope}
+
+            preview = TOOLS._preview_sprite_image(scope, 7)
+
+            self.assertIsNotNone(preview)
+            self.assertEqual(preview.size, (4, 2))
+            self.assertEqual(preview.getpixel((2, 1)), (0, 255, 0, 255))
+
     def test_sprite_render_data_resolves_external_sprite_atlas_scope(self) -> None:
         render_key = {"first": {"data[0]": 9}, "second": 21300000}
         packed_data = {
@@ -262,7 +295,7 @@ class SplitSpriteSelectionTests(unittest.TestCase):
             )
             texture_path.parent.mkdir(parents=True)
             atlas_image = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
-            atlas_image.paste((20, 40, 60, 255), (1, 2, 4, 6))
+            atlas_image.paste((20, 40, 60, 255), (1, 5, 3, 6))
             atlas_image.save(texture_path)
 
             allpng_root = root / "AllPNG"
@@ -290,7 +323,8 @@ class SplitSpriteSelectionTests(unittest.TestCase):
             render_key = {"first": {"data[0]": 9}, "second": 21300000}
             packed_data = {
                 "texture": {"m_FileID": 0, "m_PathID": 64},
-                "textureRect": {"x": 1, "y": 2, "width": 3, "height": 4},
+                "textureRect": {"x": 2, "y": 4, "width": 4, "height": 2},
+                "downscaleMultiplier": 0.5,
                 "settingsRaw": 0,
             }
             atlas_scope = {
@@ -370,12 +404,14 @@ class SplitSpriteSelectionTests(unittest.TestCase):
             self.assertEqual(item["render_data_source"], "sprite_atlas")
             self.assertEqual(Path(item["texture_png"]), texture_path)
             self.assertEqual(
-                item["rect"], {"x": 1, "y": 2, "width": 3, "height": 4}
+                item["rect"], {"x": 2, "y": 4, "width": 4, "height": 2}
             )
+            self.assertEqual(item["downscale_multiplier"], 0.5)
             split_path = sprite_root / "PNG" / "ItemIcon_7.png"
             self.assertTrue(split_path.is_file())
             with Image.open(split_path) as split_image:
-                self.assertEqual(split_image.size, (3, 4))
+                self.assertEqual(split_image.size, (4, 2))
+                self.assertEqual(split_image.convert("RGBA").getpixel((2, 1)), (20, 40, 60, 255))
             self.assertFalse((sprite_root / "PNG" / "sactx-items_2.png").exists())
 
     def test_split_sprite_can_be_selected_without_regular_allpng_map(self) -> None:

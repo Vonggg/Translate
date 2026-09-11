@@ -481,6 +481,72 @@ class PipelineConfig:
         return (self.project_dir / self.stringliteral_json_subpath).resolve()
 
     @property
+    def il2cpp_script_json_path(self) -> Path:
+        return self.stringliteral_json_path.with_name("script.json")
+
+    @property
+    def il2cpp_dump_cs_path(self) -> Path:
+        return self.stringliteral_json_path.with_name("dump.cs")
+
+    @property
+    def libil2cpp_arm64_path(self) -> Path:
+        preferred = (
+            self.project_dir
+            / "game-name"
+            / "game"
+            / "lib"
+            / "arm64-v8a"
+            / "libil2cpp.so"
+        ).resolve()
+        if preferred.is_file() and preferred.stat().st_size > 0:
+            return preferred
+
+        game_root = (self.project_dir / "game-name").resolve()
+        common_candidates = [
+            game_root / "game" / "assets" / "lib" / "arm64-v8a" / "libil2cpp.so",
+            game_root / "GAME_hongtu_L" / "lib" / "arm64-v8a" / "libil2cpp.so",
+            game_root / "GAME_hongtu_L" / "assets" / "lib" / "arm64-v8a" / "libil2cpp.so",
+            game_root / "GAME_hongtu_P" / "lib" / "arm64-v8a" / "libil2cpp.so",
+            game_root / "GAME_hongtu_P" / "assets" / "lib" / "arm64-v8a" / "libil2cpp.so",
+        ]
+        for candidate in common_candidates:
+            try:
+                if candidate.is_file() and candidate.stat().st_size > 0:
+                    return candidate.resolve()
+            except OSError:
+                continue
+
+        if game_root.is_dir():
+            discovered: list[Path] = []
+            try:
+                for candidate in game_root.rglob("libil2cpp.so"):
+                    lowered_parts = {part.lower() for part in candidate.parts}
+                    if "arm64-v8a" not in lowered_parts:
+                        continue
+                    try:
+                        if candidate.is_file() and candidate.stat().st_size > 0:
+                            discovered.append(candidate.resolve())
+                    except OSError:
+                        continue
+            except OSError:
+                discovered = []
+            if discovered:
+                def rank(path: Path) -> tuple[int, int, str]:
+                    lowered = str(path).lower().replace("\\", "/")
+                    source_rank = (
+                        0 if "/game/" in lowered
+                        else 1 if "/game_hongtu_l/" in lowered
+                        else 2 if "/game_hongtu_p/" in lowered
+                        else 3
+                    )
+                    return source_rank, len(path.parts), lowered
+
+                return min(discovered, key=rank)
+        # Preserve the historical path in the eventual error message when no
+        # valid binary can be discovered.
+        return preferred
+
+    @property
     def scan_state_path(self) -> Path:
         return self.stage_record_dir / self.scan_state_json
 
@@ -498,6 +564,16 @@ def load_config(config_path: str | Path | None = None, quiet: bool = False) -> P
 
     def get_value(key: str, default: Any) -> Any:
         return raw.get(key, default)
+
+    def worker_value(key: str, env_key: str) -> int:
+        configured = max(0, int(get_value(key, 0) or 0))
+        try:
+            automatic = max(0, int(os.environ.get(env_key, "0") or 0))
+        except ValueError:
+            automatic = 0
+        if configured > 0 and automatic > 0:
+            return min(configured, automatic)
+        return configured or automatic
 
     project_name = _normalize_project_name(get_value("project_name", ""))
 
@@ -666,10 +742,18 @@ def load_config(config_path: str | Path | None = None, quiet: bool = False) -> P
         output_mapping_tsv=get_value("output_mapping_tsv", "mapping.tsv"),
         scan_state_json=get_value("scan_state_json", "scan_state.json"),
         scan_cache_dir=get_value("scan_cache_dir", "scan_cache"),
-        max_scan_workers=int(get_value("max_scan_workers", 0) or 0),
-        max_translate_workers=int(get_value("max_translate_workers", 0) or 0),
-        max_export_workers=max(0, int(get_value("max_export_workers", 0) or 0)),
-        max_import_workers=max(0, int(get_value("max_import_workers", 0) or 0)),
+        max_scan_workers=worker_value(
+            "max_scan_workers", "TRANSLATE_AUTO_MAX_SCAN_WORKERS"
+        ),
+        max_translate_workers=worker_value(
+            "max_translate_workers", "TRANSLATE_AUTO_MAX_TRANSLATE_WORKERS"
+        ),
+        max_export_workers=worker_value(
+            "max_export_workers", "TRANSLATE_AUTO_MAX_EXPORT_WORKERS"
+        ),
+        max_import_workers=worker_value(
+            "max_import_workers", "TRANSLATE_AUTO_MAX_IMPORT_WORKERS"
+        ),
         verbose_export_assets=bool(get_value("verbose_export_assets", False)),
         enable_sample_collection=bool(get_value("enable_sample_collection", False)),
         include_ascii=bool(get_value("include_ascii", True)),

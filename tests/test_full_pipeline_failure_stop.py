@@ -69,15 +69,54 @@ class FullPipelineFailureStopTests(unittest.TestCase):
 
     def test_any_step_exception_is_converted_to_failure_code(self) -> None:
         with patch("main.export_translated_files", side_effect=ValueError("broken output")):
-            result = main._run_noninteractive_step(SimpleNamespace(), "4")
+            result = main._run_noninteractive_step(SimpleNamespace(), "5")
 
         self.assertEqual(result, 1)
 
     def test_keyboard_interrupt_is_converted_to_stop_code(self) -> None:
         with patch("main.build_ttf_replacements", side_effect=KeyboardInterrupt):
-            result = main._run_noninteractive_step(SimpleNamespace(), "6")
+            result = main._run_noninteractive_step(SimpleNamespace(), "7")
 
         self.assertEqual(result, 130)
+
+    def test_script_three_dispatches_independent_dynamic_dictionary_builder(self) -> None:
+        cfg = SimpleNamespace()
+        with patch("main.generate_dynamic_translation_dictionary") as generate:
+            result = main._execute_noninteractive_step(cfg, "3")
+
+        self.assertEqual(result, 0)
+        generate.assert_called_once_with(
+            cfg,
+            translation_builder=main.build_translation_map_for_texts,
+        )
+
+    def test_full_pipeline_includes_new_step_three_and_finishes_at_ten(self) -> None:
+        cfg = SimpleNamespace(enable_ai_field_review=True)
+        with patch(
+            "main._run_steps_in_isolated_processes",
+            return_value=0,
+        ) as run:
+            result = main._run_full_pipeline_in_isolated_processes(cfg)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [str(index) for index in range(11)],
+            run.call_args.args[1],
+        )
+
+    def test_full_pipeline_without_field_ai_skips_only_step_one(self) -> None:
+        cfg = SimpleNamespace(enable_ai_field_review=False)
+        with patch(
+            "main._run_steps_in_isolated_processes",
+            return_value=0,
+        ) as run:
+            result = main._run_full_pipeline_in_isolated_processes(cfg)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            ["0", *[str(index) for index in range(2, 11)]],
+            run.call_args.args[1],
+        )
 
 
 if __name__ == "__main__":

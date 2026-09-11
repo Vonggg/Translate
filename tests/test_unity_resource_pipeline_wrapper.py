@@ -31,6 +31,7 @@ class UnityResourcePipelineWrapperTests(unittest.TestCase):
                 sample_root=sample_root,
                 import_workers=0,
                 save_samples=True,
+                verbose_import_assets=False,
             )
 
             command = unity_resource_pipeline.build_command(args, root / "AssetPipeline_CLI")
@@ -42,6 +43,8 @@ class UnityResourcePipelineWrapperTests(unittest.TestCase):
             )
             sample_index = command.index("--sample-root")
             self.assertEqual(Path(command[sample_index + 1]), sample_root)
+            verbose_index = command.index("--verbose-import-assets")
+            self.assertEqual(command[verbose_index + 1], "false")
 
 
 if __name__ == "__main__":

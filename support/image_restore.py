@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Mapping
 
 from support.image_import_utils import copy_image_for_import
+
+
+NGUI_FONT_GENERATION_MANIFEST = "ngui_font_generation.json"
 
 
 def _print_red(message: str) -> None:
@@ -97,8 +101,16 @@ def restore_split_sprites_to_import(
     sprite_map_path: Path,
     source_root: Path,
     imported_images: set[Path] | None = None,
+    ngui_font_atlas_bases: Mapping[str, Path] | None = None,
+    prepared_ngui_atlases: set[str] | None = None,
 ) -> tuple[int, int, int]:
-    """Patch edited Unity Sprite/NGUI UIAtlas PNGs into original Texture2D atlases."""
+    """Patch edited Sprite/NGUI UIAtlas PNGs into their Texture2D atlases.
+
+    An NGUI bitmap-font atlas is larger than its source Texture2D after the
+    font generator runs.  For an edited Sprite belonging to one of those
+    atlases, start from that generated atlas, then paste the Sprite into it.
+    This keeps both the generated glyphs and the translated UI Sprite.
+    """
     from PIL import Image
 
     items = load_allpng_map(sprite_map_path)
@@ -152,7 +164,14 @@ def restore_split_sprites_to_import(
             _print_red(f"[图集回拼][跳过] 原图集不在 workspace/input 中: {texture_path}")
             continue
         target_path = to_import_root / relative_texture_path
-        base_path = target_path if target_path.is_file() else texture_path
+        font_atlas_path = (ngui_font_atlas_bases or {}).get(key)
+        # A direct full-texture edit was already merged into an expanded font
+        # atlas by ``compose_ngui_font_atlas_image_overrides``.  Otherwise a
+        # generated font atlas must win over a stale/plain Texture2D target.
+        if font_atlas_path is not None and key not in (prepared_ngui_atlases or set()):
+            base_path = font_atlas_path
+        else:
+            base_path = target_path if target_path.is_file() else texture_path
         if not base_path.is_file():
             invalid += len(group["sprites"])
             _print_red(f"[图集回拼][跳过] 找不到原始 Texture2D: {texture_path}")
@@ -172,6 +191,11 @@ def restore_split_sprites_to_import(
             y = round(_number(rect.get("y")))
             width = round(_number(rect.get("width")))
             height = round(_number(rect.get("height")))
+            downscale_multiplier = _number(
+                item.get("downscale_multiplier"), 1.0
+            )
+            if downscale_multiplier <= 0:
+                downscale_multiplier = 1.0
             is_ngui = item.get("item_type") == "ngui_sprite"
             rotation = 0 if is_ngui else int(item.get("packing_rotation", 0) or 0)
             expected_size = (height, width) if rotation == 4 else (width, height)
@@ -198,22 +222,47 @@ def restore_split_sprites_to_import(
                 invalid += 1
                 _print_red(f"[图集回拼][跳过] 还原 packing rotation 后尺寸异常: {edited_path.name}")
                 continue
+            left = round(x * downscale_multiplier)
+            right = round((x + width) * downscale_multiplier)
+            scaled_y = round(y * downscale_multiplier)
+            scaled_upper = round((y + height) * downscale_multiplier)
+            scaled_width = right - left
+            scaled_height = scaled_upper - scaled_y
+            if scaled_width <= 0 or scaled_height <= 0:
+                invalid += 1
+                _print_red(f"[图集回拼][跳过] 缩放后的矩形尺寸无效: {edited_path.name}")
+                continue
+            if sprite.size != (scaled_width, scaled_height):
+                sprite = sprite.resize(
+                    (scaled_width, scaled_height),
+                    Image.Resampling.LANCZOS,
+                )
             # Unity Sprite textureRect uses a bottom-left origin; NGUI UIAtlas
             # mSprites stores y from the top edge of the atlas.
-            top = y if is_ngui else atlas.height - y - height
-            if x < 0 or top < 0 or x + width > atlas.width or top + height > atlas.height:
+            top = scaled_y if is_ngui else atlas.height - scaled_upper
+            if (
+                left < 0
+                or top < 0
+                or right > atlas.width
+                or top + scaled_height > atlas.height
+            ):
                 invalid += 1
                 _print_red(f"[图集回拼][跳过] 子图矩形超出原图集: {edited_path.name}")
                 continue
             # 透明像素也必须覆盖原区域，否则旧图会从透明处残留。
-            atlas.paste(sprite, (x, top))
+            atlas.paste(sprite, (left, top))
             atlas_patched += 1
             patched_sprites += 1
             if imported_images is not None:
                 imported_images.add(edited_path.resolve())
             print(
                 f"[图集回拼] {edited_path.name} -> {relative_texture_path} "
-                f"({x}, {y}, {width}, {height})"
+                f"({left}, {scaled_y}, {scaled_width}, {scaled_height})"
+                + (
+                    f" [SpriteAtlas scale={downscale_multiplier:g}]"
+                    if downscale_multiplier != 1.0
+                    else ""
+                )
             )
         if atlas_patched:
             target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,11 +275,55 @@ def restore_split_sprites_to_import(
     return patched_sprites, rebuilt_atlases, invalid
 
 
+def _load_ngui_font_generation_groups(generation_manifest_path: Path) -> dict[Path, dict]:
+    if not generation_manifest_path.is_file():
+        raise FileNotFoundError(f"缺少 NGUI 字体生成清单: {generation_manifest_path}")
+
+    manifest = json.loads(generation_manifest_path.read_text(encoding="utf-8-sig"))
+    groups = manifest.get("groups", []) if isinstance(manifest, dict) else []
+    if not isinstance(groups, list):
+        raise ValueError(f"NGUI 字体生成清单 groups 无效: {generation_manifest_path}")
+
+    group_by_texture: dict[Path, dict] = {}
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        texture = group.get("texture")
+        if isinstance(texture, str) and texture:
+            relative = Path(*texture.replace("\\", "/").split("/"))
+            group_by_texture[relative] = group
+    return group_by_texture
+
+
+def load_ngui_font_atlas_bases(
+    ngui_import_root: Path,
+    source_root: Path,
+    generation_manifest_path: Path,
+) -> dict[str, Path]:
+    """Return source Texture2D path -> generated NGUI font-atlas PNG."""
+    if not ngui_import_root.is_dir():
+        return {}
+
+    groups = _load_ngui_font_generation_groups(generation_manifest_path)
+    bases: dict[str, Path] = {}
+    for relative in groups:
+        source_path = source_root / relative
+        generated_path = ngui_import_root / relative
+        if not source_path.is_file():
+            raise FileNotFoundError(f"NGUI 字体图集原图不存在: {source_path}")
+        if not generated_path.is_file():
+            raise FileNotFoundError(f"NGUI 字体图集待导入文件不存在: {generated_path}")
+        bases[str(source_path.resolve()).lower()] = generated_path
+    return bases
+
+
 def restore_edited_images_before_import(
     workspace_root: Path,
     source_root: Path,
     to_import_root: Path,
     not_imported_images: list[Path] | None = None,
+    ngui_font_import_root: Path | None = None,
+    ngui_generation_manifest_path: Path | None = None,
 ) -> tuple[int, int, int, int]:
     """Restore flat edited images immediately before the image import overlay is built."""
     all_image_root = workspace_root / "AllPNG"
@@ -273,6 +366,33 @@ def restore_edited_images_before_import(
     else:
         print("[图片恢复] 修改目录中只有已映射的 Sprite 子图，跳过普通图片恢复。")
 
+    ngui_font_atlas_bases: dict[str, Path] = {}
+    prepared_ngui_atlases: set[str] = set()
+    if (
+        ngui_font_import_root is not None
+        and ngui_generation_manifest_path is not None
+        and ngui_generation_manifest_path.is_file()
+    ):
+        ngui_font_atlas_bases = load_ngui_font_atlas_bases(
+            ngui_font_import_root,
+            source_root,
+            ngui_generation_manifest_path,
+        )
+        # Full-atlas image replacements are merged before Sprite reassembly;
+        # reassembly below then pastes every edited Sprite onto this final font
+        # atlas.  This is intentionally done even when no Sprite needs it so a
+        # manually edited original atlas cannot erase generated glyphs.
+        prepared = compose_ngui_font_atlas_image_overrides(
+            ngui_font_import_root,
+            to_import_root,
+            to_import_root,
+            ngui_generation_manifest_path,
+        )
+        prepared_ngui_atlases = {
+            str((source_root / relative).resolve()).lower()
+            for relative in prepared
+        }
+
     patched_sprites = 0
     rebuilt_atlases = 0
     invalid = 0
@@ -283,6 +403,8 @@ def restore_edited_images_before_import(
             sprite_map_path,
             source_root,
             imported_images,
+            ngui_font_atlas_bases,
+            prepared_ngui_atlases,
         )
     else:
         print("[图集回拼] 未找到 Sprite 映射，跳过拆分子图回拼；如需回拼请先执行工具脚本菜单 2。")
@@ -296,3 +418,120 @@ def restore_edited_images_before_import(
             path for path in edited_paths if path.resolve() not in imported_images
         )
     return restored, patched_sprites, rebuilt_atlases, invalid
+
+
+def compose_ngui_font_atlas_image_overrides(
+    ngui_import_root: Path,
+    image_import_root: Path,
+    destination_root: Path,
+    generation_manifest_path: Path,
+) -> set[Path]:
+    """Merge translated image pixels into expanded NGUI font atlases.
+
+    NGUI font generation keeps the original atlas at the same top-left
+    coordinates and packs new glyphs outside that rectangle.  Image restore,
+    however, produces an atlas with the original dimensions.  When both are
+    selected for import, copy only the original image rectangle onto the
+    expanded font atlas so neither side overwrites the other.
+    """
+    from PIL import Image
+
+    if not ngui_import_root.is_dir() or not image_import_root.is_dir():
+        return set()
+
+    ngui_files = {
+        path.relative_to(ngui_import_root)
+        for path in ngui_import_root.rglob("*")
+        if path.is_file()
+    }
+    image_files = {
+        path.relative_to(image_import_root)
+        for path in image_import_root.rglob("*")
+        if path.is_file()
+    }
+    conflicts = ngui_files & image_files
+    if not conflicts:
+        return set()
+    if not generation_manifest_path.is_file():
+        raise FileNotFoundError(
+            f"图片与 NGUI 字体存在同路径文件，但缺少字体生成清单: {generation_manifest_path}"
+        )
+
+    manifest = json.loads(generation_manifest_path.read_text(encoding="utf-8-sig"))
+    groups = manifest.get("groups", []) if isinstance(manifest, dict) else []
+    if not isinstance(groups, list):
+        raise ValueError(f"NGUI 字体生成清单 groups 无效: {generation_manifest_path}")
+
+    group_by_texture: dict[Path, dict] = {}
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        texture = group.get("texture")
+        if isinstance(texture, str) and texture:
+            group_by_texture[Path(*texture.replace("\\", "/").split("/"))] = group
+
+    unknown_conflicts = sorted(
+        (relative for relative in conflicts if relative not in group_by_texture),
+        key=lambda path: str(path).lower(),
+    )
+    if unknown_conflicts:
+        preview = "、".join(str(path) for path in unknown_conflicts[:5])
+        raise ValueError(f"图片与 NGUI 字体发生无法合成的同路径冲突: {preview}")
+
+    composed: set[Path] = set()
+    for relative in sorted(conflicts, key=lambda path: str(path).lower()):
+        group = group_by_texture[relative]
+        original_size = group.get("original_size")
+        generated_size = group.get("generated_size")
+        forbidden_rect = group.get("forbidden_rect")
+        if (
+            not isinstance(original_size, list)
+            or len(original_size) != 2
+            or not isinstance(generated_size, list)
+            or len(generated_size) != 2
+            or not isinstance(forbidden_rect, list)
+            or len(forbidden_rect) != 4
+        ):
+            raise ValueError(f"NGUI 字体图集合成参数无效: {relative}")
+
+        original_width, original_height = (int(value) for value in original_size)
+        generated_width, generated_height = (int(value) for value in generated_size)
+        x, y, width, height = (int(value) for value in forbidden_rect)
+        if (width, height) != (original_width, original_height):
+            raise ValueError(f"NGUI 字体图集原图区域尺寸不一致: {relative}")
+
+        font_path = ngui_import_root / relative
+        image_path = image_import_root / relative
+        with Image.open(font_path) as opened_font:
+            font_atlas = opened_font.convert("RGBA")
+        with Image.open(image_path) as opened_image:
+            image_override = opened_image.convert("RGBA")
+
+        if font_atlas.size != (generated_width, generated_height):
+            raise ValueError(
+                f"NGUI 字体图集尺寸异常: {relative}，"
+                f"实际={font_atlas.width}x{font_atlas.height}，"
+                f"应为={generated_width}x{generated_height}"
+            )
+        if image_override.size == (original_width, original_height):
+            original_region = image_override
+        elif image_override.width >= x + width and image_override.height >= y + height:
+            original_region = image_override.crop((x, y, x + width, y + height))
+        else:
+            raise ValueError(
+                f"汉化图片无法覆盖 NGUI 原图区域: {relative}，"
+                f"图片={image_override.width}x{image_override.height}，"
+                f"需要={width}x{height}"
+            )
+
+        font_atlas.paste(original_region, (x, y))
+        output_path = destination_root / relative
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        font_atlas.save(output_path, "PNG")
+        composed.add(relative)
+        print(
+            f"[NGUI图集合成] 汉化图片原图区域 + 扩展字体区域 -> {relative} "
+            f"({original_width}x{original_height} -> {generated_width}x{generated_height})",
+            flush=True,
+        )
+    return composed

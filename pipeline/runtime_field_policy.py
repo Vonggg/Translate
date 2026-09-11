@@ -108,7 +108,17 @@ _LEGACY_INPUT_NAME_LEAVES = {
 _RUNTIME_LOOKUP_LEAVES = {
     "desiredTag": "Unity Tag 查找名称",
     "jelasticKey": "后端/远程配置键",
+    "SpecificVehicleName": "任务载具查找名称",
+    "VehicleType": "任务载具类型",
+    "PickupType": "任务拾取物类型",
+    "TargetFaction": "任务阵营标识",
+    "markVisualType": "任务标记类型",
+    "MarksTypeNPC": "任务标记类型",
+    "MarksTypePickUp": "任务标记类型",
+    "DialogName": "对话运行时查找名称",
 }
+
+_SERIALIZED_JSON_METADATA_LEAVES = {"$id", "$ref", "$type"}
 
 def _field_leaf(field_path: str) -> str:
     leaf = field_path.rsplit(".", 1)[-1]
@@ -195,6 +205,15 @@ def runtime_field_exclusion_reason(
 
     leaf = _field_leaf(field_path)
     stripped = value.strip()
+
+    if leaf in _SERIALIZED_JSON_METADATA_LEAVES:
+        return "序列化 JSON 结构元数据"
+    if (
+        leaf == "Name"
+        and field_path.startswith("m_Script.json.")
+        and (".$content[]" in field_path or ".QwestTree[]" in field_path)
+    ):
+        return "任务内部查找名称"
 
     if leaf in _LEGACY_INPUT_NAME_LEAVES:
         return "Unity Legacy Input 轴/按钮名称"

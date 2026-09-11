@@ -74,6 +74,38 @@ class ProjectWorkspaceTests(unittest.TestCase):
                     attribute,
                 )
 
+    def test_workbench_automatic_worker_budget_applies_without_manual_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            with patch.dict(
+                os.environ,
+                {
+                    "TRANSLATE_AUTO_MAX_SCAN_WORKERS": "4",
+                    "TRANSLATE_AUTO_MAX_EXPORT_WORKERS": "2",
+                    "TRANSLATE_AUTO_MAX_TRANSLATE_WORKERS": "2",
+                    "TRANSLATE_AUTO_MAX_IMPORT_WORKERS": "2",
+                },
+                clear=False,
+            ):
+                cfg = self._load(root, "GameA")
+
+            self.assertEqual(4, cfg.max_scan_workers)
+            self.assertEqual(2, cfg.max_export_workers)
+            self.assertEqual(2, cfg.max_translate_workers)
+            self.assertEqual(2, cfg.max_import_workers)
+
+    def test_explicit_worker_limit_remains_stricter_than_automatic_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            with patch.dict(
+                os.environ,
+                {"TRANSLATE_AUTO_MAX_SCAN_WORKERS": "8"},
+                clear=False,
+            ):
+                cfg = self._load(root, "GameA", max_scan_workers=1)
+
+            self.assertEqual(1, cfg.max_scan_workers)
+
     def test_empty_project_name_keeps_legacy_workspace_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir).resolve()

@@ -69,7 +69,7 @@ class AIFallbackChainTests(unittest.TestCase):
             ai_translation_model="http-model",
         )
 
-    def test_batch_falls_back_from_codex_to_http_after_equal_retry_budget(self):
+    def test_batch_falls_back_from_codex_53_to_56_then_http(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cfg = self._translation_config(Path(temp_dir))
             requested_http_ids = []
@@ -107,8 +107,43 @@ class AIFallbackChainTests(unittest.TestCase):
                     [(7, "Start")], cfg, _Strategy(), 1, 1
                 )
 
-            self.assertEqual(codex_request.call_count, 1)
+            self.assertEqual(
+                [call.kwargs["model"] for call in codex_request.call_args_list],
+                ["codex-model", "gpt-5.6-luna"],
+            )
             self.assertEqual(requested_http_ids, [[7]])
+            self.assertEqual(result, {7: "开始"})
+
+    def test_batch_uses_codex_56_before_deepseek(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = self._translation_config(Path(temp_dir))
+
+            def codex_response(*_args, model=None, **_kwargs):
+                if model == "codex-model":
+                    raise RuntimeError("primary quota exhausted")
+                self.assertEqual(model, "gpt-5.6-luna")
+                return {"items": [{"id": 7, "translation": "开始"}]}, {}
+
+            with (
+                mock.patch.object(translation, "codex_cli_available", return_value=True),
+                mock.patch.object(
+                    translation,
+                    "request_structured_output",
+                    side_effect=codex_response,
+                ) as codex_request,
+                mock.patch(
+                    "requests.Session",
+                    side_effect=AssertionError("DeepSeek must not be used"),
+                ),
+            ):
+                result = translation._translate_ai_batch(
+                    [(7, "Start")], cfg, _Strategy(), 1, 1
+                )
+
+            self.assertEqual(
+                [call.kwargs["model"] for call in codex_request.call_args_list],
+                ["codex-model", "gpt-5.6-luna"],
+            )
             self.assertEqual(result, {7: "开始"})
 
     def test_unresolved_ai_text_falls_back_to_baidu_provider(self):
@@ -147,7 +182,7 @@ class AIFallbackChainTests(unittest.TestCase):
             ):
                 result = translation.build_translation_map([record], cfg)
 
-            self.assertEqual(codex_request.call_count, 1)
+            self.assertEqual(codex_request.call_count, 2)
             baidu_request.assert_called_once_with(cfg, "Play now", max_attempts=3)
             self.assertEqual(result["Play now"], "立即开始")
 
@@ -172,7 +207,7 @@ class AIFallbackChainTests(unittest.TestCase):
 
             def request_batch(*_args, transport=None, **_kwargs):
                 calls.append(transport)
-                if transport == "codex_cli":
+                if str(transport).startswith("codex_cli"):
                     raise RuntimeError("codex failed")
                 return ["m_Text"]
 
@@ -191,8 +226,43 @@ class AIFallbackChainTests(unittest.TestCase):
             ):
                 fields = translation._request_ai_field_selection(cfg, candidates_path)
 
-            self.assertEqual(calls, ["codex_cli", "http", "http"])
+            self.assertEqual(
+                calls,
+                ["codex_cli", "codex_cli_fallback", "http", "http"],
+            )
             self.assertEqual(fields, ["m_Text"])
+
+    def test_field_review_accepts_a_successful_empty_selection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            candidates_path = temp_path / "string_field_review.txt"
+            candidates_path.write_text(
+                "规则\n\nfield: caption\nsample_values:\n- Internal name\n",
+                encoding="utf-8",
+            )
+            cfg = replace(
+                load_config(),
+                record_dir=temp_path,
+                ai_field_review_transport="http",
+                ai_field_review_base_url="https://example.invalid",
+                ai_field_review_api_key="key",
+                ai_field_review_model="http-model",
+            )
+            with (
+                mock.patch.object(
+                    translation,
+                    "_post_ai_field_review_batch",
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    translation,
+                    "_manual_ai_field_selection",
+                    side_effect=AssertionError("empty is a valid completed decision"),
+                ),
+            ):
+                fields = translation._request_ai_field_selection(cfg, candidates_path)
+
+            self.assertEqual([], fields)
 
     def test_open_circuit_skips_codex_for_later_translation_batches(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -242,7 +312,10 @@ class AIFallbackChainTests(unittest.TestCase):
                     [(2, "Two")], cfg, _Strategy(), 2, 2, codex_circuit=circuit
                 )
 
-            self.assertEqual(codex_request.call_count, 1)
+            self.assertEqual(
+                [call.kwargs["model"] for call in codex_request.call_args_list],
+                ["codex-model", "gpt-5.6-luna"],
+            )
             self.assertEqual(requested_http_ids, [[1], [2]])
             self.assertEqual(first, {1: "译文1"})
             self.assertEqual(second, {2: "译文2"})

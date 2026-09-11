@@ -5,3 +5,6 @@ PyYAML==6.0.2
 spookyhash==2.1.1
 lz4==4.4.5
 Pillow==11.3.0
+capstone==5.0.9
+pyelftools==0.32
+ripgrep-bin==15.2.0

@@ -78,6 +78,10 @@ namespace UnityResourceCLI
             if (File.Exists(classDataPath))
             {
                 am.LoadClassPackage(classDataPath);
+                var versions = am.ClassPackage.TpkTypeTree.Versions;
+                if (versions.Count > 0)
+                    Log($"[原生模板] TPK v{am.ClassPackage.Header.FileVersion}, " +
+                        $"版本记录={versions.Count}, 范围={versions.First()} ~ {versions.Last()}");
             }
 
             if (Directory.Exists(options.ManagedRoot))
@@ -135,7 +139,8 @@ namespace UnityResourceCLI
                 foreach (string sourcePath in sourceFiles)
                 {
                     serialProcessed++;
-                    Log($"[{serialProcessed}/{sourceFiles.Count}] Exporting {Path.GetFileName(sourcePath)}");
+                    if (ShouldLogFileProgress(serialProcessed, sourceFiles.Count))
+                        Log($"[{serialProcessed}/{sourceFiles.Count}] Exporting {Path.GetFileName(sourcePath)}");
                     worker.ExportFile(sourcePath);
                 }
                 progress.LogFinal();
@@ -156,7 +161,8 @@ namespace UnityResourceCLI
                 ResourcePipeline worker = workers.Value!;
                 worker.ExportFile(sourcePath);
                 int completed = Interlocked.Increment(ref processed);
-                Log($"[{completed}/{sourceFiles.Count}] Exported {Path.GetFileName(sourcePath)}");
+                if (ShouldLogFileProgress(completed, sourceFiles.Count))
+                    Log($"[{completed}/{sourceFiles.Count}] Exported {Path.GetFileName(sourcePath)}");
             });
 
             progress.LogFinal();
@@ -243,7 +249,8 @@ namespace UnityResourceCLI
                 foreach (string manifestPath in manifestPaths)
                 {
                     serialProcessed++;
-                    Log($"[{serialProcessed}/{manifestPaths.Count}] Importing {Path.GetDirectoryName(manifestPath)}");
+                    if (ShouldLogFileProgress(serialProcessed, manifestPaths.Count))
+                        Log($"[{serialProcessed}/{manifestPaths.Count}] Importing {Path.GetDirectoryName(manifestPath)}");
                     ImportManifest(manifestPath);
                 }
                 Log($"Import finished. Processed {serialProcessed} manifest(s).");
@@ -258,11 +265,26 @@ namespace UnityResourceCLI
                 ResourcePipeline worker = workers.Value!;
                 worker.ImportManifest(manifestPath);
                 int completed = Interlocked.Increment(ref processed);
-                Log($"[{completed}/{manifestPaths.Count}] Imported {Path.GetDirectoryName(manifestPath)}");
+                if (ShouldLogFileProgress(completed, manifestPaths.Count))
+                    Log($"[{completed}/{manifestPaths.Count}] Imported {Path.GetDirectoryName(manifestPath)}");
             });
 
             Log($"Import finished. Processed {processed} manifest(s).");
             return 0;
+        }
+
+        private static bool ShouldLogFileProgress(int completed, int total)
+        {
+            if (completed <= 1 || completed >= total)
+                return true;
+            int interval = total switch
+            {
+                <= 20 => 1,
+                <= 200 => 10,
+                <= 2_000 => 50,
+                _ => 100
+            };
+            return completed % interval == 0;
         }
 
         private IEnumerable<string> EnumerateCandidateFiles(string root)
@@ -319,13 +341,17 @@ namespace UnityResourceCLI
                         foreach (ExportManifestMonoBehaviourFailure failure in previousManifest!.MonoBehaviourFailures)
                             exportProgress?.ReportMonoBehaviourFailure(failure, cached: true);
                     }
-                    Log(
-                        $"  Reusing unchanged export profile(s): {string.Join(", ", requestedProfiles.OrderBy(value => value))}; " +
-                        $"validated {previousManifest!.Items.Count(item => currentTypeNames.Contains(item.TypeName)):N0} item(s)."
-                    );
+                    if (options.VerboseExportAssets)
+                    {
+                        Log(
+                            $"  Reusing unchanged export profile(s): {string.Join(", ", requestedProfiles.OrderBy(value => value))}; " +
+                            $"validated {previousManifest!.Items.Count(item => currentTypeNames.Contains(item.TypeName)):N0} item(s)."
+                        );
+                    }
                     return;
                 }
-                Log($"  Cached profile cannot be reused: {reuseReason}");
+                if (options.VerboseExportAssets)
+                    Log($"  Cached profile cannot be reused: {reuseReason}");
             }
 
             if (previousManifest != null)
@@ -360,9 +386,9 @@ namespace UnityResourceCLI
                     ? previousManifest!.MonoBehaviourFailures
                     : new List<ExportManifestMonoBehaviourFailure>()
             };
-            if (canMerge)
+            if (canMerge && options.VerboseExportAssets)
                 Log($"  Incremental manifest: retained {manifest.Items.Count:N0} item(s), replacing {string.Join(", ", currentTypeNames.OrderBy(value => value))}.");
-            else if (previousManifest != null)
+            else if (previousManifest != null && options.VerboseExportAssets)
                 Log("  Source changed or legacy manifest detected; starting a fresh manifest.");
 
             if (fileType == DetectedFileType.AssetsFile)
@@ -378,7 +404,8 @@ namespace UnityResourceCLI
             }
 
             WriteManifest(manifestFilePath, manifest);
-            Log($"  Wrote manifest: {manifestFilePath}");
+            if (options.VerboseExportAssets)
+                Log($"  Wrote manifest: {manifestFilePath}");
         }
 
         private ExportManifest? ReadManifest(string path)
@@ -581,7 +608,8 @@ namespace UnityResourceCLI
                 string entryRelativeDir = Path.Combine("bundle", Sanitize(bundleEntryName));
                 string entryDir = Path.Combine(sourceDir, entryRelativeDir);
                 Directory.CreateDirectory(entryDir);
-                Log($"  Bundle entry: {bundleEntryName}");
+                if (options.VerboseExportAssets)
+                    Log($"  Bundle entry: {bundleEntryName}");
 
                 ExportAssetsFile(inst, sourceStem, entryDir, entryRelativeDir, bundleEntryName, manifest);
             }
@@ -919,7 +947,8 @@ namespace UnityResourceCLI
                     }
                     else
                     {
-                        Log("  No matching replacements found. Skipping output.");
+                        if (options.VerboseImportAssets)
+                            Log("  No matching replacements found. Skipping output.");
                     }
                 }
                 finally
@@ -933,7 +962,8 @@ namespace UnityResourceCLI
                 bool changed = ImportBundleManifest(bunInst, manifest, manifestDir, resultPath);
                 if (!changed)
                 {
-                    Log("  No matching replacements found. Skipping output.");
+                    if (options.VerboseImportAssets)
+                        Log("  No matching replacements found. Skipping output.");
                 }
             }
         }
@@ -960,7 +990,8 @@ namespace UnityResourceCLI
 
                     EnsureClassDatabase(inst);
                     EnsureMonoTemplateGenerator(inst);
-                    Log($"  Bundle entry: {entryName}");
+                    if (options.VerboseImportAssets)
+                        Log($"  Bundle entry: {entryName}");
                     try
                     {
                         bool changed = ApplyManifestToAssetsFile(inst, group.ToList(), manifestDir);
@@ -1065,7 +1096,8 @@ namespace UnityResourceCLI
 
                 if (item.TypeName == nameof(AssetClassID.Texture2D) || item.ExportKind.StartsWith("texture-", StringComparison.OrdinalIgnoreCase))
                 {
-                    Log($"    {item.TypeName}: {item.AssetName} <- {item.RelativePath}");
+                    if (options.VerboseImportAssets)
+                        Log($"    {item.TypeName}: {item.AssetName} <- {item.RelativePath}");
                     byte[]? bytes = ApplyTextureReplacement(
                         inst, info, replacementPath, manifestDir, item);
                     if (bytes != null)
@@ -1076,7 +1108,8 @@ namespace UnityResourceCLI
                 }
                 else if (item.TypeName == nameof(AssetClassID.Font) || item.ExportKind.StartsWith("font-", StringComparison.OrdinalIgnoreCase))
                 {
-                    Log($"    {item.TypeName}: {item.AssetName} <- {item.RelativePath}");
+                    if (options.VerboseImportAssets)
+                        Log($"    {item.TypeName}: {item.AssetName} <- {item.RelativePath}");
                     byte[]? bytes = ApplyFontReplacement(inst, info, replacementPath);
                     if (bytes != null)
                     {
@@ -1086,7 +1119,8 @@ namespace UnityResourceCLI
                 }
                 else
                 {
-                    Log($"    {item.TypeName}: {item.AssetName} <- {item.RelativePath}");
+                    if (options.VerboseImportAssets)
+                        Log($"    {item.TypeName}: {item.AssetName} <- {item.RelativePath}");
                     byte[]? bytes = ApplyDumpReplacement(inst, info, replacementPath, item.ExportKind, manifestDir, item);
                     if (bytes != null)
                     {
@@ -2135,6 +2169,15 @@ namespace UnityResourceCLI
 
             if (!string.IsNullOrWhiteSpace(inst.file.Metadata.UnityVersion))
             {
+                var version = new UnityVersion(inst.file.Metadata.UnityVersion);
+                var versions = am.ClassPackage?.TpkTypeTree?.Versions;
+                if (versions == null || versions.Count == 0)
+                    throw new InvalidOperationException("缺少可用的原生类型模板库 classdata.tpk。");
+                if (version.ToUInt64() < versions.First().ToUInt64() ||
+                    version.ToUInt64() > versions.Last().ToUInt64())
+                    throw new InvalidOperationException(
+                        $"Unity {version} 超出原生模板已覆盖范围 " +
+                        $"{versions.First()} ~ {versions.Last()}；请更新模板，拒绝静默套用不兼容结构。");
                 am.LoadClassDatabaseFromPackage(inst.file.Metadata.UnityVersion);
             }
         }
@@ -2366,7 +2409,16 @@ namespace UnityResourceCLI
         {
             try
             {
-                return am.GetBaseField(inst, info);
+                var field = am.GetBaseField(inst, info);
+                if (field != null && info.TypeId != (int)AssetClassID.MonoBehaviour && info.TypeId >= 0)
+                {
+                    long parsedSize = field.WriteToByteArray().LongLength;
+                    if (parsedSize != info.ByteSize)
+                        throw new InvalidDataException(
+                            $"原生类型模板长度不匹配: parsed={parsedSize}, actual={info.ByteSize}；" +
+                            "拒绝导出或重写可能错位的字段。");
+                }
+                return field;
             }
             catch (Exception ex)
             {

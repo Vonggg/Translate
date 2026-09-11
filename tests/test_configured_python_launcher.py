@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 def _load_launcher():
@@ -37,6 +37,10 @@ def _args(script: str, *script_args: str) -> argparse.Namespace:
 
 
 class ConfiguredPythonLauncherTests(unittest.TestCase):
+    def test_launcher_exposes_one_click_pipeline(self) -> None:
+        choices = {key: script for key, script, _label in LAUNCHER.SCRIPT_CHOICES}
+        self.assertEqual(choices["4"], "one_click_pipeline.py")
+
     def test_blank_python_configuration_uses_launcher_interpreter(self) -> None:
         self.assertEqual(
             LAUNCHER.resolve_python({"python_executable": ""}),
@@ -76,6 +80,84 @@ class ConfiguredPythonLauncherTests(unittest.TestCase):
                 run.call_args.kwargs["env"][LAUNCHER.ACTIVE_CONFIG_PATH_ENV],
                 str(LAUNCHER.DEFAULT_CONFIG_PATH),
             )
+
+    def test_regular_scripts_bypass_one_click_resource_queue(self) -> None:
+        completed = SimpleNamespace(returncode=0)
+        with (
+            patch.dict(
+                os.environ,
+                {LAUNCHER.CONTROL_CENTER_ENV: "1"},
+                clear=False,
+            ),
+            patch.object(
+                LAUNCHER,
+                "resolve_configured_python",
+                return_value=Path(sys.executable),
+            ),
+            patch.object(
+                LAUNCHER,
+                "_acquire_one_click_resource",
+                side_effect=AssertionError(
+                    "非一键脚本及其子脚本不应进入资源队列"
+                ),
+            ),
+            patch.object(LAUNCHER.subprocess, "run", return_value=completed),
+        ):
+            for script in (
+                "快速配置.py",
+                "resource_menu.py",
+                "main.py",
+                "工具脚本.py",
+            ):
+                with self.subTest(script=script):
+                    self.assertEqual(
+                        0,
+                        LAUNCHER.run_script(
+                            script,
+                            [],
+                            LAUNCHER.DEFAULT_CONFIG_PATH,
+                        ),
+                    )
+
+    def test_only_one_click_pipeline_acquires_and_releases_resource(self) -> None:
+        completed = SimpleNamespace(returncode=0)
+        lease = SimpleNamespace(release=Mock())
+        budget = {"MYWORKBENCH_TRANSLATE_SLOT_LIMIT": "1"}
+        with (
+            patch.dict(
+                os.environ,
+                {LAUNCHER.CONTROL_CENTER_ENV: "1"},
+                clear=False,
+            ),
+            patch.object(
+                LAUNCHER,
+                "resolve_configured_python",
+                return_value=Path(sys.executable),
+            ),
+            patch.object(
+                LAUNCHER,
+                "_acquire_one_click_resource",
+                return_value=(lease, budget),
+            ) as acquire,
+            patch.object(
+                LAUNCHER.subprocess,
+                "run",
+                return_value=completed,
+            ) as run,
+        ):
+            result = LAUNCHER.run_script(
+                "one_click_pipeline.py",
+                [],
+                LAUNCHER.DEFAULT_CONFIG_PATH,
+            )
+
+        self.assertEqual(0, result)
+        acquire.assert_called_once_with(LAUNCHER.DEFAULT_CONFIG_PATH)
+        lease.release.assert_called_once_with()
+        self.assertEqual(
+            "1",
+            run.call_args.kwargs["env"]["MYWORKBENCH_TRANSLATE_SLOT_LIMIT"],
+        )
 
     def test_external_same_named_script_does_not_bypass_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

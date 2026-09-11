@@ -48,7 +48,7 @@ dotnet --version
 
 ### 4. Unity Editor（按资源类型需要）
 
-只有脚本 0 检测到 TMP/SDF FontAsset、并在步骤 8 生成 TMP/SDF 字体时才需要完整 Unity Editor。纯文本、图片、TTF 或仅 NGUI 位图字体流程不依赖 Unity 字体生成；`unity_exe=auto` 时工具会按辅助工程版本自动查找已安装的 Unity。
+只有脚本 0 检测到 TMP/SDF FontAsset、并在步骤 9 生成 TMP/SDF 字体时才需要完整 Unity Editor。纯文本、图片、TTF 或仅 NGUI 位图字体流程不依赖 Unity 字体生成；`unity_exe=auto` 时工具会按辅助工程版本自动查找已安装的 Unity。
 
 ## 首次使用快速配置
 
@@ -139,8 +139,13 @@ python .\快速配置.py --config '<配置文件路径>' --check
   - 源文件指纹没有变化时会直接复用；源文件变化或用户明确清空 workspace 时才会重建。不要在其中保存手工文件。
 - `addressables_download_workers` / `addressables_download_timeout`
   - 远程 Addressables 下载线程数和单次请求超时，默认 `5` 和 `60` 秒。
-- `stringliteral_json_subpath`  （现在暂未使用）
-  - 如果有 IL2CPP 字符串导出，可配置到 `game-name/bak/64/stringliteral.json`。
+- `stringliteral_json_subpath`
+  - IL2CPP 字符串导出路径，一般配置为 `game-name/bak/64/stringliteral.json`。
+  - 脚本 3 会同时读取同目录的 `script.json`，以及
+    ARM64 `libil2cpp.so`，验证字符串是否真实流入 Unity 文本显示参数。优先使用
+    `game-name/game/lib/arm64-v8a/libil2cpp.so`；该路径不存在或文件为空时，会自动在
+    `game`、`GAME_hongtu_L`、`GAME_hongtu_P` 及其 `assets` 目录中查找有效文件。
+  - 动态词典仍与静态资源 `trans.json` 独立；缺少二进制分析输入时会明确停止，不会退回全量字符串猜测。
 
 `bin/Data` 资源路径由：
 
@@ -175,25 +180,25 @@ project_root_dir/[project_name/]game-name/bak/64/DummyDll
 - `ngui_glyph_padding`
   - NGUI 新字形之间的透明间距，默认 `2` 像素，用于避免双线性采样串色。
 - `include_old_sdf_template_chars`
-  - 脚本 7 是否把 `templates/老工具的SDF模板.json` 里的常用汉字一并合入 `tmp_chars.txt`，默认 `false`。
-  - 关闭后只合并模板 TTF 非中文字符、原游戏 TMP 字符和译文字符，可明显减少新 TMP 字符数。
+  - 脚本 8 是否把 `templates/老工具的SDF模板.json` 里的常用汉字一并合入 `tmp_chars.txt`，默认 `false`。
+  - 关闭后仍会合并模板 TTF 全部字符、原游戏 TMP 字符和译文字符；仅不额外合并老工具 SDF 模板的字符。
 - `protect_i2_tmp_fonts_from_replacement`
-  - 脚本 9 是否跳过 I2 运行时文本正在使用的 TMP FontAsset/Atlas，默认 `true`。
+  - 脚本 10 是否跳过 I2 运行时文本正在使用的 TMP FontAsset/Atlas，默认 `true`。
   - 用于排查或规避 I2 文本因字体替换引起的运行时刷新、卡顿或材质状态问题。
 - `enable_text_effect_material_cleanup`
   - 为兼容旧配置保留；当前主流程不再读取这个开关。
-  - 脚本 5 只处理同 GameObject 上额外挂载的 Shadow/Outline 组件；TMP/SDF Material 的阴影、描边和发光参数由脚本 9 在字体导入覆盖层中统一处理。
+  - 脚本 6 只处理同 GameObject 上额外挂载的 Shadow/Outline 组件；TMP/SDF Material 的阴影、描边和发光参数由脚本 10 在字体导入覆盖层中统一处理。
 - `ttf_template_path`
-  - 替换字体模板 TTF。模板不支持的译文字符会在脚本 7 中提示并停止。
+  - 替换字体模板 TTF。模板不支持的译文字符会在脚本 8 中提示并停止。
 
 ### 翻译配置
 
 - `enable_ai_translation`
   - `true` 时优先使用 AI 整表翻译。
-  - `codex_cli` 模式下，Codex CLI 进程一旦报错、超时或额度不足，会立即触发本次操作的熔断：当前批立刻切换到已配置的 OpenAI-compatible HTTP AI，后续批次全部跳过 Codex。Codex 成功响应但只漏少量条目时仍可重试缺失条目；HTTP AI 最多重试 3 次，最后才回落到 `translate_provider` 指定的普通翻译（通常为百度）。
+  - `codex_cli` 模式下统一按 `gpt-5.3-codex-spark -> gpt-5.6-luna -> DeepSeek` 执行。某个 Codex 模型报错、超时、额度不足或不可用时只熔断该模型，当前批和后续批次继续尝试链中的下一级；两个 Codex 模型均不可用时才进入已配置的 OpenAI-compatible DeepSeek。DeepSeek 最多重试 3 次，最后才回落到 `translate_provider` 指定的普通翻译（通常为百度）。
 - `ai_translation_transport`
   - `http`：使用下方的 OpenAI-compatible HTTP 接口配置。
-  - `codex_cli`：通过本机已登录的 `codex exec` 调用 Codex，使用 `ai_translation_codex_model`；无需 API key。若同时填写 HTTP 接口配置，该接口会作为 Codex 的第二级 AI 回退。
+  - `codex_cli`：通过本机已登录的 `codex exec` 调用 Codex；无需 API key。`ai_translation_codex_model` 是首选模型（默认 `gpt-5.3-codex-spark`），之后固定尝试 `gpt-5.6-luna`；若同时填写 HTTP 接口配置，该接口作为最后一级 DeepSeek 回退。
 - `ai_translation_codex_model`
   - Codex CLI 模型，例如 `gpt-5.3-codex-spark`。
 - `ai_translation_codex_reasoning_effort`
@@ -218,12 +223,12 @@ project_root_dir/[project_name/]game-name/bak/64/DummyDll
   - `false`：扫描时按 `text_keys` 白名单提取文本。
   - `true`：扫描时先用 `string_field_blacklist` 排除明显不该翻译的字段，再记录所有字符串字段，之后让 AI 判断哪些字段需要汉化。
 - `ai_field_review_transport` / `ai_field_review_codex_model`
-  - 可设为 `codex_cli` 并指定 Codex 模型，让字段判断复用本机 Codex 登录。若同时填写字段判断 HTTP 接口配置，Codex CLI 一旦报错便立即熔断，当前批和本次操作的后续批次直接使用 HTTP AI；HTTP AI 最多重试 3 次。
+  - 可设为 `codex_cli` 并指定首选 Codex 模型，让字段判断复用本机 Codex 登录。字段审核同样使用 `Codex 5.3 -> Codex 5.6 -> DeepSeek`，每次只熔断实际失败的模型；DeepSeek 最多重试 3 次。
 - `ai_field_review_codex_reasoning_effort`
   - 字段判断默认使用 `medium`，在判断质量和额度消耗之间取平衡。
 - `ai_field_review_base_url` / `ai_field_review_api_key` / `ai_field_review_model`
   - AI 字段判断接口配置；在 `codex_cli` 模式下也会保留并用作第二级 AI 回退。
-  - Codex 和 HTTP AI 均未配置或重试后仍失败时，脚本会提示把 `workspace/records/string_field_review.txt` 手动交给 AI 判断。
+  - 两个 Codex 模型和 DeepSeek 均不可用或重试后仍失败时，脚本会提示把 `workspace/records/string_field_review.txt` 手动交给 AI 判断。
 - `string_field_blacklist`
   - 字段黑名单。典型例子：`m_Script`、`m_Name`、`m_Entries.Array*.m_Key`。
   - Unity Localization 的 Shared Data key 不应该翻译，所以 `m_Entries.Array*.m_Key` 必须保留在黑名单里。
@@ -259,6 +264,7 @@ project_name = "<游戏名>" -> workspace<游戏名>
 - NGUI 生成产物：`workspace/output/Font/NGUI/generated`
 - NGUI 待导入：`workspace/output/Font/NGUI/ToImport`
 - 图片待导入：`workspace/output/Image/ToImport`
+- 动态汉化词典：`workspace/output/Hook_Translate/native_unity_translation_dictionary.generated.cpp`
 - 最终结果：`workspace/FinalResult`
 
 ## 常规使用顺序
@@ -293,13 +299,13 @@ python .\run_with_config_python.py main.py
 推荐顺序：
 
 ```text
-0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
+0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9 -> 10
 ```
 
 如果 `enable_ai_field_review=false`，跳过脚本 1：
 
 ```text
-0 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
+0 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9 -> 10
 ```
 
 如果想一口气执行：
@@ -308,7 +314,7 @@ python .\run_with_config_python.py main.py
 a. 全部执行
 ```
 
-注意：`a` 在 AI 字段判断开启时会自动执行脚本 1；也支持输入 `1-2`、`4-7` 或 `0,2,4-9` 连续执行指定步骤。
+注意：`a` 在 AI 字段判断开启时会自动执行脚本 1；也支持输入 `1-3`、`5-8` 或 `0,2-4,6-10` 连续执行指定步骤。
 
 ### 3. 手动处理图片或工具修补
 
@@ -328,6 +334,7 @@ python .\run_with_config_python.py 工具脚本.py
 - 按 Object 名称获取链路并选择层级屏蔽：主菜单 7
 - 动态列表索引与选择性屏蔽（测试阶段）：主菜单 8
 - 统一撤销 Object/商品屏蔽：主菜单 9
+- 将 `records/trans.json` 写入 Hook C++ 整字匹配词典：主菜单 10
 - 查找字符串、PathID 或资源名：`S. 搜索`
 - 兼容性检查、maybe title 清理及 records 字段恢复：`T. 测试`
 - 按产物清单清理主脚本文件：`C. 清理主脚本产物`
@@ -416,7 +423,7 @@ InternalId 被改为本地 RuntimePath，就会同步覆盖源 `game/assets/aa` 
 - `ref_map.json`: MonoBehaviour 引用关系。
 - `tmp_manifest_index.json`: TMP/TTF 替换定位索引。
 - `string_field_stats.json` / `string_field_stats.tsv`: AI 字段判断启用时生成的完整字段统计，包含资源类型、MonoBehaviour 脚本引用、同级字段类型结构、来源文件和上下文选择标识。
-- `bitmap_font_detection.json`: 扫描阶段生成的字体类型检测报告，同时记录 TMP/SDF FontAsset、NGUI 位图 UIFont/BMFont，以及 `UILabel.mTrueTypeFont` 使用的 NGUI 动态 TTF。动态 TTF 会提示执行步骤 6 并确认替换字体包含全部译文字符；它不触发 NGUI 位图生成。已确认的 NGUI 位图 `UIFont` 允许继续并交给 NGUI 专用流程；标准 `.fnt` 或嵌入 TextAsset 的非 NGUI BMFont 仍会使脚本 0 返回失败。脚本 8/9 根据报告只运行实际存在的 TMP/SDF、NGUI 位图生成与替换流程。
+- `bitmap_font_detection.json`: 扫描阶段生成的字体类型检测报告，同时记录 TMP/SDF FontAsset、NGUI 位图 UIFont/BMFont，以及 `UILabel.mTrueTypeFont` 使用的 NGUI 动态 TTF。动态 TTF 会提示执行步骤 7 并确认替换字体包含全部译文字符；它不触发 NGUI 位图生成。已确认的 NGUI 位图 `UIFont` 允许继续并交给 NGUI 专用流程；标准 `.fnt` 或嵌入 TextAsset 的非 NGUI BMFont 仍会使脚本 0 返回失败。脚本 9/10 根据报告只运行实际存在的 TMP/SDF、NGUI 位图生成与替换流程。
 - `string_field_review.txt`: 发给 AI 判断字段用的精简文本。同一字段只有在脚本类型或同级字段结构不同时才自动拆成多个 `@@context_...` 候选；`m_Text`、`m_text`、`mText`、`_text` 等明确文本字段保持全局聚合。
 
 如果 `enable_ai_field_review=false`，脚本 0 直接按 `text_keys` 白名单生成 `records.json`。
@@ -427,7 +434,7 @@ InternalId 被改为本地 RuntimePath，就会同步覆盖源 `game/assets/aa` 
 
 脚本 0 还会在 AI 判断前执行高置信度运行时字段排除：识别 Unity Input System 动作表/控制方案、动作 GUID 与控制路径、Unity SerializeReference 类型元数据、Addressables InternalId/ProviderId 等技术字符串。命中项不会进入 `records.json`、字段统计或 AI 候选；扫描日志会按原因汇总排除数量。翻译文件导出时会再次执行同一策略，防止旧记录或旧译文改写运行时字段。
 
-脚本 4 每次实际翻译并导出 Text 资源前会清空 `workspace/output/Text`，避免上一次运行留下的旧覆盖文件再次进入一键导入。
+脚本 5 每次实际翻译并导出 Text 资源前会清空 `workspace/output/Text`，避免上一次运行留下的旧覆盖文件再次进入一键导入。
 
 导出的 TextAsset 如果在 `m_Script` 中内嵌带 `Key` 和英文源文本列（如 `EN`）的 CSV/TSV 本地化表，
 脚本 0 会安全解析单元格，并以 `m_Script.csv[].EN` 这类统一字段加入扫描记录；不会把整段 `m_Script`
@@ -439,11 +446,11 @@ InternalId 被改为本地 RuntimePath，就会同步覆盖源 `game/assets/aa` 
 
 它会读取脚本 0 生成的 `string_field_review.txt`，让 AI 只返回可能需要翻译的 field 候选标识，然后按字段及上下文过滤 `records.json`。普通字段仍只判断一次；同名字段跨越不同脚本类型或同级字段结构时，脚本 0 会自动按完整结构签名分组，不限制上下文组数。AI 必须原样返回带 `@@context_...` 后缀的候选，脚本 1 才会只保留该上下文中的具体记录。
 
-脚本 4 回写时会再次依据过滤后的 `records.json` 建立 `(文件、完整 field 路径、原文)` 精确白名单。即使同一原文同时出现在可翻译字段和运行时字段中，也只修改 AI 已选择的具体位置；运行时字段安全规则仍会进行第二次拦截。
+脚本 5 回写时会再次依据过滤后的 `records.json` 建立 `(文件、完整 field 路径、原文)` 精确白名单。即使同一原文同时出现在可翻译字段和运行时字段中，也只修改 AI 已选择的具体位置；运行时字段安全规则仍会进行第二次拦截。
 
-一键全部执行时，步骤 1 采用严格非交互模式：Codex CLI 报错后立即熔断并切换 HTTP AI，HTTP AI 完成重试后仍失败才会返回失败；Windows 下同时终止对应超时进程树，外层不会继续执行步骤 2–9，也不会停在人工粘贴提示。单独执行步骤 1 时仍允许全部自动通道失败后人工粘贴字段列表。每次请求的等待上限由 `ai_field_review_timeout` 控制。
+一键全部执行时，步骤 1 采用严格非交互模式：按 Codex 5.3、Codex 5.6、DeepSeek 逐级回退，DeepSeek 完成重试后仍失败才会返回失败；Windows 下同时终止对应超时进程树，外层不会继续执行步骤 2–10，也不会停在人工粘贴提示。单独执行步骤 1 时仍允许全部自动通道失败后人工粘贴字段列表。每次请求的等待上限由 `ai_field_review_timeout` 控制。
 
-`a` 全部执行以及 `1-3`、`0,2,4-9` 等连续/组合执行统一采用 fail-fast：任一步骤抛出异常、返回非零状态或收到人工中断，当前执行链立即结束，尚未启动的后续步骤不会执行。只有明确返回成功的步骤才会启动下一步。
+`a` 全部执行以及 `1-4`、`0,2,5-10` 等连续/组合执行统一采用 fail-fast：任一步骤抛出异常、返回非零状态或收到人工中断，当前执行链立即结束，尚未启动的后续步骤不会执行。只有明确返回成功的步骤才会启动下一步。
 
 字段路径里的数组下标会归一化，例如：
 
@@ -481,16 +488,75 @@ AI 翻译开启时会把整批 trans 内容发给 AI，并把请求/响应写入
 
 如果 AI 漏翻或失败，剩余内容会回落到普通翻译。
 
-### 3. 从 trans.json 重建 game.txt 和 game_chars.txt
+### 3. 分析 IL2CPP 显示链路并生成动态汉化词典
+
+脚本会联合读取 `stringliteral.json`、`script.json` 和 ARM64
+`libil2cpp.so`。分析链路为：
+
+```text
+stringliteral metadata cell
+  -> ELF .rela.dyn usage slot 或直接 literal cell/LDR literal
+  -> ARM64 跳转表、寄存器/栈与返回值数据流
+  -> 对象/静态字段、数组和集合、包装函数、跨方法委托/事件回调
+  -> TMP/uGUI/NGUI/TextMesh/UI Toolkit/IMGUI/FairyGUI 文本入口
+```
+
+只有原值到达显示参数，或被证明经过 `String.Format`、`String.Concat`、StringBuilder、TMP
+格式化 `SetText` 后到达显示参数，并通过基本文本卫生检查的字符串才会翻译。仅仅与 UI
+调用出现在同一方法内不算显示证据，因此日志、Analytics、状态键等不会因方法共现而进入词典。
+直接字段、最多三层的嵌套 View 字段、返回 Text/TMP/UILabel 的组件获取函数和真实
+`Action<T>`/自定义 delegate 的订阅调用均可继续追踪；普通 C# `add_Event` 中的
+`Delegate.Combine` 也会与订阅者和触发者跨方法连接。虚调用会使用 `dump.cs` 的 `Slot:`
+核对真实 `set_text` 槽，只有 ABI 形状但槽位无法确认的结果单列为 probable，不会自动翻译。
+索引无法确定的数组/List/Dictionary 文本同样只进入 probable。
+
+UI Toolkit 会覆盖 TextElement、Label、Button、Foldout、GroupBox、HelpBox、BaseField、
+进度标题、列标题、Tooltip 与文本输入控件；uGUI/TMP 输入框同时追踪公开 setter、内部
+`SetText` 和 `SetTextWithoutNotify`。同一显示 API 含多个字符串参数时会分别追踪，不再只
+保留第一个参数。复杂菜单方法在控制流合流处最多保留 128 个独立文本来源，减少大型商店、
+背包和多标签页面因候选截断造成的漏检。
+
+输出：
+
+- `workspace/records/stringliteral_trans.json`: 动态字符串原文到译文的独立映射。
+- `workspace/records/stringliteral_display_analysis.json`: 每条 exact/derived/probable 结果的 literal
+  地址、方法、调用点、显示入口和变换路径证据。
+- `workspace/records/stringliteral_display_analysis.cache.json`: 兼容分析器内部输出位置；
+  脚本 3 每次运行前都会删除并强制忽略该缓存，确保每个项目从当前代码重新分析。
+- `workspace/records/stringliteral_filter_report.json` / `stringliteral_filtered_out.json`:
+  显示链路统计，以及未被证明为原值显示、控制串、纯非语言值、URI、路径等排除明细。
+- `workspace/output/Hook_Translate/native_unity_translation_dictionary.generated.cpp`: 可直接复制到
+  `native_unity_translation_dictionary.cpp` 的 `kWholeTextDictionary` 和
+  `kSubstringDictionary` 两张 C++ 数组。
+
+生成时会读取项目 `game-name/cpp/native_unity_translation_dictionary.cpp` 和上一版生成文件，
+保留其中已有的手工词条及整句/片段角色；本次自动扫描暂时漏掉某条文本时，不会再把旧译文删除。
+发送 AI 翻译时，每条候选会附带方法、显示入口、调用路径和字符串变换作为只读上下文。
+
+原值不变地到达 setter 的 literal 写入 `kWholeTextDictionary`；经过 `String.Format`、
+`String.Concat` 或 TMP 格式化 `SetText` 后显示的 `derived_influence` 写入
+`kSubstringDictionary`。同一源文本同时存在两种路径时只翻译和缓存一次，但会写入两张表。
+片段表按较长源文本优先排列，避免短片段先替换而吞掉长片段。
+
+包含 `{0}`、`{1:N2}` 等数字占位符的派生模板即使没有普通字母，也会保留到动态翻译任务中；
+Hook 端会把占位符视为动态片段，匹配已经完成格式化的运行时文本，并把捕获内容带回译文中的同名占位符位置。
+
+动态词典不会把静态资源的 `trans.json` 全量并入 Hook；但代码 literal 与已证明的静态显示字段
+原文完全一致时，会把它作为额外交叉证据，并优先复用 `trans.json` 中该条已有译文。
+由于当前 Hook 对 ASCII 英文字母忽略大小写，脚本会在翻译前合并仅大小写不同的等价原文；它们在运行时本来也无法使用不同译文。
+
+### 4. 从 trans.json 重建 game.txt 和 game_chars.txt
 
 适合手动修改 `trans.json` 后使用。
 
-它不会重新扫描，也不会重新翻译，只根据现有 `trans.json` 刷新：
+它不会重新扫描，也不会重新翻译；会汇总现有静态 `trans.json` 的原文与译文，
+并读取 `native_unity_translation_dictionary.generated.cpp` 两个词典数组中的原文与译文。
+动态 C++ 词典尚未生成时，才回退使用 `stringliteral_trans.json` 中实际进入动态词典的内容：
 
-- `game.txt`
-- `game_chars.txt`
+- `game.txt`: 静态与动态词条原文、译文的去重行。
+- `game_chars.txt`: 静态与动态词条原文、译文字符集合。
 
-### 4. 导出并实际翻译 Text 资源
+### 5. 导出并实际翻译 Text 资源
 
 读取 `records.json` 和 `trans.json`。
 
@@ -508,17 +574,17 @@ Unity Localization 要特别注意：
 TextAsset 内嵌 CSV/TSV 会根据 `records.json` 中保留的结构化定位信息，只回写已选中的源语言单元格；
 Key、注释和其它语言列保持不变。字体和材质无法从这类静态表定位时会跳过，后续 TMP 字体仍通过译文字符集合统一生成。
 
-### 5. 清理译文/I2 文本额外挂载的阴影/描边组件
+### 6. 清理译文/I2 文本额外挂载的阴影/描边组件
 
-脚本 5 根据 `records.json`、`material_map.json` 和译文使用关系定位文本所在的 GameObject，只处理额外挂载的 Shadow/Outline MonoBehaviour：
+脚本 6 根据 `records.json`、`material_map.json` 和译文使用关系定位文本所在的 GameObject，只处理额外挂载的 Shadow/Outline MonoBehaviour：
 
 - 普通译文会处理同 GameObject 上的 Shadow/Outline 组件。
 - 有 I2 语言表时，会精确定位相关 I2 GameObject 并处理同物体组件。
-- 不重写 Text/TMP/SDF 字体组件，也不在步骤 5 写出普通 Material 覆盖层。
+- 不重写 Text/TMP/SDF 字体组件，也不在步骤 6 写出普通 Material 覆盖层。
 
-TMP/SDF Material 的阴影、描边和发光参数已合并到步骤 9 的 SDF 导入覆盖层中统一处理；I2 TMP 字体和实际使用材质也由步骤 9 处理。
+TMP/SDF Material 的阴影、描边和发光参数已合并到步骤 10 的 SDF 导入覆盖层中统一处理；I2 TMP 字体和实际使用材质也由步骤 10 处理。
 
-### 6. 生成 TTF 替换字体
+### 7. 生成 TTF 替换字体
 
 读取脚本 0 的字体索引，使用 `ttf_template_path` 指向的模板字体，生成 TTF 待导入文件：
 
@@ -526,14 +592,15 @@ TMP/SDF Material 的阴影、描边和发光参数已合并到步骤 9 的 SDF �
 workspace/output/Font/TTF/ToImport
 ```
 
-### 7. 合并 TMP 字符并提示新增字符
+### 8. 合并 TMP 字符并提示新增字符
 
 读取：
 
-- `trans.json`
+- 脚本 4 合并生成的 `game_chars.txt`
+- `trans.json` 与 `stringliteral_trans.json`（用于缺字来源明细）
 - 原游戏 SDF 字体字符
 - 模板 TTF 支持字符
-- 模板 TTF 非中文字符
+- 模板 TTF 全部字符
 - 可选的老工具 SDF 模板字符
 
 生成：
@@ -542,7 +609,7 @@ workspace/output/Font/TTF/ToImport
 workspace/records/tmp_chars.txt
 ```
 
-如果 `trans.json` 里有模板 TTF 不支持的字符，会输出：
+如果静态或动态词库里有模板 TTF 不支持的译文字符，会输出：
 
 - `translation_chars_missing_from_ttf.txt`
 - `translation_chars_missing_from_ttf.tsv`
@@ -551,12 +618,13 @@ workspace/records/tmp_chars.txt
 
 `include_old_sdf_template_chars=false` 时，不会再把老工具 SDF 模板里的约 3000 个常用汉字强制合进新字体。
 
-### 8. 生成字体（支持 TMP、NGUI）
+### 9. 生成字体（支持 TMP、NGUI）
 
-脚本 8 会读取脚本 0 写入的字体类型检测结论并按需执行：仅检测到 TMP/SDF 时只调用 Unity；仅检测到 NGUI 位图字体时跳过 Unity、只运行 NGUI 静态字形生成；两者同时存在时才依次运行两套生成流程。NGUI 动态 TTF 由步骤 6 直接替换 TTF，不进入步骤 8/9 的位图生成流程。未检测到的字体类型不会生成空产物。
+脚本 9 会读取脚本 0 写入的字体类型检测结论并按需执行：仅检测到 TMP/SDF 时只调用 Unity；仅检测到 NGUI 位图字体时跳过 Unity、只运行 NGUI 静态字形生成；两者同时存在时才依次运行两套生成流程。NGUI 动态 TTF 由步骤 7 直接替换 TTF，不进入步骤 9/10 的位图生成流程。未检测到的字体类型不会生成空产物。
 
-读取脚本 7 生成的 `tmp_chars.txt`，调用 Unity 辅助工程生成 TMP/SDF 字体资源；同时读取
-`trans.json`、脚本 0 的 NGUI 检测报告和 `ttf_template_path`，为已确认的 NGUI 位图字体生成静态字形。
+读取脚本 8 生成的 `tmp_chars.txt`，调用 Unity 辅助工程生成 TMP/SDF 字体资源；同时读取
+`tmp_chars.txt`、脚本 0 的 NGUI 检测报告和 `ttf_template_path`，为已确认的 NGUI 位图字体生成静态字形；
+因此 NGUI 与 TMP/SDF 使用同一份最终字符集。
 
 NGUI 会把原图集区域设为禁止写入区，将“各 UIFont 原字符全集 + 译文字符”全部使用模板 TTF 重新生成并逐字打包到扩大图集后的 L 形空间。普通 UI Sprite 的原像素和坐标不改变，但 UIFont 不再引用原字体 Sprite 的旧字形像素与旧排版指标。
 共用图集且字号相同的多个 UIFont 会复用同一套重生成字形像素和坐标，并写入相同的完整字符集，以统一中英文、数字和标点的风格与基线。所有保留下来的字符均由模板 TTF 重生成，不会混用旧字形。
@@ -572,11 +640,11 @@ workspace/output/Font/SDF/generated_templates/generated_tmp_font.png
 workspace/output/Font/NGUI/generated/ngui_font_generation.json
 ```
 
-### 9. 根据已生成字体准备导入替换（支持 TMP、NGUI）
+### 10. 根据已生成字体准备导入替换（支持 TMP、NGUI）
 
-脚本 9 使用与脚本 8 相同的脚本 0 检测结论，只准备实际存在的字体类型；TMP/SDF 与 NGUI 同时存在时分别生成各自的待导入替换文件。
+脚本 10 使用与脚本 9 相同的脚本 0 检测结论，只准备实际存在的字体类型；TMP/SDF 与 NGUI 同时存在时分别生成各自的待导入替换文件。
 
-读取脚本 8 生成的 TMP/SDF 与 NGUI 字体产物，校验源资源和生成文件哈希后准备待导入文件：
+读取脚本 9 生成的 TMP/SDF 与 NGUI 字体产物，校验源资源和生成文件哈希后准备待导入文件：
 
 ```text
 workspace/output/Font/SDF/ToImport
@@ -585,17 +653,17 @@ workspace/output/Font/NGUI/ToImport
 
 如果某个 TMP FontAsset 没有有效图集，脚本会跳过该字体，避免出现“新字体表 + 旧/缺失图集”的错配。
 
-`protect_i2_tmp_fonts_from_replacement=true` 时，脚本 9 会额外跳过 I2 运行时文本正在使用的 TMP FontAsset/Atlas。
+`protect_i2_tmp_fonts_from_replacement=true` 时，脚本 10 会额外跳过 I2 运行时文本正在使用的 TMP FontAsset/Atlas。
 
 ### a. 全部执行
 
 按顺序执行：
 
 ```text
-0 -> 1(仅 AI 字段判断开启时) -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
+0 -> 1(仅 AI 字段判断开启时) -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9 -> 10
 ```
 
-`a` 直接按顺序调用脚本 0 至 9 的同一执行入口，每一步使用独立子进程；步骤之间不会保留扫描、翻译产生的大量内存和线程状态。若检测到 Unity 在进入字体生成代码前发生原生启动崩溃，会安全清理失效的 `UnityLockfile` 并自动重试一次；失败时停止，不执行后续步骤。
+`a` 直接按顺序调用脚本 0 至 10 的同一执行入口，每一步使用独立子进程；步骤之间不会保留扫描、翻译产生的大量内存和线程状态。若检测到 Unity 在进入字体生成代码前发生原生启动崩溃，会安全清理失效的 `UnityLockfile` 并自动重试一次；失败时停止，不执行后续步骤。
 
 ## resource_menu.py 菜单说明
 
@@ -683,7 +751,8 @@ workspace/FinalResult/obb
   - Unity 图片按 Sprite 或 SpriteAtlas 的运行时 textureRect 拆分，并记录 Sprite PathID；NGUI 图片按 UIAtlas.mSprites 拆分，并记录 Atlas PathID + SpriteName。旧导出若缺少图集对象索引，请重新一键导出并选择对象索引后再拆分。
   - 按图片定位对象时，普通 Texture2D 会同时检查 Unity RawImage/NGUI UITexture 的直接引用；图集子图则按上述 Sprite PathID 或 NGUI Atlas PathID + SpriteName 精确反查。
 - 图片目录结构恢复已并入一键导入的“图片替换”，工具菜单中不再需要单独执行。
-  - 修改后的图片统一放入 `workspace/AllPNG/修改后的图片目录`。选择导入图片时，脚本会把改好的普通图片恢复成导入需要的目录结构；同时读取 `workspace/AllPNG/Sprite/_allsprite_map.json`，将其中已修改的 Unity Sprite 或 NGUI 子图按各自坐标规则贴回原 Texture2D，再输出完整图集到 `Image/ToImport`。
+- 修改后的图片统一放入 `workspace/AllPNG/修改后的图片目录`。选择导入图片时，脚本会把改好的普通图片恢复成导入需要的目录结构；同时读取 `workspace/AllPNG/Sprite/_allsprite_map.json`，将其中已修改的 Unity Sprite 或 NGUI 子图按各自坐标规则贴回原 Texture2D，再输出完整图集到 `Image/ToImport`。
+- 图片与 NGUI 位图字体共用同一 Texture2D 时，全部导入会以扩展后的字体图集为底图，只把汉化图片的原图区域贴回原坐标；不会再由图片覆盖新增字形，也不会由字体覆盖汉化 Sprite。
   - 再次执行菜单 1 刷新 `AllPNG` 时会保留该修改目录及其中的文件，不会误删已经修改的图片。
   - 只需放入实际修改过的子图，未放入的子图和图集空白区域会保持原样。子图像素尺寸必须与拆分结果一致；尺寸变化时会跳过并提示，避免拉伸或错位破坏图集。
 - `3. AI 翻译批次补跑 / 修补 trans.json`
@@ -705,7 +774,7 @@ workspace/FinalResult/obb
   - 配置与界面按领域语义和真实引用链绑定，避免仅因位于同一个 level 就把宠物、奖励、皮肤或转盘数据套进错误的商店界面。
   - 真实布局解析失败时才使用原来的可滚动顺序画布，并明确标注“回退布局”；两种模式都支持点击多选及右键屏蔽。
   - 完整商店预览提供“打开真实商店 Object 层级”按钮；只有运行时容器而没有静态条目数组的界面以 `R1`、`R2` 编号列出，输入 `R编号` 会进入与菜单 5/6/7 相同的真实层级树，可屏蔽整个界面或其子 Object。
-  - 启用 `enable_ai_dynamic_list_review` 后，困难候选先由 `ai_dynamic_list_codex_model`（默认 `gpt-5.3-codex-spark`）复核一次；Codex CLI 报错时回退已有的 OpenAI-compatible/DeepSeek 配置。AI 只会收到匿名候选 ID 和本地提取的结构证据，也只能选择已有候选，不能创建路径或直接修改资源。
+  - 启用 `enable_ai_dynamic_list_review` 后，困难候选按 `gpt-5.3-codex-spark -> gpt-5.6-luna -> DeepSeek` 复核。AI 只会收到匿名候选 ID 和本地提取的结构证据，也只能选择已有候选，不能创建路径或直接修改资源。
   - 可操作商品显示绿色边框及“编号 + 商品名”，当前选中项叠加橙色边框；运行时条目模板自带的占位图会先清除，再把解析出的商品图片放入真实 Icon 区域。已屏蔽商品仍保留原图片，并使用红框和“已屏蔽”标签标记。
   - 逐条屏蔽只从识别到的数据数组移除对应原始索引（重复 PPtr 也只移除选中的那一次出现），不删除可能被其他界面共享的图片、Prefab 或条目源数据；修改结果写入 `workspace/output/Object/ToImport`，旧的商品屏蔽记录保持兼容。
 - `9. 统一撤销已记录的 Object/商品屏蔽`
@@ -723,7 +792,7 @@ Object 层级静态预览会按序列化 sibling 顺序还原 UGUI 的 Horizonta
 - `T. 测试`
   - 包含 Unity 资源兼容性检查、maybe title 清理和 records 字段恢复。
 - `C. 清理主脚本产物`
-  - 按产物清单选择并清理主流程脚本 0 至 9 生成的文件。
+  - 按产物清单选择并清理主流程脚本 0 至 10 生成的文件。
 
 一键导出会自动读取 `settings.json`，识别 Addressables 使用的是 `catalog.json`
 还是 `catalog.bin`。遇到二进制 catalog 时会同时输出：

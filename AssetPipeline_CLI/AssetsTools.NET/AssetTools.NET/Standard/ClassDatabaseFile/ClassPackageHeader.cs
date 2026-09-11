@@ -32,7 +32,7 @@ namespace AssetsTools.NET
 
             FileVersion = reader.ReadByte();
 
-            if (FileVersion > 1)
+            if (FileVersion < 1 || FileVersion > 2)
                 throw new Exception($"Unsupported or invalid file version {FileVersion}.");
 
             CompressionType = (ClassFileCompressionType)reader.ReadByte();

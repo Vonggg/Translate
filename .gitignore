@@ -14,6 +14,9 @@ Build/
 Builds/
 *.csproj
 !AssetPipeline_CLI/**/*.csproj
+!tools/TypeTreeCompatibilityCheck/*.csproj
+/tools/TypeTreeCompatibilityCheck/bin/
+/tools/TypeTreeCompatibilityCheck/obj/
 *.sln
 !AssetPipeline_CLI/**/*.sln
 *.user

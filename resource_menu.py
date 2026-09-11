@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import subprocess
 import sys
 import shutil
+import threading
+import time
 from pathlib import Path
 
 from support.config import activate_config_path, load_config
@@ -16,6 +19,7 @@ from support.channel_package_sync import (
     sync_import_result_to_channel_package,
 )
 from support.image_restore import (
+    NGUI_FONT_GENERATION_MANIFEST,
     print_not_imported_images,
     restore_edited_images_before_import,
 )
@@ -41,16 +45,17 @@ def prompt_input(message: str) -> str:
     return input(f"\033[38;5;208m{message}\033[0m")
 
 
-def _activate_entry_config(argv: list[str]) -> None:
+def _activate_entry_config(argv: list[str]) -> list[str]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--channel-package-dir-name")
-    options, _ = parser.parse_known_args(argv)
+    options, remaining = parser.parse_known_args(argv)
     if options.config is not None:
         activate_config_path(options.config)
         os.environ[EXPLICIT_CONFIG_ENV] = "1"
     if options.channel_package_dir_name is not None:
         os.environ[CHANNEL_PACKAGE_DIR_NAME_ENV] = options.channel_package_dir_name.strip()
+    return remaining
 
 
 def log_source_modified(message: str) -> None:
@@ -187,20 +192,55 @@ def run_pipeline(
     print(" ".join(command))
     print()
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    child_env = dict(os.environ)
+    # `dotnet run` may otherwise leave reusable MSBuild nodes alive.  Those
+    # descendants inherit this process' stdout pipe and can keep the reader
+    # waiting forever even though UnityResourceCLI has already exited.
+    child_env["MSBUILDDISABLENODEREUSE"] = "1"
     proc = subprocess.Popen(
         command,
         cwd=str(PIPELINE_SCRIPT.parent.parent),
+        env=child_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
     )
     assert proc.stdout is not None
+    output_queue: queue.Queue[str] = queue.Queue()
+    reader_done = threading.Event()
+
+    def read_output() -> None:
+        try:
+            for line in proc.stdout:
+                output_queue.put(line)
+        finally:
+            reader_done.set()
+
+    threading.Thread(target=read_output, daemon=True).start()
     with log_path.open("w", encoding="utf-8") as log_file:
         tee = Tee(sys.stdout, log_file)
-        for line in proc.stdout:
-            tee.write(line)
-    return proc.wait()
+        process_exit_at: float | None = None
+        while True:
+            try:
+                tee.write(output_queue.get(timeout=0.1))
+                continue
+            except queue.Empty:
+                pass
+
+            returncode = proc.poll()
+            if returncode is None:
+                continue
+            if process_exit_at is None:
+                process_exit_at = time.monotonic()
+
+            while True:
+                try:
+                    tee.write(output_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if reader_done.is_set() or time.monotonic() - process_exit_at >= 1.0:
+                return returncode
 
 
 def clean_result_root(result_root: Path) -> None:
@@ -458,11 +498,20 @@ def print_import_options() -> None:
     print()
 
 
-def _merge_tree(source_root: Path, destination_root: Path, label: str = "") -> int:
+def _merge_tree(
+    source_root: Path,
+    destination_root: Path,
+    label: str = "",
+    skip_relative_paths: set[Path] | None = None,
+) -> int:
     if not source_root.is_dir():
         return 0
 
-    files = [path for path in source_root.rglob("*") if path.is_file()]
+    skipped = skip_relative_paths or set()
+    files = [
+        path for path in source_root.rglob("*")
+        if path.is_file() and path.relative_to(source_root) not in skipped
+    ]
     total = len(files)
     total_bytes = sum(path.stat().st_size for path in files)
     if label:
@@ -753,25 +802,50 @@ def build_import_overlay(
                 cfg.resource_input_root,
                 cfg.image_import_dir,
                 not_imported_images,
+                (
+                    cfg.ngui_import_dir
+                    if "tmp" in selection
+                    else None
+                ),
+                (
+                    cfg.ngui_generated_dir / NGUI_FONT_GENERATION_MANIFEST
+                    if "tmp" in selection
+                    else None
+                ),
             )
         except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
             print(f"\033[91m[图片导入][停止] 自动恢复目录结构失败: {exc}\033[0m")
             return None
-        image_count = _merge_tree(cfg.image_import_dir, overlay_root, "图片")
+        image_count = _merge_tree(
+            cfg.image_import_dir,
+            overlay_root,
+            "图片",
+        )
         copied_counts.append(f"图片={image_count}")
 
+    # Finish every automatic text post-process before merging Object edits.
+    # Object/ToImport contains explicit user choices made from the hierarchy UI;
+    # those files must be the final authority when they collide with generated
+    # static translations at the same relative path.
+    _normalize_monobehaviour_json_arrays_for_import(overlay_root)
+    if text_json_paths:
+        _restore_text_overlay_runtime_fields(cfg, overlay_root, text_json_paths)
+
     if "object" in selection:
-        object_count = _merge_tree(cfg.object_import_dir, overlay_root, "Object")
+        object_count = _merge_tree(cfg.object_import_dir, overlay_root, "Object（手动优先）")
         copied_counts.append(f"Object={object_count}")
+        if object_count:
+            print(f"[导入覆盖] 手动 Object 文件已在自动产物之后合并，冲突时保留手动值。")
+
+    # Hierarchy edits may come from AssetStudio-shaped JSON too, so normalize
+    # them only after they have won the overlay conflict. This transformation
+    # changes container syntax, not the user's field values.
+    _normalize_monobehaviour_json_arrays_for_import(overlay_root)
 
     total_files = sum(1 for _ in overlay_root.rglob("*") if _.is_file())
     if total_files == 0:
         shutil.rmtree(overlay_root)
         return None
-
-    _normalize_monobehaviour_json_arrays_for_import(overlay_root)
-    if text_json_paths:
-        _restore_text_overlay_runtime_fields(cfg, overlay_root, text_json_paths)
 
     print(f"已构建临时导入覆盖层: {overlay_root}")
     print(f"包含文件: {', '.join(copied_counts)}")
@@ -884,8 +958,32 @@ def prompt_export_profile() -> str | None:
     return "+".join(profile_names[index] for index in sorted(selected))
 
 
+def run_export_profile(cfg, export_profile: str) -> int:
+    root = workspace_root(cfg)
+    root.mkdir(parents=True, exist_ok=True)
+    source_root = prepare_unified_resource_source(cfg)
+    if source_root is None:
+        return 1
+    prepare_managed_dlls(cfg)
+    result = run_pipeline(
+        "export",
+        source_root,
+        cfg.resource_input_root,
+        cfg.resource_managed_root,
+        cfg.log_dir / "一键导出.log",
+        export_profile=export_profile,
+        export_workers=cfg.max_export_workers,
+        verbose_export_assets=cfg.verbose_export_assets,
+    )
+    if result == 0:
+        build_file_id_map(cfg)
+        print_monobehaviour_export_summary(cfg.resource_input_root)
+        print_export_profile_summary(cfg.resource_input_root)
+    return result
+
+
 def main() -> int:
-    _activate_entry_config(sys.argv[1:])
+    entry_args = _activate_entry_config(sys.argv[1:])
     cfg = load_config()
     input_root = cfg.resource_input_root
     managed_root = cfg.resource_managed_root
@@ -894,6 +992,16 @@ def main() -> int:
     raw_import_result_root = workspace_temp_root(cfg) / "import_result_raw"
     log_dir = cfg.log_dir
     print(f"当前项目工作区: {workspace_root(cfg)}")
+
+    direct_script_entry = Path(sys.argv[0]).resolve() == Path(__file__).resolve()
+    if entry_args and direct_script_entry:
+        command = entry_args[0].strip().lower()
+        if command in {"export-all", "all-export"}:
+            print("[资源一键流程] 非交互执行全部导出；保留并更新现有 workspace。")
+            return run_export_profile(cfg, "all")
+        print(f"未知命令: {entry_args[0]}")
+        print(f"用法: python {Path(__file__).name} export-all")
+        return 1
 
     while True:
         print_menu()
@@ -919,25 +1027,7 @@ def main() -> int:
                     print()
             else:
                 root.mkdir(parents=True, exist_ok=True)
-            source_root = prepare_unified_resource_source(cfg)
-            if source_root is None:
-                return 1
-            prepare_managed_dlls(cfg)
-            result = run_pipeline(
-                "export",
-                source_root,
-                input_root,
-                managed_root,
-                log_dir / "一键导出.log",
-                export_profile=export_profile,
-                export_workers=cfg.max_export_workers,
-                verbose_export_assets=cfg.verbose_export_assets,
-            )
-            if result == 0:
-                build_file_id_map(cfg)
-                print_monobehaviour_export_summary(input_root)
-                print_export_profile_summary(input_root)
-            return result
+            return run_export_profile(cfg, export_profile)
         if choice == "2":
             clean_import_temp_roots(cfg)
             source_root = load_prepared_resource_source(cfg)
