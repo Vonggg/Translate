@@ -17,6 +17,33 @@ from support.config import load_config
 
 
 class RuntimeFieldPolicyTests(unittest.TestCase):
+    def test_character_lookup_names_are_protected_and_stale_text_restored(self):
+        source = {
+            "m_Script": {"m_FileID": 1, "m_PathID": 430},
+            "Customs": {"Array": [
+                {"name": name, "customSets": {"m_FileID": 0, "m_PathID": index}}
+                for index, name in enumerate(("slick", "frank"), 100)
+            ]},
+            "m_Text": "slick",
+        }
+        translated = apply_translations_to_json(source, load_config(), {"slick": "斯利克", "frank": "弗兰克"})
+        self.assertEqual(translated["Customs"], source["Customs"])
+        self.assertEqual(translated["m_Text"], "斯利克")
+        stale = json.loads(json.dumps(translated))
+        stale["Customs"]["Array"][0]["name"] = "斯利克"
+        repaired, changes = restore_protected_runtime_fields(source, stale)
+        self.assertEqual(repaired["Customs"], source["Customs"])
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(repaired["m_Text"], "斯利克")
+
+    def test_arbitrary_display_name_and_reference_are_not_model_evidence(self):
+        for reference in ("icon", "prefab", "customSets"):
+            data = {"cards": {"Array": [{"name": "Frank", reference: {"m_FileID": 0, "m_PathID": 12}}]}}
+            self.assertIsNone(runtime_field_exclusion_reason(data, "cards.Array[0].name", "Frank"))
+        for value in (None, "Preview", {}, {"m_PathID": 12}):
+            data = {"m_Script": {"m_FileID": 1, "m_PathID": 2}, "Customs": {"Array": [{"name": "Frank", "customSets": value}]}}
+            self.assertIsNone(runtime_field_exclusion_reason(data, "Customs.Array[0].name", "Frank"))
+
     def setUp(self) -> None:
         self.input_actions = {
             "m_ActionMaps": {

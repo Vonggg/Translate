@@ -163,7 +163,8 @@ def _acquire_one_click_resource(config_path: Path) -> tuple[_OneClickResourceLea
             reason = "等待可用内存达到 2 GiB"
         else:
             try:
-                disk_free = shutil.disk_usage(config_path.parent).free
+                context = os.environ.get('TRANSLATE_PROJECT_CONTEXT')
+                disk_free = shutil.disk_usage(Path(context).parent if context else config_path.parent).free
             except OSError:
                 disk_free = -1
             if 0 <= disk_free < MIN_ONE_CLICK_DISK_FREE:
@@ -261,6 +262,7 @@ def parse_args() -> argparse.Namespace:
         help="导入成功后自动回写的渠道包目录名，例如 GAME_hongtu_L。",
     )
     parser.add_argument("--print-python", action="store_true", help="只打印配置解析出的 Python 路径并退出。")
+    parser.add_argument("--project-context", type=Path, help="仅包含项目定位信息；业务配置读取 Translate/config.json。")
     parser.add_argument(
         "script",
         nargs="?",
@@ -352,6 +354,26 @@ def run_script(
 
 def main() -> int:
     args = parse_args()
+    args.project_context = getattr(args, 'project_context', None)
+    if args.project_context is not None:
+        if args.config is not None:
+            raise ValueError('--config 与 --project-context 不能同时使用')
+        from support.project_context import materialize_context
+        with tempfile.TemporaryDirectory(prefix='translate-session-') as session_dir:
+            args.config = materialize_context(DEFAULT_CONFIG_PATH, args.project_context, Path(session_dir) / 'config.json')
+            previous = os.environ.get('TRANSLATE_PROJECT_CONTEXT')
+            os.environ['TRANSLATE_PROJECT_CONTEXT'] = str(args.project_context.resolve())
+            try:
+                return _main(args)
+            finally:
+                if previous is None:
+                    os.environ.pop('TRANSLATE_PROJECT_CONTEXT', None)
+                else:
+                    os.environ['TRANSLATE_PROJECT_CONTEXT'] = previous
+    return _main(args)
+
+
+def _main(args) -> int:
     config_path = resolve_config_path(args.config)
     explicit_config = args.config is not None or os.environ.get(EXPLICIT_CONFIG_ENV) == "1"
     channel_package_dir_name = str(
@@ -368,6 +390,9 @@ def main() -> int:
         return 0
 
     if args.script:
+        if args.project_context is not None and resolve_script(args.script) == QUICK_CONFIG_SCRIPT:
+            print('[launcher] 项目会话不运行快速配置；请独立启动 Translate 修改其全局 config.json。')
+            return 2
         return run_script(
             args.script,
             args.script_args,
@@ -380,6 +405,9 @@ def main() -> int:
         script = choose_script()
         if not script:
             return 0
+        if args.project_context is not None and resolve_script(script) == QUICK_CONFIG_SCRIPT:
+            print('[launcher] 项目会话不运行快速配置；请独立启动 Translate 修改其全局 config.json。')
+            continue
         result = run_script(
             script,
             [],

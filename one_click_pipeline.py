@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Callable
 
 from support.config import activate_config_path, load_config, resolve_config_path
@@ -25,7 +26,7 @@ AI_REQUEST_PATTERNS = {
 MISSING_TTF_CHARS_FILENAME = "translation_chars_missing_from_ttf.txt"
 WORKBENCH_EVENT_PREFIX = "@@WORKBENCH_EVENT@@"
 RUN_STATE_SCHEMA_VERSION = 1
-PIPELINE_VERSION = 1
+PIPELINE_VERSION = 2
 RUN_STATE_FILENAME = "run-state.json"
 
 
@@ -139,10 +140,21 @@ def _input_fingerprint(cfg, config_path: Path) -> str:
             continue
         seen.add(normalized)
         _update_tree_fingerprint(hasher, path)
+    catalog_path = getattr(cfg, "catalog_source_path", None)
+    if catalog_path is not None and len(Path(catalog_path).parents) >= 3:
+        _update_tree_fingerprint(hasher, Path(catalog_path).parents[2] / "assets" / "assetpack")
+        _update_tree_fingerprint(hasher, Path(catalog_path).parents[2] / "AndroidManifest.xml")
+    workspace = getattr(cfg, "workspace_root", None)
+    if workspace is not None:
+        _update_tree_fingerprint(hasher, Path(workspace) / "resource_state" / "resource_crypto.json")
     return hasher.hexdigest()
 
 
 def _default_run_state_path(config_path: Path) -> Path:
+    import os
+    context = os.environ.get('TRANSLATE_PROJECT_CONTEXT')
+    if context:
+        return Path(context).parent / RUN_STATE_FILENAME
     # Workbench stores each project's Translate config in
     # ``<project>/.translate/config.json``.  Keeping the checkpoint beside it
     # makes project export/import preserve progress without copying caches.
@@ -296,6 +308,7 @@ def run_python_script(script: Path, args: list[str], label: str) -> int:
     print(f"[一键执行] 开始: {label}", flush=True)
     print(f"[一键执行] 命令: {' '.join(command)}", flush=True)
     emit_workbench_event("translate-stage-start", label=label)
+    started = time.perf_counter()
     try:
         result = subprocess.run(
             command,
@@ -309,6 +322,7 @@ def run_python_script(script: Path, args: list[str], label: str) -> int:
             "translate-stage-error",
             label=label,
             error=f"{type(exc).__name__}: {exc}",
+            elapsed_seconds=time.perf_counter() - started,
         )
         return 1
     if result == 0:
@@ -318,10 +332,13 @@ def run_python_script(script: Path, args: list[str], label: str) -> int:
             f"\033[91m[一键执行][失败] {label}，返回码={result}\033[0m",
             flush=True,
         )
+    elapsed = time.perf_counter() - started
+    print(f"[一键执行][耗时] {label}: {elapsed:.3f}s（含子进程等待）", flush=True)
     emit_workbench_event(
         "translate-stage-finish",
         label=label,
         returncode=result,
+        elapsed_seconds=elapsed,
     )
     return result
 

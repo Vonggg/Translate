@@ -119,6 +119,63 @@ namespace UnityResourceCLI
 
         private int Export()
         {
+            try
+            {
+                return ExportCore();
+            }
+            finally
+            {
+                WriteResourceScanReport();
+            }
+        }
+
+        private readonly ConcurrentBag<ResourceScanIssue> resourceScanIssues = new();
+        private sealed record ResourceScanIssue(string Path, string Status, string Reason);
+
+        private void ExportTracked(ResourcePipeline worker, string sourcePath)
+        {
+            try { worker.ExportFile(sourcePath); }
+            catch (Exception ex)
+            {
+                resourceScanIssues.Add(new(Path.GetRelativePath(options.SourceRoot, sourcePath),
+                    "parse_failed", $"{ex.GetType().Name}: {ex.Message}"));
+                throw;
+            }
+        }
+
+        private void WriteResourceScanReport()
+        {
+            var issues = resourceScanIssues.OrderBy(x => x.Path, StringComparer.OrdinalIgnoreCase).ToList();
+            int suspicious = issues.Count(x => x.Status == "suspected_encryption");
+            int failed = issues.Count(x => x.Status == "parse_failed");
+            string reportPath = Path.Combine(options.WorkRoot, "resource_scan_report.json");
+            try
+            {
+                File.WriteAllText(reportPath, JsonSerializer.Serialize(new
+                {
+                    SourceRoot = options.SourceRoot,
+                    SuspectedEncryptionCount = suspicious,
+                    ParseFailedCount = failed,
+                    Note = "非标准文件头不等于确认加密，也可能是损坏、自定义封装或不支持的格式。普通非 Unity 文件单独记录，不作为加密告警。",
+                    Files = issues
+                }, new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                LogYellow($"[资源扫描报告] 写入失败: {ex.Message}");
+            }
+            if (suspicious + failed == 0)
+                return;
+            LogYellow("================ 导出不完整：资源异常汇总 ================");
+            LogYellow($"疑似加密/非标准资源包={suspicious}；解析失败={failed}。这些文件未能正常导出，可能导致文本、图片漏项！");
+            foreach (var issue in issues.Where(x => x.Status != "unrecognized").Take(20))
+                LogYellow($"[{issue.Status}] {issue.Path} — {issue.Reason}");
+            LogYellow($"完整文件清单（含普通未识别文件）: {reportPath}");
+            LogYellow("疑似加密不是确诊，也可能是损坏、自定义封装或不支持的格式；仅重跑翻译不能补回这些资源。");
+        }
+
+        private int ExportCore()
+        {
             Log("Scanning resource files...");
             List<string> sourceFiles = EnumerateCandidateFiles(options.SourceRoot).ToList();
             Log($"Found {sourceFiles.Count} candidate file(s).");
@@ -141,7 +198,7 @@ namespace UnityResourceCLI
                     serialProcessed++;
                     if (ShouldLogFileProgress(serialProcessed, sourceFiles.Count))
                         Log($"[{serialProcessed}/{sourceFiles.Count}] Exporting {Path.GetFileName(sourcePath)}");
-                    worker.ExportFile(sourcePath);
+                    ExportTracked(worker, sourcePath);
                 }
                 progress.LogFinal();
                 if (progress.HasCriticalFailure)
@@ -159,7 +216,7 @@ namespace UnityResourceCLI
             Parallel.ForEach(sourceFiles, parallelOptions, sourcePath =>
             {
                 ResourcePipeline worker = workers.Value!;
-                worker.ExportFile(sourcePath);
+                ExportTracked(worker, sourcePath);
                 int completed = Interlocked.Increment(ref processed);
                 if (ShouldLogFileProgress(completed, sourceFiles.Count))
                     Log($"[{completed}/{sourceFiles.Count}] Exported {Path.GetFileName(sourcePath)}");
@@ -294,6 +351,18 @@ namespace UnityResourceCLI
                 DetectedFileType fileType = FileTypeDetector.DetectFileType(path);
                 if (fileType == DetectedFileType.BundleFile || fileType == DetectedFileType.AssetsFile)
                     yield return path;
+                else
+                {
+                    string relative = Path.GetRelativePath(root, path);
+                    string normalized = relative.Replace('\\', '/');
+                    string extension = Path.GetExtension(path).ToLowerInvariant();
+                    bool expectedResource = extension is ".bundle" or ".unity3d" or ".assetbundle" or ".assets"
+                        || (extension.Length == 0 && (normalized.StartsWith("aa/Android/", StringComparison.OrdinalIgnoreCase)
+                            || normalized.StartsWith("assetpack/", StringComparison.OrdinalIgnoreCase)));
+                    resourceScanIssues.Add(new(relative,
+                        expectedResource ? "suspected_encryption" : "unrecognized",
+                        expectedResource ? "预期资源文件，但未识别出标准 Unity 文件头；未进入导出。" : "未识别为 Unity 资源（可能是正常附属文件）。"));
+                }
             }
         }
 

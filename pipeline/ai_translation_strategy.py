@@ -9,6 +9,13 @@ from typing import Any
 DEFAULT_BATCH_MAX_CHARS = 1200000
 DEFAULT_MAX_OUTPUT_CHARS = 384000
 DEFAULT_OUTPUT_SAFETY_DIVISOR = 12
+PERSON_NAME_TRANSLATION_RULE = (
+    "游戏中用于显示的人名、角色名、英雄名必须汉化为简体中文，不得仅因是专有名词、"
+    "全大写或缺少上下文就保留外文原名。优先采用通行中文译名；无通行译名时采用自然、"
+    "一致的中文音译，例如 SAM BUCK 译为山姆·巴克；同一人物在不同文本中保持译名一致。"
+    "此要求仅针对显示文本，不得据此改写资源路径、内部ID、代码标识、占位符或富文本标签，"
+    "也不得把这些技术字符串仅凭外形当作人名音译。"
+)
 
 _TRANSLATION_JSON_DELIMITER_TYPO = re.compile(
     r'("(?:items|id|translation|text)")\s*[=>]\s*(?=[\[\{"\-0-9tfn])'
@@ -111,6 +118,7 @@ class DefaultAITranslationStrategy:
             "如果 items[].text（原始键）本身含有中文，translation 中的所有中文字符也必须是简体中文，不得夹杂繁体字。"
             "语言名称也要汉化，例如 Español 译为西班牙语、Français 译为法语、日本語译为日语、한국어译为韩语。"
             "如果不同语言文本表达的是同一句话或同一个 UI 含义，要翻译成一致的简体中文说法。"
+            f"{PERSON_NAME_TRANSLATION_RULE}"
             "保留 id，不要新增、删除、合并、重排项目。"
             "保留换行、占位符、数字、货币符号、格式控制符和富文本标签。"
             "如果输入项包含 context，它只用于说明文本出现的函数、显示组件和拼接方式，"

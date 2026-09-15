@@ -20,6 +20,35 @@ from pipeline.ngui_font import (
 
 
 class NguiFontPipelineTests(unittest.TestCase):
+    def test_direct_material_font_needs_no_atlas_or_sprite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = self._fixture(Path(temp_dir))
+            font = next(cfg.resource_input_root.rglob("TestFont_40.json"))
+            data = json.loads(font.read_text(encoding="utf-8"))
+            data["mAtlas"] = {"m_FileID": 0, "m_PathID": 0}
+            data["mMat"] = {"m_FileID": 0, "m_PathID": 20}
+            data["mFont"]["mSpriteName"] = ""
+            font.write_text(json.dumps(data), encoding="utf-8")
+            result = generate_ngui_fonts(cfg)
+            self.assertEqual(result["status"], "generated")
+            generated = json.loads((cfg.ngui_generated_dir / font.relative_to(cfg.resource_input_root)).read_text(encoding="utf-8"))
+            self.assertEqual(generated["mFont"]["mSpriteName"], "")
+            self.assertEqual(generated["mUVRect"], {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0})
+            self.assertFalse(list(cfg.ngui_generated_dir.rglob("MainAtlas_30.json")))
+
+    def test_dynamic_font_old_glyph_table_is_not_bitmap(self) -> None:
+        from pipeline.bitmap_font_detection import _detect_json_data
+        from pipeline.ngui_font import _ResourceResolver, _load_font_jobs
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = self._fixture(Path(temp_dir))
+            font = next(cfg.resource_input_root.rglob("TestFont_40.json"))
+            data = json.loads(font.read_text(encoding="utf-8"))
+            data["mDynamicFont"] = {"m_FileID": 0, "m_PathID": 1215}
+            data["mFont"]["mSpriteName"] = ""
+            font.write_text(json.dumps(data), encoding="utf-8")
+            self.assertFalse(_detect_json_data(data, font, cfg.resource_input_root))
+            self.assertEqual(_load_font_jobs(cfg, _ResourceResolver(cfg)), [])
+
     def _fixture(self, root: Path) -> SimpleNamespace:
         input_root = root / "input"
         records = root / "records"

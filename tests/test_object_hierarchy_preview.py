@@ -25,6 +25,57 @@ TOOLS = _load_tool_scripts()
 
 
 class ObjectHierarchyPreviewLayoutTests(unittest.TestCase):
+    def test_layout_type_uses_external_script_not_numeric_path_id(self):
+        script_scope = {"items": {("MonoScript", 720): {
+            "data": {"m_ClassName": "VerticalLayoutGroup"}, "path": Path("unused")
+        }}}
+        scope = {"items": {}, "pointer_scopes": {1: script_scope}}
+        data = {"m_Script": {"m_FileID": 1, "m_PathID": 720}}
+        self.assertEqual(TOOLS._preview_script_class(scope, data), "VerticalLayoutGroup")
+        # Same numeric ID in another file must not inherit the first type.
+        scope["pointer_scopes"][2] = {"items": {("MonoScript", 720): {
+            "data": {"m_ClassName": "HorizontalLayoutGroup"}, "path": Path("unused")
+        }}}
+        data["m_Script"]["m_FileID"] = 2
+        self.assertEqual(TOOLS._preview_script_class(scope, data), "HorizontalLayoutGroup")
+
+    def test_content_fitter_restores_zero_height_before_vertical_layout(self):
+        def entry(data):
+            return {"data": data, "path": Path("unused")}
+        layout = {
+            "m_Script": {"m_FileID": 0, "m_PathID": 720},
+            "m_ChildAlignment": 1, "m_Spacing": 40,
+            "m_ChildControlWidth": 0, "m_ChildControlHeight": 0,
+            "m_ChildForceExpandWidth": 0, "m_ChildForceExpandHeight": 0,
+            "m_Padding": {"m_Top": 55, "m_Bottom": 130},
+        }
+        parent = {"m_Component": {"Array": [
+            {"component": {"m_PathID": 10}}, {"component": {"m_PathID": 11}}
+        ]}}
+        transform = {"m_Pivot": {"x": .5, "y": .5}, "m_Children": {"Array": [
+            {"m_PathID": 21}, {"m_PathID": 22}, {"m_PathID": 23}
+        ]}}
+        scope = {"items": {
+            ("MonoScript", 720): entry({"m_ClassName": "VerticalLayoutGroup"}),
+            ("MonoBehaviour", 10): entry(layout),
+            ("MonoBehaviour", 11): entry({"m_HorizontalFit": 0, "m_VerticalFit": 2}),
+        }}
+        children = []
+        for i in (1, 2, 3):
+            child = {"m_GameObject": {"m_PathID": i},
+                     "m_SizeDelta": {"x": 520, "y": 140},
+                     "m_AnchorMin": {"x": 0, "y": 0},
+                     "m_AnchorMax": {"x": 0, "y": 0}}
+            scope["items"][("RectTransform", 20 + i)] = entry(child)
+            scope["items"][("GameObject", i)] = entry({"m_IsActive": i != 3})
+            children.append((i, child))
+        fitted = TOOLS._preview_content_fitted_rect(scope, parent, transform, (0, 0, 760, 0), (1, 1))
+        self.assertEqual(fitted, (0, -252.5, 760, 505))
+        rects, applied = TOOLS._preview_vertical_layout_child_rects(scope, parent, fitted, (1, 1), children)
+        self.assertTrue(applied)
+        self.assertEqual(rects[1][1] - rects[2][1], 180)
+        self.assertNotIn(3, rects)
+
     def test_file_id_scope_falls_back_to_unique_bundle_entry(self) -> None:
         exact_scope = {"asset_key": "source/exact/bundle/CAB-exact"}
         external_scope = {"asset_key": "actual/owner/bundle/CAB-external"}

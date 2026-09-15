@@ -26,11 +26,12 @@ from .obb_container import (
     write_obb_from_template,
 )
 from .split_bundle import find_split_bundle_groups, merge_split_bundle_group
+from .resource_crypto import decrypt_staged, load_candidates, encrypt_results, settings_path
 from tools.catalog_bin_tool import repack_binary_catalog_from_legacy_output
 
 
 REMOTE_PLACEHOLDER_RE = re.compile(r"\{[^}]*RemoteLoadPath[^}]*\}", re.IGNORECASE)
-RESOURCE_STAGING_STATE_VERSION = 3
+RESOURCE_STAGING_STATE_VERSION = 6
 OBB_STAGING_CONTENT_SUFFIX = ".contents"
 
 
@@ -92,6 +93,7 @@ def _resource_source_fingerprint(cfg: PipelineConfig) -> dict[str, Any]:
     roots = (
         ("data", cfg.resource_source_root, True),
         ("android", _addressables_android_root(cfg), False),
+        ("assetpack", _game_root(cfg) / "assets" / "assetpack", False),
     )
     for label, root, skip_managed in roots:
         if not root.is_dir():
@@ -115,6 +117,14 @@ def _resource_source_fingerprint(cfg: PipelineConfig) -> dict[str, Any]:
     if catalog_hash_path != catalog_path:
         add_file(f"catalog/{catalog_hash_path.name}", catalog_hash_path)
     game_root = _game_root(cfg)
+    digest.update(json.dumps({name: str(getattr(cfg, name, "")) for name in (
+        "enable_ai_translation", "ai_translation_transport", "ai_translation_model",
+        "ai_translation_codex_model", "ai_translation_base_url", "ai_translation_api_key",
+    )}, sort_keys=True).encode())
+    # Key discovery/configuration changes must invalidate plaintext staging.
+    for path in (game_root / "AndroidManifest.xml", settings_path(cfg.workspace_root)):
+        if path.is_file():
+            digest.update(path.read_bytes())
     obb_root = game_root / "assets" / "obb"
     for obb_path in discover_obb_files(game_root):
         try:
@@ -741,6 +751,10 @@ def _source_info_for_staged_path(
 ) -> tuple[str, Path, Path]:
     parts = staged_relative.parts
     game_root = _game_root(cfg)
+    if parts and parts[0].lower() == "assetpack":
+        relative = Path(*parts[1:])
+        source_relative_game = Path("assets") / "assetpack" / relative
+        return "assetpack", game_root / source_relative_game, source_relative_game
     if len(parts) >= 2 and parts[0].lower() == "aa" and parts[1].lower() == "android":
         relative = Path(*parts[2:])
         source_path = _addressables_android_root(cfg) / relative
@@ -782,10 +796,11 @@ def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
     if not inspect_and_download_catalog_resources(cfg):
         return None
     obb_paths = discover_obb_files(_game_root(cfg))
-    if not cfg.resource_source_root.is_dir() and not obb_paths:
+    assetpack_root = _game_root(cfg) / "assets" / "assetpack"
+    if not cfg.resource_source_root.is_dir() and not obb_paths and not assetpack_root.is_dir():
         print(
             f"[资源暂存][停止] Data 资源目录不存在，assets/obb 下也没有 OBB: "
-            f"{cfg.resource_source_root}"
+            f"{cfg.resource_source_root}，也未找到 assets/assetpack"
         )
         return None
 
@@ -798,8 +813,10 @@ def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
     android_root = _addressables_android_root(cfg)
     android_count = _copy_source_tree(android_root, staging_root / "aa" / "Android")
     data_count = _copy_source_tree(cfg.resource_source_root, staging_root / "bin" / "Data", skip_managed=True)
+    assetpack_count = _copy_source_tree(assetpack_root, staging_root / "assetpack")
     print(f"[资源暂存] Addressables Android: {android_count} 个文件")
     print(f"[资源暂存] bin/Data（不含 Managed）: {data_count} 个文件")
+    print(f"[资源暂存] PAD assets/assetpack: {assetpack_count} 个文件")
 
     obb_root = _obb_root(cfg)
     obb_entry_records: dict[str, dict[str, Any]] = {}
@@ -945,6 +962,8 @@ def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
             f"{len(part_rows)} 个 split"
         )
 
+    crypto_candidates = load_candidates(_game_root(cfg), cfg.workspace_root)
+    crypto_count = 0
     entries: list[dict[str, Any]] = []
     for staged_path in sorted(path for path in staging_root.rglob("*") if path.is_file()):
         staged_relative = staged_path.relative_to(staging_root)
@@ -970,7 +989,45 @@ def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
             }
             if split_record is not None:
                 entry["split_parts"] = split_record["parts"]
+        crypto = decrypt_staged(staged_path, crypto_candidates)
+        if crypto is not None:
+            entry["resource_crypto"] = crypto
+            crypto_count += 1
         entries.append(entry)
+
+    # AI is a separate evidence/key-candidate stage, only for unresolved resource
+    # files. Known locally verified transforms need no network request.
+    unresolved = []
+    for entry in entries:
+        path = Path(entry["staged_path"])
+        if entry.get("resource_crypto") or path.suffix.lower() not in (".bundle", ".unity3d", ".assetbundle"):
+            continue
+        if path.stat().st_size < 32:
+            continue
+        with path.open("rb") as stream:
+            if stream.read(8) in (b"UnityFS\0", b"UnityRaw", b"UnityWeb"):
+                continue
+        unresolved.append(path)
+    if unresolved:
+        try:
+            from .resource_crypto_ai import discover_ai_candidates
+            ai_candidates = discover_ai_candidates(cfg, unresolved)
+        except Exception:
+            print("[资源AI分析][跳过] 分析暂不可用，保留资源异常告警。")
+            ai_candidates = []
+        for entry in entries:
+            path = Path(entry["staged_path"])
+            if path not in unresolved or not ai_candidates:
+                continue
+            try:
+                crypto = decrypt_staged(path, ai_candidates)
+            except Exception:
+                print(f"[资源AI分析][验证未通过] {entry['staged_relative']}；文件未变更，不采用 AI 建议。")
+                continue
+            if crypto:
+                crypto["key_source"] = "ai_candidate_locally_validated"
+                entry["resource_crypto"] = crypto
+                crypto_count += 1
 
     state = {
         "state_version": RESOURCE_STAGING_STATE_VERSION,
@@ -985,6 +1042,8 @@ def prepare_unified_resource_source(cfg: PipelineConfig) -> Path | None:
         "obb_resource_entry_count": obb_resource_count,
     }
     _write_json(resource_source_map_path(cfg), state)
+    if crypto_count:
+        _log_green(f"[资源解密] 自动识别并解密 {crypto_count} 个资源包，完整解析及重新加密往返校验通过；原资源未修改。")
     _write_json(split_merge_report_path(cfg), list(split_records.values()))
     print(f"[资源暂存] 统一资源目录: {staging_root}")
     print(f"[资源暂存] 路径映射: {resource_source_map_path(cfg)}")
@@ -1021,6 +1080,8 @@ def _final_path_for_entry(final_root: Path, entry: dict[str, Any]) -> Path:
         return final_root / "aa" / "Android" / Path(*parts[2:])
     if category == "data" and len(parts) >= 2:
         return final_root / "Data" / Path(*parts[2:])
+    if category == "assetpack" and parts:
+        return final_root / "assetpack" / Path(*parts[1:])
     return final_root / staged_relative
 
 
@@ -1075,9 +1136,21 @@ def restore_imported_resource_paths(
     print(f"[导入路径] 已按原始来源整理修改结果: {moved} 个文件")
     print(f"[导入路径] Addressables: {final_root / 'aa'}")
     print(f"[导入路径] bin/Data: {final_root / 'Data'}")
+    if any(entry.get("category") == "assetpack" for entry in entries if isinstance(entry, dict)):
+        print(f"[导入路径] PAD: {final_root / 'assetpack'}（对应 assets/assetpack）")
     if any(entry.get("origin_kind") == "obb" for entry in entries if isinstance(entry, dict)):
         print(f"[导入路径] OBB 修改暂存: {raw_root / 'obb'}")
     return restored
+
+
+def encrypt_imported_resource_paths(cfg: PipelineConfig, restored: dict[str, Path], *, catalog_ready: bool = True) -> int:
+    state = json.loads(resource_source_map_path(cfg).read_text(encoding="utf-8-sig"))
+    if not catalog_ready and cfg.catalog_source_path.is_file() and any(
+        entry.get("resource_crypto") and entry.get("category") == "addressables_android"
+        and entry.get("staged_relative") in restored for entry in state["entries"]
+    ):
+        raise RuntimeError("加密资源的 catalog 校验/回写未成功，停止加密和渠道同步；当前结果不可直接导入。")
+    return encrypt_results(state["entries"], restored)
 
 
 def _write_split_parts_next_to_merged(

@@ -352,9 +352,8 @@ def _filter_merged_chars_by_ttf_support(
         return chars, ""
 
     source_label = (
-        "模板 TTF 全部字符 + "
         f"{'老工具 SDF 模板字符 + ' if cfg.include_old_sdf_template_chars else ''}"
-        "原游戏字体字符 + 译文字符"
+        "原游戏字体字符 + 译文字符 + 配置额外字符"
     )
 
     kept: list[str] = []
@@ -502,10 +501,9 @@ def build_merged_tmp_chars(cfg: PipelineConfig) -> Path:
             stale_path.unlink()
     if missing_translation_chars:
         raise SystemExit(1)
-    template_ttf_chars = _chars_from_supported_codepoints(supported_ttf_chars)
     all_old_sdf_template_chars = _chars_from_supported_codepoints(supported_old_sdf_chars)
     old_sdf_template_chars = all_old_sdf_template_chars if cfg.include_old_sdf_template_chars else ""
-    print(f"[TMP] 模板 TTF 全部字符: {len(template_ttf_chars)} 个，将参与 tmp_chars.txt 合并。", flush=True)
+    print("[TMP] 模板 TTF 仅用于字符支持检查，不合并其全部字符。", flush=True)
     if cfg.include_old_sdf_template_chars:
         print(f"[TMP] 老工具 SDF 模板字符: {len(old_sdf_template_chars)} 个，将参与 tmp_chars.txt 合并。", flush=True)
     else:
@@ -518,11 +516,18 @@ def build_merged_tmp_chars(cfg: PipelineConfig) -> Path:
     if old_tmp_chars:
         print(f"[TMP] 已从资源导出目录提取原 TMP 字符: {len(old_tmp_chars)} 个", flush=True)
     old_tmp_char_set = set(old_tmp_chars)
-    merged = "".join(unique_preserve_order(template_ttf_chars + old_sdf_template_chars + old_tmp_chars + source_chars))
+    extra_chars = getattr(cfg, "tmp_extra_chars", "") or ""
+    if not isinstance(extra_chars, str):
+        raise ValueError("tmp_extra_chars 必须是字符串，例如：霰髅")
+    merged = "".join(unique_preserve_order(old_sdf_template_chars + old_tmp_chars + source_chars + extra_chars))
     merged = "".join(char for char in merged if _is_tmp_char_candidate(char))
     merged_before_filter_count = len(merged)
     merged, missing_from_ttf = _filter_merged_chars_by_ttf_support(cfg, merged, supported_ttf_chars)
     merged_char_set = set(merged)
+    extra_kept = "".join(char for char in unique_preserve_order(extra_chars)
+                         if char in merged_char_set and is_visible_char(char))
+    if extra_chars:
+        print(f"[TMP] 配置额外字符（去重且通过 TTF 支持检查）: {len(extra_kept)} 个：{extra_kept}", flush=True)
     added_chars = "".join(
         char
         for char in unique_preserve_order(source_chars)
@@ -531,9 +536,9 @@ def build_merged_tmp_chars(cfg: PipelineConfig) -> Path:
     output_path = cfg.stage_record_dir / cfg.output_tmp_chars_txt
     output_path.write_text(merged, encoding="utf-8")
     print(
-        f"[TMP] 模板 TTF 全部字符 + "
+        f"[TMP] "
         f"{'老工具 SDF 模板字符 + ' if cfg.include_old_sdf_template_chars else ''}"
-        f"原游戏字体字符 + 译文字符: {merged_before_filter_count} 个；"
+        f"原游戏字体字符 + 译文字符 + 配置额外字符: {merged_before_filter_count} 个；"
         f"写入 tmp_chars.txt: {len(merged)} 个；删除模板 TTF 不支持字符: {len(missing_from_ttf)} 个",
         flush=True,
     )

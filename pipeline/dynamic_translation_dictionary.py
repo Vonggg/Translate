@@ -723,6 +723,7 @@ def render_dynamic_translation_dictionary(
     *,
     whole_sources: Collection[str] | None = None,
     substring_sources: Collection[str] = (),
+    untranslated: bool = False,
 ) -> str:
     if whole_sources is None:
         whole_sources = [source for source in translations if isinstance(source, str)]
@@ -736,6 +737,11 @@ def render_dynamic_translation_dictionary(
         longest_source_first=True,
         derive_placeholder_fragments=True,
     )
+    if untranslated:
+        whole_entries = [(source, "") for source in dict.fromkeys(whole_sources)
+                         if isinstance(source, str) and source and "\x00" not in source]
+        substring_entries = [(source, "") for source in sorted(set(substring_sources), key=lambda s: (-len(s), s))
+                             if isinstance(source, str) and source and "\x00" not in source]
     rows = [
         "// Generated from stringliteral.json entries proven to reach a Unity display sink.",
         "// Exact literals use whole-text matching; derived literals use substring matching.",
@@ -844,6 +850,7 @@ def generate_dynamic_translation_dictionary(
     *,
     translation_builder: TranslationBuilder | None = None,
     usage_analyzer: Callable[..., Mapping[str, Any]] | None = None,
+    translation_confirmation: Callable[[], bool] | None = None,
 ) -> Path:
     """Translate proven display literals and generate both Hook dictionaries."""
     source_path = cfg.stringliteral_json_path
@@ -900,20 +907,6 @@ def generate_dynamic_translation_dictionary(
     analysis_cache_path = (
         cfg.stage_record_dir / "stringliteral_display_analysis.cache.json"
     )
-    if analysis_cache_path.exists():
-        try:
-            analysis_cache_path.unlink()
-            print(
-                f"[动态词库] 已清理本次专用分析缓存: {analysis_cache_path}",
-                flush=True,
-            )
-        except OSError as exc:
-            # The built-in analyzer is still called with use_cache=False, so
-            # an undeletable stale file can never affect this run.
-            print(
-                f"[动态词库][提示] 分析缓存无法删除，将强制忽略: {exc}",
-                flush=True,
-            )
     analysis_kwargs: dict[str, Any] = {
         "libil2cpp_path": libil2cpp_path,
         "script_json_path": script_json_path,
@@ -923,7 +916,7 @@ def generate_dynamic_translation_dictionary(
     }
     if use_builtin_analyzer:
         analysis_kwargs["cache_path"] = analysis_cache_path
-        analysis_kwargs["use_cache"] = False
+        analysis_kwargs["use_cache"] = True
         analysis_kwargs["progress_callback"] = lambda message: print(
             f"[动态词库][链路分析] {message}", flush=True
         )
@@ -1085,6 +1078,25 @@ def generate_dynamic_translation_dictionary(
     pending_count = sum(
         not combined_translations.get(source) for source in all_candidates
     )
+    # Publish the complete empty-translation dictionary before asking or making
+    # any translation request. Keep an existing generated result recoverable.
+    raw_cpp = render_dynamic_translation_dictionary(
+        OrderedDict((source, "") for source in all_candidates),
+        whole_sources=list(dict.fromkeys([*whole_sources, *enum_whole_sources])),
+        substring_sources=list(dict.fromkeys([*substring_sources, *enum_substring_sources])),
+        untranslated=True,
+    )
+    backup_path = output_path.with_suffix(output_path.suffix + ".before_untranslated.bak")
+    if output_path.is_file() and not backup_path.exists():
+        import shutil
+        shutil.copy2(output_path, backup_path)
+    output_path.write_text(raw_cpp, encoding="utf-8")
+    output_path.with_name(output_path.stem + ".untranslated.cpp").write_text(raw_cpp, encoding="utf-8")
+    print(f"[动态词库][第一步完成] 已生成空译文 C++ 字典: {output_path}", flush=True)
+    if translation_confirmation is not None and not translation_confirmation():
+        atomic_write_json(report_path, {"status": "untranslated", "candidate_count": len(all_candidates),
+            "dictionary_output_path": str(output_path), "translation_requested": False})
+        return output_path
     if pending_count:
         if translation_builder is None:
             raise RuntimeError(
@@ -1134,6 +1146,10 @@ def generate_dynamic_translation_dictionary(
                 }
                 if use not in context["display_uses"]:
                     context["display_uses"].append(use)
+        # The builder resumes from this file, not from combined_translations.
+        # Include enum translations as well so adding one literal does not
+        # retranslate (and overwrite) every previously translated enum.
+        atomic_write_json(cache_path, dict(combined_translations))
         result = builder(
             all_candidates,
             cfg,

@@ -1065,7 +1065,8 @@ def test_virtual_text_component_call_is_traced_from_dump_field_type() -> None:
     assert result["stats"]["virtual_component_candidate_method_count"] == 1
 
 
-def test_virtual_text_component_slot_is_not_fixed_to_one_tmp_version() -> None:
+@pytest.mark.parametrize("tail_call", [False, True])
+def test_virtual_text_component_slot_is_not_fixed_to_one_tmp_version(tail_call) -> None:
     caller = 0x1000
     literal_slot = 0x5010
     words = [
@@ -1077,7 +1078,7 @@ def test_virtual_text_component_slot_is_not_fixed_to_one_tmp_version() -> None:
         _ldr(9, 8, 0x558),
         _ldr(2, 8, 0x560),  # adjacent IL2CPP MethodInfo cell
         _mov(0, 20),
-        _blr(9),
+        (0xD61F0000 | (9 << 5)) if tail_call else _blr(9),
         RET,
     ]
     section = _make_section({caller: _words(*words)})
@@ -1099,6 +1100,27 @@ def test_virtual_text_component_slot_is_not_fixed_to_one_tmp_version() -> None:
     assert [item["value"] for item in result["exact_literals"]] == [
         "Events unlocked"
     ]
+
+
+@pytest.mark.parametrize("slot,expected", [(0x558, True), (0x578, False)])
+def test_virtual_tail_setter_requires_verified_slot(slot, expected):
+    caller, literal_slot = 0x1000, 0x5010
+    section = _make_section({caller: _words(
+        _adrp(caller, literal_slot, 8), _ldr(8, 8, literal_slot & 0xFFF),
+        _ldr(1, 8), _ldr(0, 0, 0x30), _ldr(8, 0),
+        _ldr(3, 8, slot), _ldr(2, 8, slot + 8),
+        0xD61F0000 | (3 << 5),  # BR x3, no return/fallthrough
+    )})
+    result = analyze_arm64_display_usage(
+        code_sections=[(caller, section)],
+        method_payload=[_method(caller, "Game.Popup$$Refresh",
+            "void Game_Popup__Refresh (Game_Popup_o* __this, const MethodInfo* method);")],
+        addresses=[caller, 0x1100], literals={0x6000: "GATLING GUN"},
+        slot_to_cell={literal_slot: 0x6000},
+        display_fields_by_method={caller: {0x30: "TMPro.TMP_Text"}},
+        virtual_text_slots_by_component={"TMPro.TMP_Text": frozenset({0x558})},
+    )
+    assert bool(result["exact_literals"]) is expected
 
 
 def test_persisted_model_string_field_reaches_later_popup_consumer() -> None:
@@ -2023,7 +2045,9 @@ def test_literal_static_field_write_reaches_later_display_reader() -> None:
     assert result["stats"]["static_field_literal_count"] == 1
 
 
-def test_erased_get_component_is_accepted_only_after_verified_text_slot() -> None:
+@pytest.mark.parametrize("factory", ["GetComponent", "GetComponentInChildren", "GetComponentInParent"])
+@pytest.mark.parametrize("owner", ["UnityEngine.GameObject", "UnityEngine.Component"])
+def test_erased_get_component_is_accepted_only_after_verified_text_slot(factory, owner) -> None:
     caller = 0x1000
     get_component = 0x1100
     literal_slot = 0x5010
@@ -2050,7 +2074,7 @@ def test_erased_get_component_is_accepted_only_after_verified_text_slot() -> Non
             ),
             _method(
                 get_component,
-                "UnityEngine.GameObject$$GetComponent<object>",
+                f"{owner}$${factory}<object>",
                 "Il2CppObject* UnityEngine_GameObject__GetComponent_object (UnityEngine_GameObject_o* __this, const MethodInfo* method);",
             ),
         ],

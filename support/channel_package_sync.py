@@ -25,6 +25,63 @@ class ChannelSyncSummary:
     source_aa_files: int = 0
     final_result_files: int = 0
     copied_bytes: int = 0
+    dictionary_entries: int = 0
+
+
+def sync_generated_dictionary(cfg, target: ChannelPackageTarget) -> int:
+    source = Path(cfg.workspace_root) / "output/Hook_Translate/native_unity_translation_dictionary.generated.cpp"
+    if not source.is_file():
+        print("[字典同步] 未生成 Hook 字典，保留项目原字典。", flush=True)
+        return 0
+    project_root = Path(cfg.project_dir).resolve()
+    destination = _safe_destination(
+        project_root, target.root.parent / "cpp/native_unity_translation_dictionary.cpp")
+    if not destination.is_file():
+        raise FileNotFoundError(f"项目汉化实现不存在，不能用数组片段覆盖: {destination}")
+    original = destination.read_text(encoding="utf-8-sig")
+    generated = source.read_text(encoding="utf-8-sig")
+    updated = original
+    total = 0
+    entry_pattern = re.compile(r'\{\s*u"((?:\\.|[^"\\])*)"\s*,\s*u"(?:\\.|[^"\\])*"\s*\}\s*,?')
+    for name in ("kWholeTextDictionary", "kSubstringDictionary"):
+        pattern = re.compile(
+            r"(const\s+NativeUnityTranslationEntry\s+" + name +
+            r"\s*\[\s*\]\s*=\s*\{)(.*?)(\n\s*\};)", re.S)
+        incoming = pattern.search(generated)
+        current = pattern.search(updated)
+        if incoming is None or current is None:
+            raise ValueError(f"字典数组缺失或格式不支持: {name}")
+        body = incoming.group(2)
+        # Reject unknown generated syntax rather than silently importing a subset.
+        residue = entry_pattern.sub("", body)
+        residue = re.sub(r"\{\s*nullptr\s*,\s*nullptr\s*\}\s*,?", "", residue)
+        residue = re.sub(r"//[^\n]*|/\*.*?\*/", "", residue, flags=re.S)
+        if residue.strip():
+            raise ValueError(f"生成字典存在无法解析的内容: {name}")
+        entries = list(entry_pattern.finditer(body))
+        replacements = {entry.group(1): entry.group(0).rstrip(",") + "," for entry in entries}
+        seen = set()
+        def replace_entry(match):
+            key = match.group(1)
+            seen.add(key)
+            return replacements.get(key, match.group(0))
+        merged = entry_pattern.sub(replace_entry, current.group(2))
+        additions = [value for key, value in replacements.items() if key not in seen]
+        if additions:
+            merged = merged.rstrip() + "\n    " + "\n    ".join(additions) + "\n"
+        updated = updated[:current.start(2)] + merged + updated[current.end(2):]
+        total += len(replacements)
+    if updated != original:
+        backup = destination.with_suffix(destination.suffix + ".before-translate-sync.bak")
+        shutil.copy2(destination, backup)
+        temporary = destination.with_name(destination.name + ".translate-channel-sync.tmp")
+        try:
+            temporary.write_text(updated, encoding="utf-8")
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+    print(f"[字典同步] 合并 {total} 条生成词条，保留项目独有词条与汉化实现 -> {destination}", flush=True)
+    return total
 
 
 def explicit_channel_sync_request() -> tuple[bool, str]:
@@ -142,8 +199,9 @@ def sync_import_result_to_channel_package(
     final_data = final_root / "Data"
     final_aa = final_root / "aa"
     final_obb = final_root / "obb"
-    if not final_data.is_dir() and not final_aa.is_dir() and not final_obb.is_dir():
-        raise FileNotFoundError(f"导入结果中没有 Data、aa 或 obb: {final_root}")
+    final_assetpack = final_root / "assetpack"
+    if not any(p.is_dir() for p in (final_data, final_aa, final_obb, final_assetpack)):
+        raise FileNotFoundError(f"导入结果中没有 Data、aa、obb 或 assetpack: {final_root}")
 
     source_aa_files = 0
     final_result_files = 0
@@ -168,6 +226,7 @@ def sync_import_result_to_channel_package(
     # win over the original aa tree copied above.
     mappings = (
         (final_data, target.assets_root / "bin" / "Data"),
+        (final_assetpack, target.assets_root / "assetpack"),
         (final_aa, target.assets_root / "aa"),
         (final_obb, target.assets_root / "obb"),
     )
@@ -182,6 +241,7 @@ def sync_import_result_to_channel_package(
 
     if final_result_files <= 0:
         raise RuntimeError(f"FinalResult 没有可同步到渠道包的文件: {final_root}")
+    dictionary_entries = sync_generated_dictionary(cfg, target)
     print(
         f"\033[92m[渠道包同步][完成] {target.name}: "
         f"原 aa={source_aa_files}，导入结果={final_result_files}，"
@@ -192,4 +252,5 @@ def sync_import_result_to_channel_package(
         source_aa_files=source_aa_files,
         final_result_files=final_result_files,
         copied_bytes=copied_bytes,
+        dictionary_entries=dictionary_entries,
     )

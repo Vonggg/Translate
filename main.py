@@ -286,9 +286,11 @@ def _execute_noninteractive_step(cfg, step: str) -> int:
     if step == "2":
         return finish_step(step, translate_from_scan_records(cfg) or 0)
     if step == "3":
+        from support.timed_confirmation import confirm_dictionary_translation
         generate_dynamic_translation_dictionary(
             cfg,
             translation_builder=build_translation_map_for_texts,
+            translation_confirmation=confirm_dictionary_translation,
         )
         return finish_step(step, 0)
     if step == "4":
@@ -416,7 +418,7 @@ def print_menu() -> None:
     print("  8: 检查静态与动态词库译文字符是否被模板 TTF 和老工具 SDF 模板支持；")
     print("     模板 TTF 缺译文字符会输出 translation_chars_missing_from_ttf.tsv 并停止；")
     print("     老工具 SDF 模板缺译文字符只输出提示文件，不中断后续流程。")
-    print("     再合并原游戏字体字符、译文字符、模板 TTF 全部字符；")
+    print("     再合并原游戏字体字符、译文字符；模板 TTF 仅用于检查字符支持；")
     print("     仅当 include_old_sdf_template_chars=true 时额外合并老工具 SDF 模板全部字符，")
     print("     删除模板 TTF 不支持字符后生成 tmp_chars.txt。")
     print("  9: 生成字体（支持 TMP、NGUI）；按脚本 0 的字体检测结果选择所需流程；")

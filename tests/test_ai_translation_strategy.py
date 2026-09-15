@@ -3,11 +3,30 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from pipeline.ai_translation_strategy import DefaultAITranslationStrategy
+from pipeline.ai_translation_strategy import DefaultAITranslationStrategy, PERSON_NAME_TRANSLATION_RULE
 from pipeline.deepseek_translation_strategy import DeepSeekTranslationStrategy
 
 
 class AITranslationStrategyTests(unittest.TestCase):
+    def test_display_person_names_require_chinese_in_batch_prompts(self) -> None:
+        cfg = SimpleNamespace()
+        for strategy in (DefaultAITranslationStrategy(cfg), DeepSeekTranslationStrategy(cfg)):
+            self.assertIn(PERSON_NAME_TRANSLATION_RULE, strategy.system_prompt())
+            self.assertIn("SAM BUCK 译为山姆·巴克", strategy.system_prompt())
+            self.assertIn("不得据此改写资源路径、内部ID、代码标识", strategy.system_prompt())
+
+    def test_single_item_fallback_uses_same_person_name_rule(self) -> None:
+        from unittest.mock import patch
+        from pipeline.translation import _translate_ai_once
+        cfg = SimpleNamespace(ai_translation_base_url="", ai_translation_api_key="",
+                              ai_translation_model="test", ai_translation_timeout=30,
+                              root_dir=None)
+        with patch("pipeline.translation.is_codex_transport", return_value=True), \
+                patch("pipeline.translation.request_structured_output",
+                      return_value=({"translation": "山姆·巴克"}, {})) as request:
+            self.assertEqual(_translate_ai_once("SAM BUCK", cfg, "test"), "山姆·巴克")
+        self.assertIn(PERSON_NAME_TRANSLATION_RULE, request.call_args.kwargs["system_prompt"])
+
     def test_chinese_source_text_requires_simplified_output_rule(self) -> None:
         cfg = SimpleNamespace(
             ai_translation_batch_max_chars=120000,

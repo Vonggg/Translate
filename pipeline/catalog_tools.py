@@ -316,7 +316,7 @@ def _pad_request_option_raw_to_length(raw: str, expected_length: int) -> str:
     return raw[:-1] + padding + raw[-1:]
 
 
-def _rebuild_extra_data_base64(field_obj: dict, crc_overflow: str = "zero") -> str:
+def _rebuild_extra_data_base64(field_obj: dict, crc_overflow: str = "zero", entry_field: dict | None = None) -> str:
     original_base64 = field_obj.get("原始base64")
     if not isinstance(original_base64, str) or not original_base64:
         raise RuntimeError("m_ExtraDataString 缺少 原始base64，无法回打")
@@ -343,7 +343,7 @@ def _rebuild_extra_data_base64(field_obj: dict, crc_overflow: str = "zero") -> s
         else:
             continue
         new_raw_unpadded = _rebuild_request_option_raw(row)
-        if len(new_raw_unpadded) > len(raw) and "m_Crc" in row:
+        if len(new_raw_unpadded) > len(raw) and entry_field is None and "m_Crc" in row:
             if crc_overflow != "zero":
                 raise RuntimeError(
                     "AssetBundleRequestOptions 回打后长度变长: "
@@ -356,10 +356,11 @@ def _rebuild_extra_data_base64(field_obj: dict, crc_overflow: str = "zero") -> s
                 "[catalog][提示] CRC 十进制长度变长，已将该条 m_Crc 回打为 0 以跳过校验: "
                 f"hash={row.get('m_Hash')} real_crc={original_crc}"
             )
-        new_raw = _pad_request_option_raw_to_length(new_raw_unpadded, len(raw))
+        grows = len(new_raw_unpadded) > len(raw) and entry_field is not None
+        new_raw = new_raw_unpadded if grows else _pad_request_option_raw_to_length(new_raw_unpadded, len(raw))
         old_bytes = raw.encode("utf-16le")
         new_bytes = new_raw.encode("utf-16le")
-        if len(new_bytes) != len(old_bytes):
+        if len(new_bytes) != len(old_bytes) and not grows:
             raise RuntimeError(
                 "AssetBundleRequestOptions 回打后长度变化，当前保守回打已拒绝: "
                 f"hash={row.get('m_Hash')} old_len={len(raw)} new_len={len(new_raw)}"
@@ -369,7 +370,41 @@ def _rebuild_extra_data_base64(field_obj: dict, crc_overflow: str = "zero") -> s
                 "AssetBundleRequestOptions 原始片段定位失败: "
                 f"hash={row.get('m_Hash')} view={view} char_offset={char_offset}"
             )
+        if grows:
+            # Addressables BinaryStorageBuffer JSON object payload uses an Int32
+            # UTF-16 byte length immediately before the JSON, not a char count.
+            if byte_offset < 4 or struct.unpack_from("<i", data, byte_offset - 4)[0] != len(old_bytes):
+                raise RuntimeError("catalog JSON 长度前缀不匹配，拒绝变长回打")
+            byte_offset -= 4
+            old_bytes = data[byte_offset:byte_offset + 4] + old_bytes
+            new_bytes = struct.pack("<i", len(new_bytes)) + new_bytes
         replacements.append((byte_offset, old_bytes, new_bytes, row))
+
+    ordered = sorted(replacements, key=lambda item: item[0])
+    for previous, current in zip(ordered, ordered[1:]):
+        if previous[0] + len(previous[1]) > current[0]:
+            raise RuntimeError("catalog JSON 回打片段重叠")
+    shifts = [(offset, offset + len(old), len(new) - len(old))
+              for offset, old, new, _ in ordered if len(new) != len(old)]
+    if shifts:
+        encoded_entries = entry_field.get("原始base64") if entry_field else None
+        if not isinstance(encoded_entries, str):
+            raise RuntimeError("catalog 变长回打缺少 entry 表，拒绝写入")
+        entries = bytearray(base64.b64decode(encoded_entries))
+        count = struct.unpack_from("<i", entries)[0] if len(entries) >= 4 else -1
+        if count < 0 or len(entries) != 4 + count * 28:
+            raise RuntimeError("catalog entry 表结构不支持，拒绝变长回打")
+        for index in range(count):
+            position = 4 + index * 28 + 16
+            offset = struct.unpack_from("<i", entries, position)[0]
+            if offset < 0:
+                continue
+            if offset >= len(data) or any(start <= offset < end for start, end, _ in shifts):
+                raise RuntimeError("catalog extra-data 引用越界或指向 JSON 内部，拒绝变长回打")
+            delta = sum(change for _, end, change in shifts if offset >= end)
+            struct.pack_into("<i", entries, position, offset + delta)
+        entry_field["原始base64"] = base64.b64encode(entries).decode("ascii")
+        print(f"[catalog] 已安全扩展 {len(shifts)} 条 JSON 数据，并重定位 {count} 条资源的 extra-data 引用。")
 
     for byte_offset, old_bytes, new_bytes, _row in sorted(replacements, key=lambda item: item[0], reverse=True):
         output[byte_offset:byte_offset + len(old_bytes)] = new_bytes
@@ -389,6 +424,12 @@ def repack_expanded_catalog(
     if not isinstance(catalog, dict):
         raise RuntimeError(f"Output.json 不是 JSON 对象: {source}")
 
+    # Rebuild extra-data first because growth can relocate entry-table offsets.
+    extra = catalog.get("m_ExtraDataString")
+    if isinstance(extra, dict):
+        entry = catalog.get("m_EntryDataString")
+        catalog["m_ExtraDataString"] = _rebuild_extra_data_base64(
+            extra, crc_overflow=crc_overflow, entry_field=entry if isinstance(entry, dict) else None)
     for field in CATALOG_FIELDS:
         value = catalog.get(field)
         if isinstance(value, str):
@@ -599,6 +640,52 @@ def save_catalog_crc_sample(
     return sample_dir
 
 
+def _attach_json_catalog_internal_ids(catalog: dict) -> None:
+    """Associate compact JSON catalog options by entry extra-data offsets, not size guesses."""
+    entry_field = catalog.get("m_EntryDataString")
+    extra_field = catalog.get("m_ExtraDataString")
+    ids = catalog.get("m_InternalIds")
+    if not isinstance(entry_field, dict) or not isinstance(extra_field, dict) or not isinstance(ids, list):
+        return
+    encoded = entry_field.get("原始base64")
+    extra_encoded = extra_field.get("原始base64")
+    if not isinstance(encoded, str) or not isinstance(extra_encoded, str):
+        return  # Binary catalog already carries InternalId on its option rows.
+    data = base64.b64decode(encoded)
+    extra = base64.b64decode(extra_encoded)
+    if len(data) < 4:
+        raise ValueError("catalog entry table is truncated")
+    count = struct.unpack_from("<i", data)[0]
+    if count < 0 or len(data) != 4 + count * 28:
+        raise ValueError("Unsupported catalog entry table layout")
+    entries = [struct.unpack_from("<7i", data, 4 + index * 28) for index in range(count)]
+    offsets = sorted({row[4] for row in entries if 0 <= row[4] < len(extra)} | {len(extra)})
+    boundaries = dict(zip(offsets, offsets[1:]))
+    options = extra_field.get("AssetBundleRequestOptions", [])
+    if not isinstance(options, list):
+        return
+    for row in entries:
+        internal_index, extra_offset = row[0], row[4]
+        if not 0 <= internal_index < len(ids) or extra_offset not in boundaries:
+            continue
+        matches = []
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            view, offset = option.get("view"), option.get("char_offset")
+            if view not in ("utf16le_even", "utf16le_odd") or not isinstance(offset, int):
+                continue
+            position = offset * 2 + (view == "utf16le_odd")
+            raw = option.get("raw", "").encode("utf-16le")
+            if extra_offset <= position and position + len(raw) <= boundaries[extra_offset] and extra[position:position + len(raw)] == raw:
+                matches.append(option)
+        if len(matches) == 1:
+            option = matches[0]
+            if "InternalId" in option and option["InternalId"] != ids[internal_index]:
+                raise ValueError("Ambiguous catalog option InternalId")
+            option["InternalId"] = ids[internal_index]
+
+
 def validate_catalog_crc_algorithm(
     cfg: PipelineConfig,
     expanded_catalog_path: Path,
@@ -607,6 +694,7 @@ def validate_catalog_crc_algorithm(
     output_dir: Path,
 ) -> bool:
     catalog = json.loads(expanded_catalog_path.read_text(encoding="utf-8-sig"))
+    _attach_json_catalog_internal_ids(catalog)
     extra = catalog.get("m_ExtraDataString") if isinstance(catalog, dict) else None
     options = extra.get("AssetBundleRequestOptions") if isinstance(extra, dict) else None
     if not isinstance(options, list):
@@ -897,6 +985,7 @@ def patch_expanded_catalog_from_final_bundles(
     if not isinstance(catalog, dict):
         raise RuntimeError(f"Output.json 不是 JSON 对象: {source}")
 
+    _attach_json_catalog_internal_ids(catalog)
     extra = catalog.get("m_ExtraDataString")
     if not isinstance(extra, dict):
         raise RuntimeError("Output.json 中 m_ExtraDataString 不是展开对象，请先解析 catalog")
@@ -911,6 +1000,7 @@ def patch_expanded_catalog_from_final_bundles(
             if not reference_source.is_file():
                 raise FileNotFoundError(f"catalog 匹配基准不存在: {reference_source}")
             reference_catalog = json.loads(reference_source.read_text(encoding="utf-8-sig"))
+            _attach_json_catalog_internal_ids(reference_catalog)
             reference_extra = (
                 reference_catalog.get("m_ExtraDataString")
                 if isinstance(reference_catalog, dict)
@@ -997,6 +1087,12 @@ def patch_expanded_catalog_from_final_bundles(
                 continue
             source_size = source_bundle.stat().st_size
             candidates = option_by_crc_size.get((source_crc, source_size), [])
+            if not candidates:
+                candidates = [options[index] for index, reference_row in enumerate(reference_options)
+                    if reference_row.get("m_Crc") == 0 and reference_row.get("m_BundleSize") == source_size
+                    and any(isinstance(reference_row.get(field), str)
+                        and Path(reference_row[field].replace("\\", "/")).name.lower() == matched_path.name.lower()
+                        for field in ("InternalId", "PrimaryKey"))]
             if len(candidates) != 1:
                 if candidates:
                     name_ambiguous += 1

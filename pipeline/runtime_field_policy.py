@@ -170,6 +170,32 @@ def _is_prefab_lookup_identifier(data: Any, field_path: str) -> bool:
     )
 
 
+def _is_character_customization_identifier(data: Any, field_path: str) -> bool:
+    """Recognize the verified CustomControl lookup schema, not arbitrary names.
+
+    CharacterCustomization compares Customs[].name to a runtime character key
+    and enables/disables customSets.gameObject. A display card with a name and
+    a prefab/icon reference alone is NOT sufficient evidence for this rule.
+    Match the schema rather than game name, PathID, or character vocabulary.
+    """
+    if not isinstance(data, dict) or not _is_unity_object_reference(data.get("m_Script")):
+        return False
+    match = re.fullmatch(r"Customs\.Array\[(\d+)\]\.name", field_path)
+    if match is None:
+        return False
+    container = data.get("Customs")
+    entries = container.get("Array") if isinstance(container, dict) else None
+    if not isinstance(entries, list) or not entries or int(match[1]) >= len(entries):
+        return False
+    return all(
+        isinstance(entry, dict)
+        and set(entry) == {"name", "customSets"}
+        and isinstance(entry["name"], str)
+        and _is_unity_object_reference(entry["customSets"])
+        for entry in entries
+    )
+
+
 def _is_menu_runtime_parameter(data: Any, field_path: str) -> bool:
     if not fnmatchcase(field_path, "Params.Array*") or not isinstance(data, dict):
         return False
@@ -247,6 +273,9 @@ def runtime_field_exclusion_reason(
 
     if _is_prefab_lookup_identifier(data, field_path):
         return "Prefab 查找表运行时标识"
+
+    if _is_character_customization_identifier(data, field_path):
+        return "角色模型定制查找表运行时标识"
 
     if leaf == "m_ActionId" and (_UUID_RE.fullmatch(stripped) or _HEX_GUID_RE.fullmatch(stripped)):
         return "Unity Input System 动作 GUID"

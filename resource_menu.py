@@ -34,6 +34,7 @@ from pipeline.resource_staging import (
     prepare_split_sync_outputs,
     prepare_unified_resource_source,
     restore_imported_resource_paths,
+    encrypt_imported_resource_paths,
 )
 from support.menu_selection import parse_number_ranges
 
@@ -923,12 +924,12 @@ def print_menu() -> None:
     print("q. 退出")
     print()
     print("说明:")
-    print("  导出: 自动解析 catalog.json/catalog.bin，并扫描外层 aa、bin/Data 与 assets/obb 内资源")
+    print("  导出: 自动解析 catalog.json/catalog.bin，并扫描外层 aa、bin/Data、assets/assetpack 与 assets/obb 内资源")
     print("        源资源未变化时复用 workspace/input_sources；split 只在暂存区自动合并，不修改原游戏目录")
     print("        支持保留 workspace 后按 1 -> 2 -> 3 分阶段增量导出，manifest 会自动合并")
     print("        导出成功后会在 workspace\\records\\file_id_map.json 记录各资源文件的 FileID 外部依赖映射")
     print("  导入: 按来源恢复外层 aa、bin/Data，并将 OBB 内修改重新打回完整 OBB")
-    print("        外层 Addressables 输出到 FinalResult/aa，内嵌 OBB 输出到 FinalResult/obb")
+    print("        外层 Addressables 输出到 FinalResult/aa，PAD 输出到 FinalResult/assetpack，内嵌 OBB 输出到 FinalResult/obb")
     print("        远程路径改为本地路径时同步覆盖源 catalog/hash")
     print("        修改过的 split 会在 FinalResult 原目录中恢复为 .splitN，并删除仅供处理的合并版")
     print()
@@ -1079,7 +1080,7 @@ def main() -> int:
                     raw_import_result_root,
                 )
                 catalog_logs = sorted(log_dir.glob("*.log")) + sorted(log_dir.glob("*.txt"))
-                auto_patch_and_repack_catalog_after_import(
+                catalog_result = auto_patch_and_repack_catalog_after_import(
                     cfg,
                     import_result_root,
                     catalog_logs,
@@ -1090,6 +1091,9 @@ def main() -> int:
                     raw_import_result_root,
                     catalog_logs,
                 )
+                # Catalog CRCs are calculated from plaintext UnityFS. Encrypt only
+                # afterwards, before splitting, OBB repacking or channel sync.
+                encrypt_imported_resource_paths(cfg, restored_paths, catalog_ready=catalog_result is not None)
                 prepare_split_sync_outputs(cfg, import_result_root, restored_paths)
                 finalize_obb_outputs(
                     cfg,

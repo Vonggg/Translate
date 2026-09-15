@@ -31,7 +31,7 @@ from .dynamic_translation_dictionary import (
 )
 from .runtime_field_policy import runtime_field_exclusion_reason
 from .local_field_policy import classify_local_string_field
-from .ai_translation_strategy import get_strategy
+from .ai_translation_strategy import PERSON_NAME_TRANSLATION_RULE, get_strategy
 from .codex_cli_provider import (
     codex_display_name,
     codex_cli_available,
@@ -2227,6 +2227,7 @@ def _translate_ai_once(text: str, cfg: PipelineConfig, transport: str) -> str:
         "语言名称也要汉化，例如 Español 译为西班牙语、Français 译为法语、日本語译为日语、한국어译为韩语。"
         "如果不同语言文本表达的是同一句话或同一个 UI 含义，要翻译成一致的简体中文说法。"
         "保持游戏 UI 文本自然简洁。"
+        f"{PERSON_NAME_TRANSLATION_RULE}"
         "保留换行、占位符、数字、货币符号、格式控制符和富文本标签。"
         "只输出译文，不要解释。"
     )

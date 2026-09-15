@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .ai_translation_strategy import DefaultAITranslationStrategy
+from .ai_translation_strategy import DefaultAITranslationStrategy, PERSON_NAME_TRANSLATION_RULE
 
 
 class DeepSeekTranslationStrategy(DefaultAITranslationStrategy):
@@ -23,6 +23,7 @@ class DeepSeekTranslationStrategy(DefaultAITranslationStrategy):
             "如果 items[].text（原始键）本身含有中文，translation 中的所有中文字符也必须是简体中文，不得夹杂繁体字。"
             "语言名称也要汉化，例如 Español 译为西班牙语、Français 译为法语、日本語译为日语、한국어译为韩语。"
             "如果不同语言文本表达的是同一句话或同一个 UI 含义，要翻译成一致的简体中文说法。"
+            f"{PERSON_NAME_TRANSLATION_RULE}"
             "保留 id，不要新增、删除、合并、重排项目。"
             "保留换行、占位符、数字、货币符号、格式控制符和富文本标签。"
             "短 UI 文本要自然、紧凑，适合按钮、菜单和弹窗。"

@@ -498,7 +498,7 @@ class DynamicTranslationDictionaryTests(unittest.TestCase):
 
             self.assertIn("退出", output_path.read_text(encoding="utf-8"))
 
-    def test_builtin_analysis_always_deletes_and_ignores_cache(self) -> None:
+    def test_builtin_analysis_delegates_cache_validation_to_analyzer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             records = root / "records"
@@ -532,9 +532,9 @@ class DynamicTranslationDictionaryTests(unittest.TestCase):
             ) as analyzer:
                 generate_dynamic_translation_dictionary(cfg)
 
-            self.assertFalse(analysis_cache.exists())
+            self.assertEqual(analysis_cache.read_text(encoding="utf-8"), '{"stale":true}')
             self.assertEqual(analysis_cache, analyzer.call_args.kwargs["cache_path"])
-            self.assertIs(analyzer.call_args.kwargs["use_cache"], False)
+            self.assertIs(analyzer.call_args.kwargs["use_cache"], True)
 
     def test_generator_skips_static_heuristic_when_records_are_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -811,8 +811,16 @@ class DynamicTranslationDictionaryTests(unittest.TestCase):
                 stage_dir=root / "output",
             )
 
+            (records / RUNTIME_ENUM_TRANSLATIONS_FILENAME).write_text(
+                json.dumps({"cal12": "12号口径"}, ensure_ascii=False), encoding="utf-8"
+            )
+
             def builder(candidates, *_args, **_kwargs):
                 self.assertEqual(["Quit", "cal12", "Rocket"], list(candidates))
+                resume = json.loads(Path(_kwargs["cache_path"]).read_text(encoding="utf-8"))
+                self.assertEqual(resume["cal12"], "12号口径")
+                self.assertEqual(resume["Quit"], "退出")
+                self.assertEqual(resume["Rocket"], "")
                 return {"Quit": "退出", "cal12": "12号口径", "Rocket": "火箭弹"}
 
             generated = generate_dynamic_translation_dictionary(

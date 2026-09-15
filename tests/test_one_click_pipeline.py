@@ -11,6 +11,13 @@ import one_click_pipeline as one_click
 
 
 class OneClickPipelineTests(unittest.TestCase):
+    def test_stage_reports_monotonic_subprocess_wall_time(self):
+        with patch.object(one_click.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                patch.object(one_click.time, "perf_counter", side_effect=[10.0, 12.5]), \
+                patch.object(one_click, "emit_workbench_event") as emit:
+            self.assertEqual(one_click.run_python_script(Path("main.py"), [], "test"), 0)
+        self.assertEqual(emit.call_args.kwargs["elapsed_seconds"], 2.5)
+
     def _cfg(self, record_dir: Path, *, ai_field_review: bool = False):
         return SimpleNamespace(
             stage_record_dir=record_dir,

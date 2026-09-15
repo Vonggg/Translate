@@ -2698,6 +2698,58 @@ def _preview_layout_element_data(scope: dict, game_object_data: dict) -> dict | 
     return None
 
 
+_PREVIEW_SCRIPT_METADATA_CACHE: dict = {}
+
+
+def _preview_script_class(scope: dict, data: dict) -> str | None:
+    """Resolve scoped MonoScript identity, never treating a PathID as a type ID."""
+    file_id, path_id = _pptr(data.get("m_Script"))
+    target = _resolve_pointer_scope(scope, file_id)
+    entry = _scope_entry(target, ("MonoScript",), path_id) if target else None
+    if entry:
+        script = _entry_data(entry) or {}
+        return str(script.get("m_ClassName", ""))
+    source = scope.get("source")
+    if not source:
+        return None
+    candidates = [DEFAULT_WORKSPACE_ROOT / "input_sources" / source]
+    if _DEFAULT_CONFIG is not None:
+        candidates.append(_DEFAULT_CONFIG.resource_source_root / source)
+    source_path = next((p for p in candidates if p.is_file()), None)
+    if source_path is None:
+        return None
+    stat = source_path.stat()
+    key = (str(source_path), stat.st_size, stat.st_mtime_ns)
+    if key not in _PREVIEW_SCRIPT_METADATA_CACHE:
+        import UnityPy
+
+        scripts, externals = {}, {}
+        try:
+            env = UnityPy.load(str(source_path))
+            for obj in env.objects:
+                owner = obj.assets_file
+                name = str(owner.name).replace("\\", "/").split("/")[-1]
+                if name not in externals:
+                    externals[name] = [
+                        str(e.path).replace("\\", "/").split("/")[-1]
+                        for e in owner.externals
+                    ]
+                if obj.type.name == "MonoScript":
+                    script = obj.read_typetree()
+                    scripts[(name, obj.path_id)] = str(script.get("m_ClassName", ""))
+        except Exception as exc:
+            print(f"[层级预览] 无法读取布局脚本类型: {source_path}: {exc}")
+        _PREVIEW_SCRIPT_METADATA_CACHE[key] = scripts, externals
+    scripts, externals = _PREVIEW_SCRIPT_METADATA_CACHE[key]
+    owner_name = str(scope.get("bundle_entry") or source_path.name)
+    if file_id:
+        refs = externals.get(owner_name, [])
+        if file_id < 1 or file_id > len(refs):
+            return ""
+        owner_name = refs[file_id - 1]
+    return scripts.get((owner_name, path_id), "")
+
+
 def _preview_horizontal_layout_data(
     scope: dict,
     game_object_data: dict,
@@ -2713,7 +2765,10 @@ def _preview_horizontal_layout_data(
         }.issubset(data):
             continue
         _file_id, script_path_id = _pptr(data.get("m_Script"))
-        if script_path_id in _UNITY_HORIZONTAL_LAYOUT_SCRIPT_PATH_IDS:
+        class_name = _preview_script_class(scope, data)
+        if class_name == "HorizontalLayoutGroup" or (
+            class_name is None and script_path_id in _UNITY_HORIZONTAL_LAYOUT_SCRIPT_PATH_IDS
+        ):
             return data
     return None
 
@@ -2733,9 +2788,83 @@ def _preview_vertical_layout_data(
         }.issubset(data):
             continue
         _file_id, script_path_id = _pptr(data.get("m_Script"))
-        if script_path_id in _UNITY_VERTICAL_LAYOUT_SCRIPT_PATH_IDS:
+        class_name = _preview_script_class(scope, data)
+        if class_name == "VerticalLayoutGroup" or (
+            class_name is None and script_path_id in _UNITY_VERTICAL_LAYOUT_SCRIPT_PATH_IDS
+        ):
             return data
     return None
+
+
+def _preview_content_fitted_rect(scope, object_data, transform, rect, scale, depth=0):
+    """Calculate layout-driven min/preferred sizes bottom-up before positioning."""
+    if depth >= 16:
+        return rect
+    fitter = None
+    for pid in _game_object_component_path_ids(object_data):
+        entry = _scope_entry(scope, ("MonoBehaviour",), pid)
+        data = _entry_data(entry) if entry else None
+        if (isinstance(data, dict) and data.get("m_Enabled", 1)
+                and "m_HorizontalFit" in data and "m_VerticalFit" in data):
+            fitter = data
+            break
+    if fitter is None:
+        return rect
+    layout = _preview_horizontal_layout_data(scope, object_data)
+    main_axis = 0
+    if layout is None:
+        layout = _preview_vertical_layout_data(scope, object_data)
+        main_axis = 1
+    if layout is None:
+        return rect
+    sizes = []
+    for pointer in _array_value(transform.get("m_Children")):
+        file_id, pid = _pptr(pointer)
+        entry = _scope_entry(scope, ("RectTransform",), pid) if file_id == 0 else None
+        child_transform = _entry_data(entry) if entry else None
+        if not child_transform:
+            continue
+        _, child_id = _pptr(child_transform.get("m_GameObject"))
+        child_entry = _scope_entry(scope, ("GameObject",), child_id)
+        child = _entry_data(child_entry) if child_entry else None
+        if not child or not child.get("m_IsActive", True):
+            continue
+        element = _preview_layout_element_data(scope, child) or {}
+        if element.get("m_IgnoreLayout", False):
+            continue
+        child_rect = _rect_transform_child_rect(child_transform, rect, scale)
+        child_rect = _preview_content_fitted_rect(
+            scope, child, child_transform, child_rect, scale, depth + 1
+        )
+        dimensions = list(child_rect[2:])
+        for axis, suffix in enumerate(("Width", "Height")):
+            if layout.get("m_ChildControl" + suffix, False):
+                minimum = _number(element.get("m_Min" + suffix), -1)
+                preferred = _number(element.get("m_Preferred" + suffix), -1)
+                mode = int(fitter.get(("m_HorizontalFit", "m_VerticalFit")[axis], 0))
+                chosen = minimum if mode == 1 else max(minimum, preferred)
+                if chosen >= 0:
+                    dimensions[axis] = chosen * abs(scale[axis])
+        sizes.append(dimensions)
+    dimensions = list(rect[2:])
+    padding = layout.get("m_Padding") or {}
+    for axis, (fit_key, edges) in enumerate((
+        ("m_HorizontalFit", ("m_Left", "m_Right")),
+        ("m_VerticalFit", ("m_Top", "m_Bottom")),
+    )):
+        if int(fitter.get(fit_key, 0)) not in (1, 2):
+            continue
+        values = [size[axis] for size in sizes]
+        content = sum(values) if axis == main_axis else max(values, default=0)
+        if axis == main_axis:
+            content += _number(layout.get("m_Spacing")) * abs(scale[axis]) * max(0, len(values) - 1)
+        dimensions[axis] = max(0, content + sum(_number(padding.get(e)) for e in edges) * abs(scale[axis]))
+    pivot = _vec2(transform.get("m_Pivot"), (0.5, 0.5))
+    return (
+        rect[0] + (rect[2] - dimensions[0]) * pivot[0],
+        rect[1] + (rect[3] - dimensions[1]) * pivot[1],
+        *dimensions,
+    )
 
 
 def _preview_horizontal_layout_child_rects(
@@ -3803,6 +3932,9 @@ def _create_object_hierarchy_preview(match: dict, root_level: int, scopes: dict)
         )
         name = str(object_data.get("m_Name") or object_id)
         hierarchy_chain = [*parent_chain, {"name": name, "path_id": object_id}]
+        rect = _preview_content_fitted_rect(
+            scope, object_data, transform_data, rect, world_scale
+        )
         rect, used_aspect_fitter = _preview_aspect_fitted_rect(
             scope, object_data, transform_data, rect
         )

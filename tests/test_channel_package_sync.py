@@ -14,10 +14,41 @@ from support.channel_package_sync import (
     explicit_channel_sync_request,
     resolve_channel_package_target,
     sync_import_result_to_channel_package,
+    sync_generated_dictionary,
 )
 
 
 class ChannelPackageSyncTests(unittest.TestCase):
+    def test_dictionary_merge_preserves_engine_manual_entries_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cfg, _, channel, _ = self._fixture(Path(temporary))
+            target = resolve_channel_package_target(cfg, channel.name)
+            source = cfg.workspace_root / "output/Hook_Translate/native_unity_translation_dictionary.generated.cpp"
+            source.parent.mkdir(parents=True)
+            destination = channel.parent / "cpp/native_unity_translation_dictionary.cpp"
+            destination.parent.mkdir()
+            def arrays(whole):
+                return ('const NativeUnityTranslationEntry kWholeTextDictionary[] = {\n'
+                        + whole + '\n    {nullptr, nullptr},\n};\n'
+                        'const NativeUnityTranslationEntry kSubstringDictionary[] = {\n'
+                        '    {nullptr, nullptr},\n};\n')
+            original = arrays('    {u"old", u"manual"},\n    {u"keep", u"keep-value"},') + "// engine preserved\n"
+            destination.write_text(original, encoding="utf-8")
+            source.write_text(arrays('    {u"old", u"new"},\n    {u"added", u"value"},'), encoding="utf-8")
+            self.assertEqual(sync_generated_dictionary(cfg, target), 2)
+            merged = destination.read_text(encoding="utf-8")
+            self.assertIn('{u"old", u"new"}', merged)
+            self.assertIn('{u"keep", u"keep-value"}', merged)
+            self.assertIn("// engine preserved", merged)
+            self.assertEqual(merged.count('{u"added", u"value"}'), 1)
+            sync_generated_dictionary(cfg, target)
+            self.assertEqual(destination.read_text(encoding="utf-8"), merged)
+            self.assertEqual(destination.with_suffix(".cpp.before-translate-sync.bak").read_text(encoding="utf-8"), original)
+            source.write_text("invalid generated content", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                sync_generated_dictionary(cfg, target)
+            self.assertEqual(destination.read_text(encoding="utf-8"), merged)
+
     def _fixture(self, root: Path) -> tuple[SimpleNamespace, Path, Path, Path]:
         project_dir = root / "projects" / "Game A"
         source_aa = project_dir / "game-name" / "game" / "assets" / "aa"
@@ -69,6 +100,15 @@ class ChannelPackageSyncTests(unittest.TestCase):
             self.assertEqual(summary.final_result_files, 3)
 
     def test_without_remote_resources_only_final_result_is_copied(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cfg, _, channel, final_root = self._fixture(Path(temporary))
+            (final_root / "assetpack/nested").mkdir(parents=True)
+            (final_root / "assetpack/nested/clothes").write_bytes(b"PAD replacement")
+            summary = sync_import_result_to_channel_package(cfg, final_root, "GAME_hongtu_L")
+            self.assertEqual((channel / "assets/assetpack/nested/clothes").read_bytes(), b"PAD replacement")
+            self.assertEqual(summary.final_result_files, 1)
+
+    def test_without_remote_resources_only_aa_final_result_is_copied(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             cfg, source_aa, channel, final_root = self._fixture(Path(temporary))
             (source_aa / "settings.json").write_text("source settings", encoding="utf-8")

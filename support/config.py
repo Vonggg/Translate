@@ -381,6 +381,7 @@ class PipelineConfig:
     ngui_max_atlas_size: int = 4096
     ngui_glyph_padding: int = 2
     include_old_sdf_template_chars: bool = False
+    tmp_extra_chars: str = ""
     protect_i2_tmp_fonts_from_replacement: bool = True
     enable_text_effect_material_cleanup: bool = True
     unity_exe: Path = Path(r"D:\user\von\Program\Develop\Unity\Editor\6000.5.1f1\Editor\Unity.exe")
@@ -712,6 +713,7 @@ def load_config(config_path: str | Path | None = None, quiet: bool = False) -> P
         ngui_max_atlas_size=max(1, int(get_value("ngui_max_atlas_size", 4096) or 4096)),
         ngui_glyph_padding=max(0, int(get_value("ngui_glyph_padding", 2) or 0)),
         include_old_sdf_template_chars=bool(get_value("include_old_sdf_template_chars", False)),
+        tmp_extra_chars=str(get_value("tmp_extra_chars", "") or ""),
         protect_i2_tmp_fonts_from_replacement=bool(get_value("protect_i2_tmp_fonts_from_replacement", True)),
         enable_text_effect_material_cleanup=bool(get_value("enable_text_effect_material_cleanup", True)),
         unity_exe=unity_exe,

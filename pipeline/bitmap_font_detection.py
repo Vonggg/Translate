@@ -10,7 +10,7 @@ from support.config import PipelineConfig
 
 
 REPORT_FILENAME = "bitmap_font_detection.json"
-REPORT_SCHEMA_VERSION = 5
+REPORT_SCHEMA_VERSION = 6
 BITMAP_FONT_JSON_TYPES = {"monobehaviour", "textasset", "font"}
 NGUI_BITMAP_FONT_TYPE = "ngui_bitmap_font"
 
@@ -176,7 +176,11 @@ def _detect_json_data(data: Any, path: Path, root: Path) -> list[dict[str, Any]]
                             "evidence": [descriptor_kind, "包含字符 ID、图集矩形和字形尺寸"],
                         }
                     )
-        detected = _detect_ngui_node(value)
+        # UIFont can retain an old BMFont table while rendering a dynamic Font
+        # or delegating to another UIFont. Those tables are not active bitmaps.
+        inactive_font = (field_path == "mFont" and isinstance(data, dict) and any(
+            _pointer_ids(data.get(name))[1] for name in ("mDynamicFont", "mReplacement")))
+        detected = None if inactive_font else _detect_ngui_node(value)
         if detected is not None:
             confidence, evidence = detected
             key = ("ngui_bitmap_font", field_path)

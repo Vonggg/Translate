@@ -17,6 +17,10 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 import hashlib
 import json
+import os
+import tempfile
+import time
+from importlib.metadata import version as package_version
 from pathlib import Path
 import re
 import struct
@@ -24,7 +28,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 AARCH64_RELATIVE_RELOCATION = 1027
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 # Large UI refresh methods frequently merge dozens of independent labels before
 # reaching a shared setter.  A budget of 32 dropped most of those values at CFG
 # joins (and made the later sink list look much smaller than the real UI).  Keep
@@ -239,7 +243,9 @@ def _is_erased_get_component_factory(method: MethodRecord | None) -> bool:
     owner, separator, member = method.name.partition("$$")
     if not separator or owner not in {"UnityEngine.GameObject", "UnityEngine.Component"}:
         return False
-    return member.startswith("GetComponent<") and (
+    return member.startswith((
+        "GetComponent<", "GetComponentInChildren<", "GetComponentInParent<"
+    )) and (
         "object" in member.casefold()
         or _normalise_signature(method.signature).replace(" ", "").startswith(
             "Il2CppObject*"
@@ -769,11 +775,16 @@ def _load_literal_file(path: Path) -> dict[int, str]:
     return result
 
 
-def _load_script(path: Path) -> tuple[list[dict[str, Any]], list[int], dict[int, str]]:
+def _read_script_payload(path: Path) -> Any:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise Il2CppDisplayAnalysisError(f"Unable to read script JSON {path}: {exc}") from exc
+
+
+def _load_script(path: Path, *, payload=None) -> tuple[list[dict[str, Any]], list[int], dict[int, str]]:
+    if payload is None:
+        payload = _read_script_payload(path)
     if not isinstance(payload, Mapping):
         raise Il2CppDisplayAnalysisError(f"script.json must contain an object: {path}")
     methods = [dict(item) for item in payload.get("ScriptMethod", []) if isinstance(item, Mapping)]
@@ -785,13 +796,11 @@ def _load_script(path: Path) -> tuple[list[dict[str, Any]], list[int], dict[int,
     return methods, addresses, literals
 
 
-def _load_script_metadata_type_names(path: Path) -> dict[int, str]:
+def _load_script_metadata_type_names(path: Path, *, payload=None) -> dict[int, str]:
     """Return ScriptMetadata TypeInfo cell -> managed type name."""
 
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise Il2CppDisplayAnalysisError(f"Unable to read script JSON {path}: {exc}") from exc
+    if payload is None:
+        payload = _read_script_payload(path)
     if not isinstance(payload, Mapping):
         return {}
     result: dict[int, str] = {}
@@ -871,11 +880,11 @@ def _parse_dump_display_fields(path: Path) -> dict[int, dict[int, str]]:
 
     field_pattern = re.compile(
         r"^\s*(?:public|private|protected|internal)\s+(?:static\s+)?"
-        r"(?P<type>[\w.]+)\s+\w+\s*;\s*//\s*0x(?P<offset>[0-9A-Fa-f]+)"
+        r"(?P<type>[\w.]+)\s+[\w<>]+\s*;\s*//\s*0x(?P<offset>[0-9A-Fa-f]+)"
     )
     rva_pattern = re.compile(r"^\s*//\s*RVA:\s*0x(?P<rva>[0-9A-Fa-f]+)")
-    class_pattern = re.compile(r"^\s*(?:public|private|protected|internal)?\s*(?:abstract\s+|sealed\s+)?class\s+\w+")
-    method_pattern = re.compile(r"^\s*(?:public|private|protected|internal)\s+(?:static\s+)?[\w.<>\[\], *&]+\s+\w+(?:<[^>]+>)?\s*\(")
+    class_pattern = re.compile(r"^\s*(?:public|private|protected|internal)?\s*(?:abstract\s+|sealed\s+|static\s+)*class\s+[\w`.<>]+")
+    method_pattern = re.compile(r"^\s*(?:public|private|protected|internal)\s+(?:static\s+)?[\w.<>\[\], *&]+\s+[\w<>]+(?:<[^>]+>)?\s*\(")
 
     result: dict[int, dict[int, str]] = {}
     fields: dict[int, str] = {}
@@ -895,7 +904,7 @@ def _parse_dump_display_fields(path: Path) -> dict[int, dict[int, str]]:
             continue
         if not in_methods:
             field_match = field_pattern.match(line)
-            if field_match:
+            if field_match and not re.search(r"\bstatic\b", line):
                 component_type = _normalise_display_field_type(field_match.group("type"))
                 if component_type:
                     fields[int(field_match.group("offset"), 16)] = component_type
@@ -923,7 +932,7 @@ def _parse_dump_virtual_text_slots(path: Path) -> dict[str, frozenset[int]]:
     class_pattern = re.compile(
         r"^\s*(?:public|private|protected|internal)?\s*"
         r"(?:abstract\s+|sealed\s+|static\s+|partial\s+)*class\s+"
-        r"(?P<name>[\w`]+)"
+        r"(?P<name>[\w`.<>]+)"
     )
     slot_pattern = re.compile(r"\bSlot:\s*(?P<slot>\d+)\b")
     setter_pattern = re.compile(
@@ -976,11 +985,11 @@ def _parse_dump_class_display_fields(path: Path) -> dict[str, dict[int, str]]:
     class_pattern = re.compile(
         r"^\s*(?:public|private|protected|internal)?\s*"
         r"(?:abstract\s+|sealed\s+|static\s+|partial\s+)*class\s+"
-        r"(?P<name>[\w`]+)"
+        r"(?P<name>[\w`.<>]+)"
     )
     field_pattern = re.compile(
         r"^\s*(?:public|private|protected|internal)\s+"
-        r"(?P<static>static\s+)?(?P<type>[\w.`<>\[\],]+)\s+\w+\s*;"
+        r"(?P<static>static\s+)?(?P<type>[\w.`<>\[\],]+)\s+[\w<>]+\s*;"
         r"\s*//\s*0x(?P<offset>[0-9A-Fa-f]+)"
     )
     namespace = ""
@@ -1037,11 +1046,11 @@ def _parse_dump_return_object_display_fields(
     class_pattern = re.compile(
         r"^\s*(?:public|private|protected|internal)?\s*"
         r"(?:abstract\s+|sealed\s+|static\s+|partial\s+)*class\s+"
-        r"(?P<name>[\w`]+)"
+        r"(?P<name>[\w`.<>]+)"
     )
     field_pattern = re.compile(
         r"^\s*(?:public|private|protected|internal)\s+"
-        r"(?P<static>static\s+)?(?P<type>[\w.`<>\[\],]+)\s+\w+\s*;"
+        r"(?P<static>static\s+)?(?P<type>[\w.`<>\[\],]+)\s+[\w<>]+\s*;"
         r"\s*//\s*0x(?P<offset>[0-9A-Fa-f]+)"
     )
     rva_pattern = re.compile(r"^\s*//\s*RVA:\s*0x(?P<rva>[0-9A-Fa-f]+)")
@@ -1125,11 +1134,11 @@ def _parse_dump_nested_display_fields(
     class_pattern = re.compile(
         r"^\s*(?:public|private|protected|internal)?\s*"
         r"(?:abstract\s+|sealed\s+|static\s+|partial\s+)*class\s+"
-        r"(?P<name>[\w`]+)"
+        r"(?P<name>[\w`.<>]+)"
     )
     field_pattern = re.compile(
         r"^\s*(?:public|private|protected|internal)\s+"
-        r"(?P<static>static\s+)?(?P<type>[\w.`<>\[\],]+)\s+\w+\s*;"
+        r"(?P<static>static\s+)?(?P<type>[\w.`<>\[\],]+)\s+[\w<>]+\s*;"
         r"\s*//\s*0x(?P<offset>[0-9A-Fa-f]+)"
     )
     rva_pattern = re.compile(r"^\s*//\s*RVA:\s*0x(?P<rva>[0-9A-Fa-f]+)")
@@ -1254,13 +1263,11 @@ def _collect_relative_slots(elf: Any) -> dict[int, int]:
     return result
 
 
-def _load_script_metadata_method_targets(path: Path) -> dict[int, int]:
+def _load_script_metadata_method_targets(path: Path, *, payload=None) -> dict[int, int]:
     """Map Il2CppDumper ``ScriptMetadataMethod`` cells to native method RVAs."""
 
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise Il2CppDisplayAnalysisError(f"Unable to read script JSON {path}: {exc}") from exc
+    if payload is None:
+        payload = _read_script_payload(path)
     if not isinstance(payload, Mapping):
         return {}
     result: dict[int, int] = {}
@@ -1277,7 +1284,7 @@ def _load_script_metadata_method_targets(path: Path) -> dict[int, int]:
     return result
 
 
-def _load_script_metadata_component_factory_types(path: Path) -> dict[int, str]:
+def _load_script_metadata_component_factory_types(path: Path, *, payload=None) -> dict[int, str]:
     """Map generic GetComponent MethodInfo cells to their concrete result type.
 
     Generic sharing makes the native method appear as ``GetComponent<object>``.
@@ -1286,10 +1293,8 @@ def _load_script_metadata_component_factory_types(path: Path) -> dict[int, str]:
     returned by that otherwise erased factory.
     """
 
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise Il2CppDisplayAnalysisError(f"Unable to read script JSON {path}: {exc}") from exc
+    if payload is None:
+        payload = _read_script_payload(path)
     if not isinstance(payload, Mapping):
         return {}
     pattern = re.compile(
@@ -1450,7 +1455,7 @@ def _methods_with_indirect_calls(
     addresses: Sequence[int],
     methods: Mapping[int, MethodRecord],
 ) -> set[int]:
-    """Return methods containing an ARM64 ``blr`` instruction.
+    """Return methods containing an ARM64 indirect call or tail branch.
 
     This is intentionally only a cheap candidate filter.  A method becomes a
     delegate-display hit later only after both the delegate object layout and
@@ -1463,7 +1468,7 @@ def _methods_with_indirect_calls(
         limit = len(data) - (len(data) % 4)
         for index, (word,) in enumerate(struct.iter_unpack("<I", memoryview(data)[:limit])):
             # BLR Xn: 1101011000111111000000 nnnnn 00000
-            if word & 0xFFFFFC1F != 0xD63F0000:
+            if word & 0xFFFFFC1F not in {0xD63F0000, 0xD61F0000}:
                 continue
             owner = _method_for_pc(addresses, base + index * 4)
             if owner in known_methods:
@@ -1500,7 +1505,7 @@ def _scan_code_indexes(
                     caller = methods[owner]
                     if kind != "b" or not caller.address <= target < caller.end:
                         call_index[target].add(owner)
-            if word & 0xFFFFFC1F == 0xD63F0000:
+            if word & 0xFFFFFC1F in {0xD63F0000, 0xD61F0000}:
                 indirect_methods.add(owner)
 
             # LDR literal: target is PC + sign_extend(imm19 << 2).
@@ -2686,7 +2691,12 @@ def _analyse_method(
                 apply_memory_writeback(state, base_register, writeback_displacement)
             if mnemonic == "ldp":
                 handled_register_writes = True
-        elif mnemonic in {"bl", "blr"}:
+        elif mnemonic in {"bl", "blr"} or (
+            mnemonic == "br" and not computed_branch_targets(instruction)
+        ):
+            # IL2CPP tail-dispatches virtual setters with BR after restoring
+            # the stack. Apply the same receiver/vtable checks as BLR. Local
+            # computed branches (e.g. switch tables) must remain CFG edges.
             target = (
                 int(operands[0].imm)
                 if mnemonic == "bl" and operands and operands[0].type == ARM64_OP_IMM
@@ -4684,6 +4694,62 @@ def analyze_arm64_display_usage(
     }
 
 
+def _content_fingerprint(paths: Sequence[Path], options: Mapping[str, Any]) -> str:
+    """Hash bytes, not mtimes: same-size replacements must invalidate analysis."""
+    digest = hashlib.sha256(json.dumps(options, sort_keys=True).encode("utf-8"))
+    for path in paths:
+        digest.update(str(path.resolve()).encode("utf-8"))
+        digest.update(b"\0")
+        content = hashlib.sha256()
+        try:
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    content.update(chunk)
+        except OSError as exc:
+            raise Il2CppDisplayAnalysisError(f"Unable to fingerprint {path}: {exc}") from exc
+        digest.update(content.digest())
+    return digest.hexdigest()
+
+
+def _result_digest(result: Mapping[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _read_analysis_cache(path: Path, fingerprint: str):
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(cached, dict) or cached.get("fingerprint") != fingerprint:
+            return None, "input_or_analyzer_changed"
+        result = cached.get("result")
+        if (not isinstance(result, dict)
+                or not isinstance(result.get("stats"), dict)
+                or any(not isinstance(result.get(k), list) for k in (
+                    "exact_literals", "derived_influence", "unresolved"
+                ))
+                or cached.get("result_sha256") != _result_digest(result)):
+            return None, "invalid_result"
+        return result, "content_verified"
+    except FileNotFoundError:
+        return None, "not_found"
+    except (OSError, ValueError):
+        return None, "unreadable_or_corrupt"
+
+
+def _write_analysis_cache(path: Path, fingerprint: str, result: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump({"fingerprint": fingerprint, "result_sha256": _result_digest(result),
+                       "result": result}, stream, ensure_ascii=False)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def analyze_il2cpp_display_usage(
     *,
     libil2cpp_path: str | Path,
@@ -4705,6 +4771,8 @@ def analyze_il2cpp_display_usage(
             "pyelftools is required for IL2CPP display analysis"
         ) from exc
 
+    started = time.perf_counter()
+    timings: dict[str, float] = {}
     so_path = Path(libil2cpp_path).resolve()
     script_path = Path(script_json_path).resolve()
     literal_path = Path(stringliteral_json_path).resolve() if stringliteral_json_path else None
@@ -4720,19 +4788,6 @@ def analyze_il2cpp_display_usage(
         input_paths.append(literal_path)
     if dump_path is not None:
         input_paths.append(dump_path)
-    fingerprint_rows: list[dict[str, Any]] = []
-    for input_path in input_paths:
-        try:
-            stat = input_path.stat()
-        except OSError:
-            stat = None
-        fingerprint_rows.append(
-            {
-                "path": str(input_path),
-                "size": stat.st_size if stat is not None else None,
-                "mtime_ns": stat.st_mtime_ns if stat is not None else None,
-            }
-        )
     excluded_addresses: set[int] = set()
     for raw_address in exclude_literal_addresses:
         try:
@@ -4746,41 +4801,37 @@ def analyze_il2cpp_display_usage(
                 f"Invalid excluded literal address: {raw_address!r}"
             )
         excluded_addresses.add(address)
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "max_wrapper_depth": max_wrapper_depth,
-                "exclude_literal_addresses": sorted(excluded_addresses),
-                "inputs": fingerprint_rows,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
-    if use_cache and cache_target.is_file():
-        try:
-            cached = json.loads(cache_target.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            cached = None
-        if (
-            isinstance(cached, Mapping)
-            and cached.get("fingerprint") == fingerprint
-            and isinstance(cached.get("result"), Mapping)
-        ):
-            result = dict(cached["result"])
-            stats = dict(result.get("stats", {}))
-            stats["cache_hit"] = True
-            result["stats"] = stats
+    fingerprint_options = {
+        "schema_version": SCHEMA_VERSION, "max_wrapper_depth": max_wrapper_depth,
+        "exclude_literal_addresses": sorted(excluded_addresses),
+        "capstone": package_version("capstone"), "pyelftools": package_version("pyelftools"),
+        "max_values": MAX_ABSTRACT_VALUES, "max_transforms": MAX_ABSTRACT_TRANSFORM_STEPS,
+    }
+    fingerprint_paths = [*input_paths, Path(__file__)]
+    fingerprint = _content_fingerprint(fingerprint_paths, fingerprint_options)
+    timings["fingerprint_seconds"] = time.perf_counter() - started
+    cache_reason = "disabled"
+    if use_cache:
+        result, cache_reason = _read_analysis_cache(cache_target, fingerprint)
+        if result is not None:
+            timings["total_seconds"] = time.perf_counter() - started
+            result["stats"].update(cache_hit=True, cache_reason=cache_reason, performance=timings)
+            if progress_callback:
+                progress_callback(f"内容校验通过，复用分析缓存；耗时={timings['total_seconds']:.3f}s")
             return result
     if progress_callback:
+        progress_callback(f"分析缓存未复用：{cache_reason}")
+    phase_started = time.perf_counter()
+    if progress_callback:
         progress_callback("正在读取 script.json 与方法元数据……")
-    methods, addresses, script_literals = _load_script(script_path)
-    metadata_method_targets = _load_script_metadata_method_targets(script_path)
-    metadata_type_names = _load_script_metadata_type_names(script_path)
+    script_payload = _read_script_payload(script_path)
+    methods, addresses, script_literals = _load_script(script_path, payload=script_payload)
+    metadata_method_targets = _load_script_metadata_method_targets(script_path, payload=script_payload)
+    metadata_type_names = _load_script_metadata_type_names(script_path, payload=script_payload)
     metadata_component_factory_types = _load_script_metadata_component_factory_types(
-        script_path
+        script_path, payload=script_payload
     )
+    del script_payload
     source_literals = _load_literal_file(literal_path) if literal_path else script_literals
     if not source_literals:
         raise Il2CppDisplayAnalysisError("No string literals were found in the supplied JSON")
@@ -4796,6 +4847,8 @@ def analyze_il2cpp_display_usage(
             "正在读取 ELF 与重定位表……"
         )
 
+    timings["metadata_seconds"] = time.perf_counter() - phase_started
+    phase_started = time.perf_counter()
     try:
         with so_path.open("rb") as stream:
             elf = ELFFile(stream)
@@ -4829,6 +4882,8 @@ def analyze_il2cpp_display_usage(
     if not code_sections:
         raise Il2CppDisplayAnalysisError(f"No executable ARM64 sections found in {so_path}")
 
+    timings["elf_seconds"] = time.perf_counter() - phase_started
+    phase_started = time.perf_counter()
     display_fields_by_method = _parse_dump_display_fields(dump_path) if dump_path else {}
     nested_display_fields_by_method = (
         _parse_dump_nested_display_fields(dump_path) if dump_path else {}
@@ -4873,6 +4928,8 @@ def analyze_il2cpp_display_usage(
     if progress_callback:
         progress_callback("ELF 与 dump.cs 索引完成，开始 ARM64 调用链分析。")
 
+    timings["dump_indexes_seconds"] = time.perf_counter() - phase_started
+    phase_started = time.perf_counter()
     result = analyze_arm64_display_usage(
         code_sections=code_sections,
         memory_sections=memory_sections,
@@ -4897,6 +4954,7 @@ def analyze_il2cpp_display_usage(
         enum_members_by_type=enum_members_by_type,
         progress_callback=progress_callback,
     )
+    timings["native_analysis_seconds"] = time.perf_counter() - phase_started
     result_stats = dict(result.get("stats", {}))
     result_stats["cache_hit"] = False
     result_stats["source_literal_count"] = len(source_literals)
@@ -4904,18 +4962,16 @@ def analyze_il2cpp_display_usage(
         len(source_literals) - len(literals)
     )
     result["stats"] = result_stats
+    timings["total_seconds"] = time.perf_counter() - started
+    result_stats.update(cache_reason=cache_reason, performance=timings)
     if use_cache:
-        cache_target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = cache_target.with_name(cache_target.name + ".tmp")
-        temporary.write_text(
-            json.dumps(
-                {"fingerprint": fingerprint, "result": result},
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        temporary.replace(cache_target)
+        if _content_fingerprint(fingerprint_paths, fingerprint_options) != fingerprint:
+            raise Il2CppDisplayAnalysisError("Analysis inputs changed while running; result was not cached")
+        try:
+            _write_analysis_cache(cache_target, fingerprint, result)
+        except OSError as exc:
+            if progress_callback:
+                progress_callback(f"分析已完成，但缓存写入失败：{exc}")
     return result
 
 

@@ -6,6 +6,14 @@ Translate 是一套 Unity 游戏资源汉化工具链。本文只说明本仓库
 
 ## 首次安装环境
 
+### PAD 资源目录
+
+一键导出会自动纳入游戏 `assets/assetpack` 目录及其子目录，不需要新增配置。
+无扩展名的 Unity AssetBundle 同样按文件内容识别。首次接入需重新执行导出和后续扫描；
+仅执行导入不会解析此前未导出的资源。修改结果保持相对目录，输出到
+`workspace<游戏名>/FinalResult/assetpack`，对应游戏的 `assets/assetpack`。
+显式启用渠道包同步时也会同步该目录。该支持针对已经落盘的资源，不负责从 Google Play 下载 PAD。
+
 本项目包含 Python 流程脚本、C# Unity 资源处理程序，以及用于 ETC2/ASTC 的原生纹理编码器。新电脑需要准备 Python、.NET SDK 和 Windows C++ 构建工具。
 
 ### 1. Python 3.9 或更高版本
@@ -181,7 +189,7 @@ project_root_dir/[project_name/]game-name/bak/64/DummyDll
   - NGUI 新字形之间的透明间距，默认 `2` 像素，用于避免双线性采样串色。
 - `include_old_sdf_template_chars`
   - 脚本 8 是否把 `templates/老工具的SDF模板.json` 里的常用汉字一并合入 `tmp_chars.txt`，默认 `false`。
-  - 关闭后仍会合并模板 TTF 全部字符、原游戏 TMP 字符和译文字符；仅不额外合并老工具 SDF 模板的字符。
+  - 关闭后只合并原游戏 TMP 字符和译文字符；模板 TTF 仅用于字符支持检查，不合并其全部字符。
 - `protect_i2_tmp_fonts_from_replacement`
   - 脚本 10 是否跳过 I2 运行时文本正在使用的 TMP FontAsset/Atlas，默认 `true`。
   - 用于排查或规避 I2 文本因字体替换引起的运行时刷新、卡顿或材质状态问题。
@@ -594,13 +602,14 @@ workspace/output/Font/TTF/ToImport
 
 ### 8. 合并 TMP 字符并提示新增字符
 
+可在当前使用的配置文件中设置 `"tmp_extra_chars": "霰"`，将指定字符额外加入步骤 8 的候选字符；多个字直接连续填写，例如 `"霰髅"`。默认空字符串，自动去重，不需要开启老工具 SDF 模板字符合并。额外字符仍须由模板 TTF 支持，不支持的字符会记录在缺字清单中并排除。修改后需重新执行步骤 8 及后续 SDF 字体生成、替换。
+
 读取：
 
 - 脚本 4 合并生成的 `game_chars.txt`
 - `trans.json` 与 `stringliteral_trans.json`（用于缺字来源明细）
 - 原游戏 SDF 字体字符
-- 模板 TTF 支持字符
-- 模板 TTF 全部字符
+- 模板 TTF 支持字符（仅用于缺字检查和过滤，不作为合并来源）
 - 可选的老工具 SDF 模板字符
 
 生成：
@@ -895,3 +904,27 @@ Unity Localization 里有两类资源最容易混：
   - 字体模板和 SDF 模板资源。
 - `workspace*/`
   - 不同配置会话相互隔离的工作区；空 `project_name` 使用 `workspace`，非空时使用 `workspace<project_name>`。
+
+## 可选资源解密／重新加密
+
+脚本 3 的动态字典生成分为两步：先输出 `native_unity_translation_dictionary.generated.cpp`（所有候选译文为空），同时保存 `.generated.untranslated.cpp` 副本；再询问是否汉化，按 Y 继续、N 跳过，30 秒无有效应答默认允许。继续后复用已有翻译缓存，仅补译缺项，再输出汉化 CPP。跳过不清空翻译缓存；空译文字典用于检查/编辑，不应当作已完成汉化的运行时字典使用。
+
+一键导出会在暂存副本上尝试已支持的资源加密方案，一键导入在 catalog 回写后、分卷及 OBB 打包前自动重新加密。正常 UnityFS 包不变，未知方案保留原文件并由资源扫描告警汇总提示。
+
+当前支持循环 XOR（`xor_repeat`），算法与密钥分离；自动密钥来源支持 Android 包名 MD5 的大写十六进制 ASCII 字节，已用战地闯关验证。不是任意加密算法或任意密钥都能自动识别。相同算法使用其他密钥只需配置，不需要改插件代码。
+
+配置可省略。需要关闭或指定其他密钥时，创建 `workspace<项目名>/resource_state/resource_crypto.json`：
+
+```json
+{
+  "enabled": true,
+  "auto_detect": true,
+  "profiles": [
+    {"algorithm": "xor_repeat", "key_hex": "0123456789abcdef"}
+  ]
+}
+```
+
+示例密钥需替换为实际**密钥字节的十六进制编码**；无需手动密钥时省略 `profiles`。`enabled: false` 关闭导出解密。密钥来源/配置改变后重新导出；导入始终使用导出时记录的参数，不临时猜测密钥。`resource_source_map.json` 含回导所需密钥参数，请与工作区一起保留，勿公开分享。
+
+升级前未解密导出的项目需要重新一键导出，再执行扫描、翻译、字体准备和导入。插件不会自动补译旧字典，也不会自行覆盖游戏。验证结果及限制见 [资源加密说明](docs/resource-crypto.md)。

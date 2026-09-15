@@ -34,7 +34,7 @@ class _FontJob:
     source_relative: Path
     source_data: dict[str, Any]
     font_node: dict[str, Any]
-    atlas_path: Path
+    atlas_path: Path | None
     atlas_data: dict[str, Any]
     texture_path: Path
     sprite_name: str
@@ -482,19 +482,25 @@ def _load_font_jobs(cfg: PipelineConfig, resolver: _ResourceResolver) -> list[_F
         if not isinstance(source_data, dict):
             raise ValueError(f"NGUI 字体 JSON 结构无效: {source_path}")
         font_node = _font_node(source_data, field_path)
+        if any(isinstance(source_data.get(name), dict) and source_data[name].get("m_PathID", 0)
+               for name in ("mDynamicFont", "mReplacement")):
+            print(f"[NGUI] 跳过动态/替代 UIFont 的遗留位图表: {source_path}")
+            continue
         sprite_name = str(font_node.get("mSpriteName", "") or "")
-        if not sprite_name:
+        has_atlas = bool((source_data.get("mAtlas") or {}).get("m_PathID", 0))
+        if not sprite_name and has_atlas:
             raise ValueError(f"NGUI 字体缺少 mSpriteName: {source_path}")
 
-        atlas_path = resolver.resolve(source_path, source_data.get("mAtlas"), "NGUI UIAtlas")
+        atlas_path = resolver.resolve(source_path, source_data.get("mAtlas"), "NGUI UIAtlas") if has_atlas else None
         atlas_data = atlas_cache.get(atlas_path)
-        if atlas_data is None:
+        if atlas_data is None and atlas_path is not None:
             loaded_atlas = read_json(atlas_path)
             if not isinstance(loaded_atlas, dict):
                 raise ValueError(f"NGUI UIAtlas JSON 结构无效: {atlas_path}")
             atlas_data = loaded_atlas
             atlas_cache[atlas_path] = atlas_data
-        sprite_data = _find_sprite(atlas_data, sprite_name)
+        atlas_data = atlas_data or {}
+        sprite_data = _find_sprite(atlas_data, sprite_name) if has_atlas else {}
         # AtlasMaker may trim transparent rows/columns from the source font
         # sprite and describe the removed area with padding*. That metadata is
         # only needed while the UIFont addresses the old, trimmed sprite. This
@@ -503,8 +509,8 @@ def _load_font_jobs(cfg: PipelineConfig, resolver: _ResourceResolver) -> list[_F
         # zeros the new sprite's padding. Therefore the source trimming does
         # not participate in any generated glyph coordinate calculation.
 
-        material_ref = atlas_data.get("material", atlas_data.get("mMaterial"))
-        material_path = resolver.resolve(atlas_path, material_ref, "NGUI Atlas Material")
+        material_ref = atlas_data.get("material", atlas_data.get("mMaterial")) if has_atlas else source_data.get("mMat")
+        material_path = resolver.resolve(atlas_path or source_path, material_ref, "NGUI Font Material")
         material_data = read_json(material_path)
         if not isinstance(material_data, dict):
             raise ValueError(f"NGUI Material JSON 结构无效: {material_path}")
@@ -651,7 +657,8 @@ def generate_ngui_fonts(cfg: PipelineConfig) -> dict[str, Any]:
         atlas_sources: dict[Path, dict[str, Any]] = {}
         pasted_glyphs: set[tuple[int, int]] = set()
         for job in group_jobs:
-            atlas_sources[job.atlas_path] = job.atlas_data
+            if job.atlas_path is not None:
+                atlas_sources[job.atlas_path] = job.atlas_data
             regenerated_glyphs: list[dict[str, Any]] = []
             for codepoint, glyph, image in job.generated_glyphs:
                 if image.width > 0 and image.height > 0:
@@ -668,9 +675,12 @@ def generate_ngui_fonts(cfg: PipelineConfig) -> dict[str, Any]:
 
             job.font_node["mWidth"] = final_size
             job.font_node["mHeight"] = final_size
-            job.font_node["mSpriteName"] = job.page_name
+            if job.atlas_path is not None:
+                job.font_node["mSpriteName"] = job.page_name
             job.source_data["mUVRect"] = {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}
 
+            if job.atlas_path is None:
+                continue  # Direct material font uses mUVRect, not a UIAtlas sprite.
             sprites = job.atlas_data.get("mSprites", {}).get("Array")
             if not isinstance(sprites, list):
                 raise ValueError(f"NGUI UIAtlas 缺少 mSprites.Array: {job.atlas_path}")

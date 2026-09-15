@@ -27,6 +27,38 @@ from support.config import load_config
 
 
 class ResourceStagingTests(unittest.TestCase):
+    def test_pad_only_staging_invalidation_and_original_path_restore(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            game = root / "projects" / "demo" / "game-name" / "game"
+            pad = game / "assets" / "assetpack"
+            (pad / "nested").mkdir(parents=True)
+            source = pad / "nested" / "clothes"
+            source.write_bytes(b"UnityFS-test")
+            cfg = replace(load_config(), root_dir=root / "tool",
+                project_root_dir=root / "projects", project_name="demo",
+                resource_source_subpath=Path("game-name/game/assets/bin/Data"),
+                catalog_source_subpath=Path("game-name/game/assets/aa/catalog.json"),
+                resource_staging_root=root / "staging")
+            with patch("pipeline.resource_staging.inspect_and_download_catalog_resources", return_value=True):
+                staged = prepare_unified_resource_source(cfg)
+                self.assertEqual((staged / "assetpack/nested/clothes").read_bytes(), b"UnityFS-test")
+                with patch("pipeline.resource_staging._copy_source_tree", side_effect=AssertionError("must reuse")):
+                    self.assertEqual(prepare_unified_resource_source(cfg), staged)
+                source.write_bytes(b"UnityFS-new-content")
+                self.assertEqual(prepare_unified_resource_source(cfg), staged)
+            self.assertEqual((staged / "assetpack/nested/clothes").read_bytes(), source.read_bytes())
+            state = json.loads(resource_source_map_path(cfg).read_text(encoding="utf-8"))
+            entry = next(e for e in state["entries"] if e["category"] == "assetpack")
+            self.assertEqual(Path(entry["source_relative_game"]), Path("assets/assetpack/nested/clothes"))
+            raw, final = root / "raw", root / "final"
+            (raw / "assetpack/nested").mkdir(parents=True)
+            (raw / "assetpack/nested/clothes").write_bytes(b"translated")
+            restore_imported_resource_paths(cfg, final, raw)
+            self.assertEqual((final / "assetpack/nested/clothes").read_bytes(), b"translated")
+            self.assertFalse((final / "Data/nested/clothes").exists())
+            self.assertEqual(source.read_bytes(), b"UnityFS-new-content")
+
     def test_old_absolute_staging_map_rebases_to_project_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -341,7 +373,7 @@ class ResourceStagingTests(unittest.TestCase):
             )
 
             state = json.loads(resource_source_map_path(cfg).read_text(encoding="utf-8"))
-            self.assertEqual(state["state_version"], 3)
+            self.assertEqual(state["state_version"], 6)
             self.assertIn("source_fingerprint", state)
             split_entries = [entry for entry in state["entries"] if entry.get("split_parts")]
             self.assertEqual(len(split_entries), 1)
@@ -470,7 +502,7 @@ class ResourceStagingTests(unittest.TestCase):
             )
 
             state = json.loads(resource_source_map_path(cfg).read_text(encoding="utf-8"))
-            self.assertEqual(state["state_version"], 3)
+            self.assertEqual(state["state_version"], 6)
             self.assertEqual(state["obb_container_count"], 1)
             obb_entries = [
                 entry for entry in state["entries"] if entry.get("origin_kind") == "obb"
