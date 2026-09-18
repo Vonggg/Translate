@@ -19,6 +19,7 @@ class LocalFieldPolicyTests(unittest.TestCase):
     def test_known_display_and_localization_values_are_allowed(self) -> None:
         self.assert_decision("allow", "m_Text", ("0",))
         self.assert_decision("allow", "m_text", (">>>",))
+        self.assert_decision("allow", "mText", ("All Enemy Planes Destroyed",))
         self.assert_decision("allow", "table.Array[].m_Localized", ("Start",))
         self.assert_decision(
             "allow",

@@ -149,10 +149,14 @@ class DefaultAITranslationStrategy:
     def parse_response(self, content: str) -> dict[int, str]:
         result = _extract_json_object(content)
         translated: dict[int, str] = {}
+        seen_ids: set[int] = set()
         for item in result.get("items", []):
             if not isinstance(item, dict):
                 continue
             item_id = item.get("id")
+            if type(item_id) is not int or item_id in seen_ids:
+                raise ValueError("AI response contains invalid or duplicate item ID")
+            seen_ids.add(item_id)
             translation = item.get("translation")
             # Some compatible chat APIs occasionally return the translated
             # value under the input field name despite the response schema.

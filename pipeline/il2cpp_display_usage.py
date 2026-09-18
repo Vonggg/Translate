@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import OrderedDict, defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 import hashlib
 import json
@@ -28,7 +28,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 AARCH64_RELATIVE_RELOCATION = 1027
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 # Large UI refresh methods frequently merge dozens of independent labels before
 # reaching a shared setter.  A budget of 32 dropped most of those values at CFG
 # joins (and made the later sink list look much smaller than the real UI).  Keep
@@ -139,6 +139,9 @@ class MethodAnalysis:
         default_factory=list
     )
     carrier_field_hits: list[
+        tuple[int, tuple[int, ...], SinkSpec, int]
+    ] = field(default_factory=list)
+    returned_carrier_field_hits: list[
         tuple[int, tuple[int, ...], SinkSpec, int]
     ] = field(default_factory=list)
     parameter_field_writes: list[tuple[int, tuple[int, ...], int]] = field(
@@ -673,6 +676,8 @@ def _container_operation(method: MethodRecord | None) -> tuple[str, tuple[int, .
     compact = _normalise_signature(method.signature).replace(" ", "")
     owner = method.name.split("$$", 1)[0]
     member = method.name.split("$$", 1)[-1]
+    if owner == "System.Linq.Enumerable" and member.split("<", 1)[0] in {"ToList", "ToArray", "AsEnumerable"}:
+        return "copy", ()
     is_collection = any(
         token in owner
         for token in (
@@ -686,7 +691,7 @@ def _container_operation(method: MethodRecord | None) -> tuple[str, tuple[int, .
         return None
     parameters = _signature_parameters(method.signature)
     string_indices = _string_parameter_indices(method.signature)
-    if member in {"Add", "set_Item"}:
+    if member in {"Add", "AddWithResize", "set_Item"}:
         # IL2CPP generic sharing commonly erases both the key and the value to
         # object.  Either side can be the displayed string (for example a
         # Dictionary<string, Sprite> used to build a reward row), so inspect
@@ -695,6 +700,10 @@ def _container_operation(method: MethodRecord | None) -> tuple[str, tuple[int, .
             return "write", (1, 2)
         if string_indices:
             return "write", string_indices
+        if "List" in owner and len(parameters) > 1 and "Il2CppObject*" in parameters[1]:
+            return "write", (1,)
+    if member in {"ToArray", "ToList"}:
+        return "copy", ()
     if member in {"Insert", "Enqueue", "Push"} and string_indices:
         return "write", string_indices
     if member in {"get_Item", "Peek", "Dequeue", "Pop"} and (
@@ -971,6 +980,50 @@ def _parse_dump_virtual_text_slots(path: Path) -> dict[str, frozenset[int]]:
         elif line.lstrip().startswith("// RVA:"):
             pending_slot = None
     return {key: frozenset(values) for key, values in result.items()}
+
+
+def _parse_dump_carrier_field_types(path: Path) -> dict[tuple[str, ...], dict[int, tuple[str, ...]]]:
+    """Resolve instance reference fields to unambiguous concrete class layouts."""
+    layouts: dict[str, dict[int, str]] = {}
+    namespace = ""
+    owner = None
+    in_fields = False
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("// Namespace:"):
+            namespace = line.partition(":")[2].strip()
+            owner = None
+            in_fields = False
+        match = re.match(r"\s*(?:(?:public|private|protected|internal|abstract|sealed|static|partial)\s+)*class\s+([\w.]+)(?=\s|:|$)", line)
+        if match:
+            owner = f"{namespace}.{match[1]}" if namespace else match[1]
+            layouts.setdefault(owner, {})
+            in_fields = False
+        elif "// Fields" in line:
+            in_fields = True
+        elif "// Methods" in line or "// Properties" in line:
+            in_fields = False
+        elif owner and in_fields:
+            match = re.match(r"\s*(?:public|private|protected|internal)\s+(?:readonly\s+)?([\w.<>\[\],]+)\s+[\w<>]+;\s*//\s*0x([0-9A-Fa-f]+)", line)
+            if match:
+                layouts[owner][int(match[2], 16)] = match[1]
+    names: dict[str, set[str]] = defaultdict(set)
+    for name in layouts:
+        parts = name.split('.')
+        for index in range(len(parts)):
+            names['.'.join(parts[index:])].add(name)
+    result = {}
+    for owner, fields in layouts.items():
+        resolved = {}
+        for offset, name in fields.items():
+            if name in {"string[]", "String[]", "System.String[]", "List<string>", "List<System.String>"}:
+                resolved[offset] = ("__string_collection__",)
+                continue
+            candidates = names.get(name, set())
+            if len(candidates) == 1:
+                resolved[offset] = _family_parts(next(iter(candidates)))
+        if resolved:
+            result[_family_parts(owner)] = resolved
+    return result
 
 
 def _parse_dump_class_display_fields(path: Path) -> dict[str, dict[int, str]]:
@@ -1630,6 +1683,7 @@ def _limit_values(values: Iterable[AbstractValue]) -> frozenset[AbstractValue]:
         "this": 15,
         "stack_address": 16,
         "call_result": 99,
+        "typed_carrier_object": 18,
     }
     return frozenset(
         sorted(
@@ -1774,6 +1828,7 @@ def _analyse_method(
     instruction_cache: dict[int, tuple[Any, ...]] | None = None,
     trace_addresses: frozenset[int] = frozenset(),
     track_object_fields: bool = False,
+    string_collection_fields: frozenset[int] = frozenset(),
 ) -> MethodAnalysis:
     try:
         from capstone import CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN, Cs
@@ -1985,6 +2040,8 @@ def _analyse_method(
 
         maximum_index: int | None = None
         for item in reversed(window):
+            if item.address >= load_instruction.address:
+                continue
             if (
                 item.mnemonic == "cmp"
                 and len(item.operands) >= 2
@@ -1992,6 +2049,17 @@ def _analyse_method(
                 and item.operands[1].type == ARM64_OP_IMM
             ):
                 maximum_index = int(item.operands[1].imm)
+                break
+            if (item.mnemonic == "mov" and len(item.operands) >= 2
+                    and operand_register(item.operands[0]) == index_register
+                    and item.operands[1].type == ARM64_OP_REG):
+                # Clang may compare w22, then use a copied w8 as table index.
+                index_register = operand_register(item.operands[1])
+                continue
+            _reads, writes = item.regs_access()
+            if any(_canonical_register(md, register) == index_register for register in writes):
+                # Arithmetic/clobbers need their own range proof. Do not reuse
+                # an older comparison for a different index value.
                 break
         if maximum_index is None or maximum_index < 0 or maximum_index > 4095:
             return []
@@ -2008,6 +2076,57 @@ def _analyse_method(
             if method.address <= target < method.end and target in instruction_map:
                 targets.append(target)
         return list(dict.fromkeys(targets))
+
+    def indexed_literal_table_values(instruction: Any) -> set[AbstractValue]:
+        """Resolve a bounded native pointer table indexed by a copied enum/int.
+
+        IL2CPP emits helpers such as ``ShowName`` as ``cmp index, #N`` followed
+        by ``ldr result, [table, index, lsl #3]``.  These are immutable native
+        pointer tables, not managed collections; each relocation target is a
+        concrete string literal cell.
+        """
+        if len(instruction.operands) < 2 or instruction.operands[1].type != ARM64_OP_MEM:
+            return set()
+        memory = instruction.operands[1].mem
+        if not memory.index:
+            return set()
+        base_register = _canonical_register(md, memory.base)
+        index_register = _canonical_register(md, memory.index)
+        instruction_index = instruction_indexes.get(instruction.address, -1)
+        window = instructions[max(0, instruction_index - 20):instruction_index]
+        maximum_index: int | None = None
+        for item in reversed(window):
+            if (item.mnemonic == "cmp" and len(item.operands) >= 2
+                    and operand_register(item.operands[0]) == index_register
+                    and item.operands[1].type == ARM64_OP_IMM):
+                maximum_index = int(item.operands[1].imm)
+                break
+            if (item.mnemonic == "mov" and len(item.operands) >= 2
+                    and operand_register(item.operands[0]) == index_register
+                    and item.operands[1].type == ARM64_OP_REG):
+                index_register = operand_register(item.operands[1])
+                continue
+            _reads, writes = item.regs_access()
+            if any(_canonical_register(md, register) == index_register for register in writes):
+                break
+        if maximum_index is None or not 0 <= maximum_index <= 4095:
+            return set()
+        shift = int(getattr(getattr(instruction.operands[1], "shift", None), "value", 0) or 0)
+        stride = 1 << shift
+        if stride not in {4, 8}:
+            return set()
+        base_addresses = {
+            value.source for value in _state_values(state, base_register)
+            if value.kind == "address"
+        }
+        values: set[AbstractValue] = set()
+        for base_address in base_addresses:
+            for table_index in range(maximum_index + 1):
+                target = pointer_slots.get(base_address + table_index * stride)
+                if target in literal_cells:
+                    values.add(AbstractValue("cell", target, instruction.address))
+                    result.referenced_literals.add(target)
+        return values
 
     def memory_offsets(instruction: Any, memory_operand_index: int) -> tuple[int, int | None]:
         memory = instruction.operands[memory_operand_index].mem
@@ -2070,7 +2189,7 @@ def _analyse_method(
                 )
             elif value.kind == "stack_address":
                 values.update(state.stack.get(value.source + displacement, frozenset()))
-            elif value.kind in {"object_param", "object_this", "call_result"}:
+            elif value.kind in {"object_param", "object_this", "call_result", "typed_carrier_return", "typed_carrier_object"}:
                 values.add(
                     AbstractValue(
                         value.kind,
@@ -2217,13 +2336,19 @@ def _analyse_method(
                         )
                     elif stored.kind in {"exact", "derived"}:
                         result.static_literal_field_writes.append((stored, key, pc))
-            elif value.kind in {"object_param", "object_this", "call_result"}:
+            elif value.kind == "call_result" and string_collection_fields:
+                # Allocated object storage belongs to that allocation, never to
+                # the method's declaring class. Only a proven collection field
+                # may later expose these slots as array elements.
+                key = ("heap_field", value.source, value.transforms + (f"{displacement:X}",))
+                state.container_elements[key] = _limit_values(values)
+            elif value.kind in {"object_param", "object_this"}:
                 field_path = tuple(
                     int(item, 16)
                     for item in value.transforms + (f"{displacement:X}",)
                 )
                 for stored in values:
-                    if stored.kind in {"param", "derived_param"}:
+                    if stored.kind in {"param", "derived_param", "container_param"}:
                         result.parameter_field_writes.append(
                             (stored.source, field_path, pc)
                         )
@@ -2238,7 +2363,10 @@ def _analyse_method(
                         # persist that container on ``this``. Preserve its
                         # string contents as a field-write summary so a later
                         # method can read the same field and display an item.
-                        for content in load_display_container_contents(state, (stored,)):
+                        for content in load_display_container_contents(
+                            state, (stored,),
+                            include_heap_fields=(value.kind == "object_this" and field_path in {(offset,) for offset in string_collection_fields}),
+                        ):
                             if content.kind not in {"exact", "derived"}:
                                 continue
                             result.literal_field_writes.append(
@@ -2306,7 +2434,7 @@ def _analyse_method(
         content = {
             value
             for value in values
-            if value.kind in {"exact", "derived", "param", "derived_param"}
+            if value.kind in {"exact", "derived", "param", "derived_param", "object_this", "object_param", "typed_carrier_return", "container_param"}
         }
         if not content:
             return
@@ -2344,20 +2472,30 @@ def _analyse_method(
             result_values.update(
                 value
                 for value in base_values
-                if value.kind in {"object_this", "object_param"}
-                and value.transforms
+                if (value.kind in {"object_this", "object_param"} and value.transforms)
+                or value.kind == "typed_carrier_return"
             )
         return _limit_values(result_values)
 
     def load_display_container_contents(
         state: AbstractState,
         base_values: Iterable[AbstractValue],
+        *,
+        include_heap_fields: bool = False,
     ) -> frozenset[AbstractValue]:
         base_values = tuple(base_values)
         values: set[AbstractValue] = set()
         for key in container_keys(base_values):
             values.update(state.container_elements.get(key, frozenset()))
+            if include_heap_fields and key[0] == "call_result":
+                for (kind, source, path), contents in state.container_elements.items():
+                    if kind == "heap_field" and source == key[1] and len(path) == 1 and int(path[0], 16) >= 0x20:
+                        values.update(contents)
         values.update(value for value in base_values if value.kind == "container_param")
+        if not values:
+            values.update(value for value in base_values if
+                          (value.kind in {"object_this", "object_param"} and value.transforms)
+                          or value.kind == "typed_carrier_return")
         return _limit_values(values)
 
     def apply_memory_writeback(
@@ -2424,6 +2562,10 @@ def _analyse_method(
             if sink.argument_transform and value.kind not in {
                 "object_param",
                 "object_this",
+                "typed_carrier_return",
+                "derived_object_param",
+                "derived_object_this",
+                "derived_typed_carrier_return",
             }:
                 transformed_kind = {
                     "exact": "derived",
@@ -2478,14 +2620,21 @@ def _analyse_method(
                         value.transforms + ("index-insensitive container enumeration",),
                     )
                 )
-            elif value.kind in {"object_param", "object_this"} and value.transforms:
+            elif value.kind in {"object_param", "object_this", "derived_object_param", "derived_object_this"} and value.transforms:
                 result.carrier_field_hits.append(
                     (
                         value.source,
                         tuple(int(item, 16) for item in value.transforms),
-                        sink,
+                        replace(sink, argument_transform="string transform on carrier field")
+                        if value.kind.startswith("derived_") else sink,
                         callsite,
                     )
+                )
+            elif value.kind in {"typed_carrier_return", "derived_typed_carrier_return", "typed_carrier_object"}:
+                result.returned_carrier_field_hits.append(
+                    (value.source, tuple(int(item, 16) for item in value.transforms),
+                     replace(sink, argument_transform="string transform on carrier field")
+                     if value.kind.startswith("derived_") else sink, callsite)
                 )
             elif value.kind in {"pointer_slot", "memory_path"}:
                 result.static_field_hits.append(
@@ -2612,9 +2761,11 @@ def _analyse_method(
                 memory = operands[1].mem
                 base_register = _canonical_register(md, memory.base)
                 if memory.index:
-                    values = load_container_elements(
-                        state, _state_values(state, base_register), pc
-                    )
+                    values = indexed_literal_table_values(instruction)
+                    if not values:
+                        values = load_container_elements(
+                            state, _state_values(state, base_register), pc
+                        )
                     writeback_displacement = None
                 else:
                     displacement, writeback_displacement = memory_offsets(instruction, 1)
@@ -2724,7 +2875,18 @@ def _analyse_method(
                 transformed_values: set[AbstractValue] = set()
                 target_method_record = methods_by_address.get(target)
                 container_operation = _container_operation(target_method_record)
-                if container_operation and container_operation[0] == "write":
+                if (track_object_fields and target_method_record is not None
+                        and _is_project_owned_method(target_method_record)
+                        and target not in delegate_constructor_addresses
+                        and target_method_record.name.rsplit("$$", 1)[-1] == ".ctor"):
+                    replace_object_aliases(
+                        state, call_x0,
+                        AbstractValue("typed_carrier_object", target, pc),
+                    )
+                if container_operation and container_operation[0] == "copy":
+                    # Collection conversion preserves its source provenance.
+                    transformed_values.update(call_x0)
+                elif container_operation and container_operation[0] == "write":
                     target_registers = _parameter_registers(
                         target_method_record.signature
                     )
@@ -2812,10 +2974,14 @@ def _analyse_method(
                                 "derived_param",
                                 "object_param",
                                 "object_this",
+                                "derived_object_param",
+                                "derived_object_this",
+                                "typed_carrier_return",
+                                "derived_typed_carrier_return",
                                 "enum_text",
                             }:
-                                if value.kind in {"object_param", "object_this"}:
-                                    transformed_values.add(value)
+                                if value.kind in {"object_param", "object_this", "typed_carrier_return", "derived_object_param", "derived_object_this", "derived_typed_carrier_return"}:
+                                    transformed_values.add(replace(value, kind=value.kind if value.kind.startswith("derived_") else "derived_" + value.kind))
                                     continue
                                 transformed_values.add(
                                     AbstractValue(
@@ -2954,6 +3120,11 @@ def _analyse_method(
                         )
                 elif target in return_object_display_fields:
                     transformed_values.add(AbstractValue("return_object", target, pc))
+                if track_object_fields and target_method_record is not None and not container_operation:
+                    return_type = target_method_record.signature.split("(", 1)[0].strip().rsplit(" ", 1)[0].strip()
+                    if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*_o\s*\*", return_type) and not _is_string_parameter(return_type):
+                        transformed_values.add(AbstractValue("typed_carrier_return", target, pc))
+                        transformed_values.add(AbstractValue("call_result", pc, pc))
                 _clear_caller_saved(state)
                 # Unknown native/IL2CPP allocators still produce a stable
                 # abstract object identity.  Real delegate construction moves
@@ -2993,9 +3164,15 @@ def _analyse_method(
                     for key in [event_key_for_value(value, strip_last=True)]
                     if key is not None
                 }
+                # MethodInfo is the final managed argument, so its register
+                # depends on the delegate arity.  Action<string> uses x2 and
+                # tail-branches through x3, while wider delegates commonly
+                # place MethodInfo in x3 or later.  Prove the +0x28 layout in
+                # any argument register instead of hard-coding x3.
                 method_info_keys = {
                     key
-                    for value in _state_values(state, "x3")
+                    for register in ("x1", "x2", "x3", "x4", "x5", "x6", "x7")
+                    for value in _state_values(state, register)
                     if value.kind in {"memory_path", "object_this", "object_param"}
                     and value.transforms
                     and value.transforms[-1] == "28"
@@ -3008,7 +3185,14 @@ def _analyse_method(
                         value
                         for value in _state_values(state, register)
                         if value.kind
-                        in {"exact", "derived", "probable", "probable_derived"}
+                        in {
+                            "exact",
+                            "derived",
+                            "probable",
+                            "probable_derived",
+                            "param",
+                            "derived_param",
+                        }
                     )
                     for register in ("x1", "x2", "x3", "x4", "x5", "x6", "x7")
                 }
@@ -3214,6 +3398,8 @@ def _analyse_method(
                     "param",
                     "derived_param",
                     "enum_text",
+                    "object_this",
+                    "object_param",
                 }
             )
             successors = []
@@ -3338,6 +3524,7 @@ def _discover_carrier_field_sinks(
     disassembler: Any,
     instruction_cache: dict[int, tuple[Any, ...]],
     consumer_methods: set[int] | None = None,
+    carrier_field_types: Mapping[tuple[str, ...], Mapping[int, tuple[str, ...]]] | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[
     list[SinkSpec],
@@ -3367,6 +3554,18 @@ def _discover_carrier_field_sinks(
     unresolved: list[dict[str, Any]] = []
     ordered_methods = sorted(methods.values(), key=lambda item: item.address)
     consumer_count = 0
+    def add_displayed_path(family, field_path, sink):
+        displayed_paths[family][field_path].append(sink)
+        # A UI field may hold the model until a later refresh. Walk only
+        # dump-proven reference types; matching numeric offsets alone is unsafe.
+        remaining = field_path
+        while carrier_field_types and len(remaining) > 1:
+            nested_family = carrier_field_types.get(family, {}).get(remaining[0])
+            if nested_family is None:
+                break
+            family = nested_family
+            remaining = remaining[1:]
+            displayed_paths[family][remaining].append(sink)
     for method in ordered_methods:
         fields = display_fields_by_method.get(method.address)
         nested_fields = nested_display_fields_by_method.get(method.address)
@@ -3394,6 +3593,10 @@ def _discover_carrier_field_sinks(
             disassembler=disassembler,
             instruction_cache=instruction_cache,
             track_object_fields=True,
+            string_collection_fields=frozenset(
+                offset for offset, field_type in (carrier_field_types or {}).get(_method_object_family(method), {}).items()
+                if field_type == ("__string_collection__",)
+            ),
         )
         consumer_count += 1
         if progress_callback and consumer_count % 250 == 0:
@@ -3408,7 +3611,51 @@ def _discover_carrier_field_sinks(
                 else _parameter_object_family(parameters[parameter_index])
             )
             if family:
-                displayed_paths[family][field_path].append(downstream)
+                add_displayed_path(family, field_path, downstream)
+
+        for target, field_path, downstream, callsite in analysis.returned_carrier_field_hits:
+            producer = methods.get(target)
+            if producer is None:
+                continue
+            if not field_path:
+                # A returned list can feed get_Item before the text is displayed.
+                # Resolve the getter's actual returned instance field rather than
+                # identifying a list solely by its generic type.
+                getter = _analyse_method(
+                    method=producer, code_sections=code_sections,
+                    memory_sections=memory_sections, literal_cells=literal_cells,
+                    slot_to_cell=slot_to_cell, sinks_by_address={},
+                    transforms_by_address=transforms_by_address,
+                    initialise_parameters=True, track_object_fields=True,
+                    methods_by_address=methods, disassembler=disassembler,
+                    instruction_cache=instruction_cache,
+                )
+                for returned in getter.return_values:
+                    if returned.kind == "object_this" and returned.transforms:
+                        family = _method_object_family(producer)
+                        if family:
+                            add_displayed_path(family, tuple(int(v, 16) for v in returned.transforms),
+                                               replace(downstream, path=(producer.name, *downstream.path)))
+                continue
+            is_constructor = producer.name.rsplit("$$", 1)[-1] == ".ctor"
+            return_type = producer.signature.split("(", 1)[0].strip().rsplit(" ", 1)[0].strip()
+            family = _method_object_family(producer) if is_constructor else _parameter_object_family(return_type)
+            if family:
+                # The concrete return type joins a later UI read to writes on
+                # that same model. Offsets alone must never connect unrelated models.
+                add_displayed_path(family, field_path,
+                    SinkSpec(
+                        address=downstream.address, name=downstream.name,
+                        signature=downstream.signature,
+                        argument_index=downstream.argument_index,
+                        argument_register=downstream.argument_register,
+                        path=(f"{producer.name} constructs {'.'.join(family)}" if is_constructor
+                              else f"{producer.name} returns {return_type}",
+                              f"{method.name} reads at {_hex(callsite)}", *downstream.path),
+                        wrapper_depth=downstream.wrapper_depth,
+                        argument_transform=downstream.argument_transform,
+                    )
+                )
 
     carrier_sinks: list[SinkSpec] = []
     exact_hits: list[dict[str, Any]] = []
@@ -3428,6 +3675,8 @@ def _discover_carrier_field_sinks(
             method_family[:length]
             for length in range(1, len(method_family) + 1)
             if method_family[:length] in displayed_families
+            and (length == len(method_family)
+                 or any("builder" in part for part in method_family[length:]))
         ]
         if not matching_families:
             continue
@@ -3444,6 +3693,10 @@ def _discover_carrier_field_sinks(
             disassembler=disassembler,
             instruction_cache=instruction_cache,
             track_object_fields=True,
+            string_collection_fields=frozenset(
+                offset for offset, field_type in (carrier_field_types or {}).get(method_family, {}).items()
+                if field_type == ("__string_collection__",)
+            ),
         )
         producer_count += 1
         if progress_callback and producer_count % 250 == 0:
@@ -3474,6 +3727,8 @@ def _discover_carrier_field_sinks(
                                 *downstream.path,
                             ),
                             wrapper_depth=1,
+                            argument_transform=downstream.argument_transform,
+                            container_contents=parameter_index in _container_parameter_indices(method.signature),
                         )
                         if spec not in carrier_sinks:
                             carrier_sinks.append(spec)
@@ -3501,10 +3756,10 @@ def _discover_carrier_field_sinks(
                                     downstream.name,
                                     *downstream.path,
                                 ],
-                                "transforms": list(value.transforms),
+                                "transforms": list(value.transforms) + ([downstream.argument_transform] if downstream.argument_transform else []),
                             },
                         }
-                        target = exact_hits if value.kind == "exact" else derived_hits
+                        target = exact_hits if value.kind == "exact" and not downstream.argument_transform else derived_hits
                         target.append(evidence)
     return (
         carrier_sinks,
@@ -3828,6 +4083,7 @@ def _discover_return_summaries(
     disassembler: Any,
     instruction_cache: dict[int, tuple[Any, ...]],
     max_depth: int,
+    pointer_slots: Mapping[int, int] | None = None,
     enum_type_by_pointer_slot: Mapping[int, str] | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[int, tuple[AbstractValue, ...]]:
@@ -3862,6 +4118,7 @@ def _discover_return_summaries(
             disassembler=disassembler,
             instruction_cache=instruction_cache,
             return_summaries_by_address=summaries,
+            pointer_slots=pointer_slots,
             methods_by_address=methods,
             enum_type_by_pointer_slot=enum_type_by_pointer_slot,
         )
@@ -3913,6 +4170,7 @@ def analyze_arm64_display_usage(
     enum_type_by_pointer_slot: Mapping[int, str] | None = None,
     enum_members_by_type: Mapping[str, Sequence[str]] | None = None,
     progress_callback: Callable[[str], None] | None = None,
+    carrier_field_types: Mapping[tuple[str, ...], Mapping[int, tuple[str, ...]]] | None = None,
 ) -> dict[str, Any]:
     """Analyse already loaded ARM64 sections.
 
@@ -4086,6 +4344,7 @@ def analyze_arm64_display_usage(
         disassembler=disassembler,
         instruction_cache=instruction_cache,
         max_depth=max_wrapper_depth,
+        pointer_slots=pointer_slots,
         enum_type_by_pointer_slot=enum_type_by_pointer_slot,
         progress_callback=progress_callback,
     )
@@ -4152,8 +4411,43 @@ def analyze_arm64_display_usage(
         disassembler=disassembler,
         instruction_cache=instruction_cache,
         consumer_methods=display_reachable_methods,
+        carrier_field_types=carrier_field_types,
         progress_callback=progress_callback,
     )
+    # A displayed model can itself be populated from another persisted model
+    # or container. Follow newly proven writer arguments upstream to a fixed
+    # point, analysing only their callers in subsequent rounds.
+    def carrier_key(sink):
+        return sink.address, sink.argument_index, sink.argument_register, sink.argument_transform
+
+    known_carriers = {carrier_key(sink) for sink in carrier_field_sinks}
+    frontier = list(carrier_field_sinks)
+    while frontier:
+        consumers = {caller for sink in frontier for caller in call_index.get(sink.address, set())}
+        if not consumers:
+            break
+        extra_sinks, extra_exact, extra_derived, extra_unresolved = _discover_carrier_field_sinks(
+            methods=methods, code_sections=code_sections, memory_sections=memory_sections,
+            literal_cells=literals, slot_to_cell=slot_to_cell,
+            base_sinks=[*pre_carrier_sinks, *carrier_field_sinks],
+            transforms_by_address=transforms_by_address,
+            display_fields_by_method={key: value for key, value in display_fields_by_method.items() if key in consumers},
+            nested_display_fields_by_method={key: value for key, value in nested_display_fields_by_method.items() if key in consumers},
+            virtual_text_slots_by_component=virtual_text_slots_by_component,
+            display_container_operations=display_container_operations,
+            disassembler=disassembler, instruction_cache=instruction_cache,
+            consumer_methods=consumers, carrier_field_types=carrier_field_types,
+        )
+        carrier_exact_hits.extend(extra_exact)
+        carrier_derived_hits.extend(extra_derived)
+        carrier_unresolved.extend(extra_unresolved)
+        frontier = []
+        for sink in extra_sinks:
+            if carrier_key(sink) not in known_carriers:
+                known_carriers.add(carrier_key(sink))
+                carrier_field_sinks.append(sink)
+                frontier.append(sink)
+        report(f"载体字段上游追踪：消费者={len(consumers)}，新增入口={len(frontier)}")
     report(f"载体字段链完成：新增入口={len(carrier_field_sinks)}")
     report("正在分析显示包装函数……")
     sinks_by_address, wrapper_methods, wrapper_unresolved = _discover_wrapper_sinks(
@@ -4186,16 +4480,26 @@ def analyze_arm64_display_usage(
         if operation[0] == "display":
             candidate_methods.update(call_index.get(target, set()))
 
+    # A UI refresh may only call a string-return helper: the enum TypeInfo or
+    # literal then lives in that helper, not in the refresh's own instructions.
+    # Include callers of proven source-return summaries; actual setter argument
+    # tracking below still decides whether those values are displayed.
+    returned_source_callers = {
+        caller
+        for target, values in return_summaries_by_address.items()
+        if any(value.kind in {"exact", "derived", "enum_text"} for value in values)
+        for caller in call_index.get(target, set())
+    }
     virtual_component_candidates = {
         address
-        for address in literal_reference_methods | enum_reference_methods
+        for address in literal_reference_methods | enum_reference_methods | returned_source_callers
         if display_fields_by_method.get(address)
         or nested_display_fields_by_method.get(address)
     }
     candidate_methods.update(virtual_component_candidates)
     component_factory_candidates = (
         component_factory_callers
-        & (literal_reference_methods | enum_reference_methods)
+        & (literal_reference_methods | enum_reference_methods | returned_source_callers)
     )
     candidate_methods.update(component_factory_candidates)
 
@@ -4425,7 +4729,7 @@ def analyze_arm64_display_usage(
     if subscribed_root_slots:
         delegate_invocation_candidates = {
             method_address
-            for method_address in literal_reference_methods & indirect_call_methods
+            for method_address in indirect_call_methods
             if (
                 references_by_method.get(method_address, set()) & subscribed_root_slots
                 or _event_family_root(_method_object_family(methods[method_address]))
@@ -4434,6 +4738,119 @@ def analyze_arm64_display_usage(
         }
     else:
         delegate_invocation_candidates = set()
+
+    # Treat a method which forwards one of its parameters through a proven
+    # delegate event as a normal display sink.  The literal often lives in its
+    # caller (for example: Format(...) -> ShowFadeableNotice(message) ->
+    # Action<string> -> TMP), so restricting event analysis to methods that
+    # themselves reference a literal loses the real display chain.
+    delegate_forward_sinks: list[SinkSpec] = []
+    for method_address in sorted(delegate_invocation_candidates):
+        method = methods.get(method_address)
+        if method is None:
+            continue
+        analysis = _analyse_method(
+            method=method,
+            code_sections=code_sections,
+            memory_sections=memory_sections,
+            literal_cells=literals,
+            slot_to_cell=slot_to_cell,
+            sinks_by_address=sinks_by_address,
+            transforms_by_address=transforms_by_address,
+            display_container_operations=display_container_operations,
+            initialise_parameters=True,
+            pointer_slots=pointer_slots,
+            metadata_method_targets=metadata_method_targets,
+            delegate_constructor_addresses=delegate_constructor_addresses,
+            delegate_combine_addresses=delegate_combine_addresses,
+            disassembler=disassembler,
+            instruction_cache=instruction_cache,
+            return_summaries_by_address=return_summaries_by_address,
+            methods_by_address=methods,
+            enum_type_by_pointer_slot=enum_type_by_pointer_slot,
+            track_object_fields=True,
+        )
+        caller_registers = _parameter_registers(method.signature)
+        for key, _callsite, values_by_register in analysis.delegate_invocations:
+            for target in delegate_subscriptions.get(key, set()):
+                callback = methods[target]
+                callback_registers = _parameter_registers(callback.signature)
+                for callback_parameter, downstream, parameter_transforms in delegate_display_sinks[target]:
+                    if callback_parameter >= len(callback_registers):
+                        continue
+                    callback_register = callback_registers[callback_parameter]
+                    if callback_register is None:
+                        continue
+                    for value in values_by_register.get(callback_register, ()):
+                        if value.kind not in {"param", "derived_param"}:
+                            continue
+                        if value.source >= len(caller_registers):
+                            continue
+                        caller_register = caller_registers[value.source]
+                        if caller_register is None:
+                            continue
+                        delegate_forward_sinks.append(
+                            SinkSpec(
+                                method.address,
+                                method.name,
+                                method.signature,
+                                value.source,
+                                caller_register,
+                                (
+                                    "delegate invocation",
+                                    callback.name,
+                                    *downstream.path,
+                                ),
+                                argument_transform=(
+                                    "delegate parameter transform"
+                                    if value.kind == "derived_param" or parameter_transforms
+                                    else None
+                                ),
+                            )
+                        )
+    if delegate_forward_sinks:
+        delegate_sink_map: dict[int, list[SinkSpec]] = defaultdict(list)
+        for sink in delegate_forward_sinks:
+            delegate_sink_map[sink.address].append(sink)
+        sinks_by_address = {
+            **sinks_by_address,
+            **{
+                address: tuple(dict.fromkeys((*sinks_by_address.get(address, ()), *items)))
+                for address, items in delegate_sink_map.items()
+            },
+        }
+        delegate_sinks_by_address, delegate_wrappers, delegate_unresolved = (
+            _discover_wrapper_sinks(
+                methods=methods,
+                call_index=call_index,
+                code_sections=code_sections,
+                memory_sections=memory_sections,
+                literal_cells=literals,
+                slot_to_cell=slot_to_cell,
+                base_sinks=[
+                    sink
+                    for sink_group in sinks_by_address.values()
+                    for sink in sink_group
+                ],
+                transforms_by_address=transforms_by_address,
+                max_wrapper_depth=max_wrapper_depth,
+                display_fields_by_method=display_fields_by_method,
+                nested_display_fields_by_method=nested_display_fields_by_method,
+                virtual_text_slots_by_component=virtual_text_slots_by_component,
+                display_container_operations=display_container_operations,
+                disassembler=disassembler,
+                instruction_cache=instruction_cache,
+                return_summaries_by_address=return_summaries_by_address,
+                component_factory_callers=component_factory_callers,
+                return_object_display_fields=return_object_display_fields,
+                pointer_slots=pointer_slots,
+            )
+        )
+        sinks_by_address = delegate_sinks_by_address
+        wrapper_unresolved.extend(delegate_unresolved)
+        candidate_methods.update(delegate_wrappers)
+        for target in sinks_by_address:
+            candidate_methods.update(call_index.get(target, set()))
 
     exact_by_literal: dict[int, list[dict[str, Any]]] = defaultdict(list)
     derived_by_literal: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -4931,6 +5348,7 @@ def analyze_il2cpp_display_usage(
     timings["dump_indexes_seconds"] = time.perf_counter() - phase_started
     phase_started = time.perf_counter()
     result = analyze_arm64_display_usage(
+        carrier_field_types=_parse_dump_carrier_field_types(dump_path) if dump_path else {},
         code_sections=code_sections,
         memory_sections=memory_sections,
         method_payload=methods,

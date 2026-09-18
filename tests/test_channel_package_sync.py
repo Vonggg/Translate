@@ -108,6 +108,24 @@ class ChannelPackageSyncTests(unittest.TestCase):
             self.assertEqual((channel / "assets/assetpack/nested/clothes").read_bytes(), b"PAD replacement")
             self.assertEqual(summary.final_result_files, 1)
 
+    def test_import_does_not_overwrite_project_native_dictionary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cfg, _, channel, final_root = self._fixture(Path(temporary))
+            (final_root / "Data").mkdir(parents=True)
+            (final_root / "Data" / "globalgamemanagers").write_text("translated", encoding="utf-8")
+            generated = cfg.workspace_root / "output/Hook_Translate/native_unity_translation_dictionary.generated.cpp"
+            generated.parent.mkdir(parents=True)
+            generated.write_text("generated dictionary", encoding="utf-8")
+            destination = channel.parent / "cpp/native_unity_translation_dictionary.cpp"
+            destination.parent.mkdir()
+            destination.write_text("project dictionary", encoding="utf-8")
+
+            summary = sync_import_result_to_channel_package(cfg, final_root, channel.name)
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "project dictionary")
+            self.assertFalse(destination.with_suffix(".cpp.before-translate-sync.bak").exists())
+            self.assertEqual(summary.dictionary_entries, 0)
+
     def test_without_remote_resources_only_aa_final_result_is_copied(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             cfg, source_aa, channel, final_root = self._fixture(Path(temporary))

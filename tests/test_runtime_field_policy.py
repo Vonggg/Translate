@@ -17,6 +17,14 @@ from support.config import load_config
 
 
 class RuntimeFieldPolicyTests(unittest.TestCase):
+    def test_nested_json_null_sentinel_is_restored_without_touching_ui(self):
+        original = {"m_Script": json.dumps({"upgrade": json.dumps({"nameTwoLines": "NULL"})}), "m_Text": "Null"}
+        candidate = {"m_Script": json.dumps({"upgrade": json.dumps({"nameTwoLines": "睡莲"})}), "m_Text": "空"}
+        repaired, changes = restore_protected_runtime_fields(original, candidate)
+        self.assertEqual(json.loads(json.loads(repaired["m_Script"])["upgrade"])["nameTwoLines"], "NULL")
+        self.assertEqual(repaired["m_Text"], "空")
+        self.assertEqual(len(changes), 1)
+
     def test_character_lookup_names_are_protected_and_stale_text_restored(self):
         source = {
             "m_Script": {"m_FileID": 1, "m_PathID": 430},

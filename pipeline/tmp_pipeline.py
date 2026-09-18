@@ -1616,6 +1616,38 @@ def prepare_generated_tmp_import_replacements(
             }
         )
 
+    # Runtime localization can select material presets which no Text component
+    # references in the serialized scene. Match their actual atlas dependency,
+    # not a game-specific mapping field or material name.
+    from .translation import _is_tmp_sdf_material_json
+    replaced_atlases = {path.resolve() for path in written_textures}
+    for (manifest_path, _entry, _id), (manifest_dir, item) in material_items.items():
+        material_path = _resolve_manifest_item_path(manifest_dir, item)
+        if material_path is None or not material_path.is_file():
+            continue
+        material_json = read_json(material_path)
+        if not _is_tmp_sdf_material_json(material_json):
+            continue
+        asset_key = _bundle_key_for_json_path(cfg, material_path)
+        for file_id, path_id in _material_main_texture_refs(material_json):
+            target_asset = asset_key if file_id == 0 else file_id_map.get(asset_key, {}).get(str(file_id), "")
+            texture_relative = path_id_map.get(target_asset, {}).get(str(path_id), "")
+            if not texture_relative and target_asset:
+                entry_name = target_asset.replace("\\", "/").rsplit("/", 1)[-1]
+                texture_entry = texture_items.get((manifest_path, entry_name, path_id))
+                if texture_entry is not None:
+                    texture_path = _resolve_manifest_item_path(texture_entry[0], texture_entry[1])
+                    if texture_path is not None:
+                        texture_relative = str(texture_path.relative_to(cfg.resource_input_root))
+            if not texture_relative:
+                continue
+            texture_output = _overlay_path_for_input_path(cfg, _input_path_for_relative(cfg, texture_relative))
+            if texture_output.resolve() in replaced_atlases:
+                relative = str(material_path.relative_to(cfg.resource_input_root))
+                add_material_target(relative, "replaced_font_atlas_material", texture_relative)
+                material_targets[relative]["disable_effects"] = True
+                break
+
     for relative, target in sorted(material_targets.items()):
         source_material_path = _input_path_for_relative(cfg, relative)
         if not source_material_path.is_file():

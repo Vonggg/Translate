@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 from fnmatch import fnmatchcase
 from typing import Any
 
@@ -231,6 +232,8 @@ def runtime_field_exclusion_reason(
 
     leaf = _field_leaf(field_path)
     stripped = value.strip()
+    if field_path.startswith("m_Script.json.") and stripped.casefold() == "null":
+        return "结构化 JSON 空值/枚举哨兵"
 
     if leaf in _SERIALIZED_JSON_METADATA_LEAVES:
         return "序列化 JSON 结构元数据"
@@ -318,6 +321,17 @@ def restore_protected_runtime_fields(
 
     def walk(source: Any, current: Any, field_path: str) -> Any:
         if isinstance(source, str):
+            if field_path == "m_Script" or field_path.startswith("m_Script.json."):
+                try:
+                    source_tree = json.loads(source)
+                    current_tree = json.loads(current) if isinstance(current, str) else None
+                except (ValueError, TypeError):
+                    source_tree = current_tree = None
+                if isinstance(source_tree, (dict, list)) and type(source_tree) is type(current_tree):
+                    count = len(restored)
+                    result = walk(source_tree, current_tree, field_path + ".json")
+                    if len(restored) != count:
+                        return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
             reason = runtime_field_exclusion_reason(root_data, field_path, source)
             if reason is not None and current != source:
                 restored.append((field_path, reason))

@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 from typing import Any, Iterable
+from .runtime_field_policy import runtime_field_exclusion_reason
 
 
 TEXTASSET_CSV_KIND = "textasset_csv"
@@ -366,6 +367,8 @@ def apply_textasset_json_translations(
     changes = 0
     changed_paths: set[str] = set()
     for record in embedded_records:
+        if runtime_field_exclusion_reason(data, record.field, record.source_text) is not None:
+            continue
         raw_path = record.embedded_locator.get("path")
         if not isinstance(raw_path, list) or not raw_path:
             continue

@@ -25,6 +25,25 @@ from pipeline.dynamic_translation_dictionary import (
 
 
 class DynamicTranslationDictionaryTests(unittest.TestCase):
+    def test_mission_wording_does_not_replace_display_evidence(self) -> None:
+        payload = [
+            {"value": "Roll 10 times in the Left lane", "address": "0x1"},
+            {"value": "Jump over 10 obstacles", "address": "0x2"},
+            {"value": "Run 30 second in the Center lane", "address": "0x3"},
+            {"value": "Buy 1 Flash Deals item", "address": "0x4"},
+            {"value": "Complete 3 Quests", "address": "0x5"},
+            {"value": "Collect 2 Coin Magnet", "address": "0x6"},
+            {"value": "Use 3 roller skates", "address": "0x7"},
+            {"value": "RollerController", "address": "0x8"},
+            {"value": "Retry 10 times in the Left lane", "address": "0x9"},
+        ]
+        candidates, filtered, reasons = extract_stringliteral_candidates(
+            payload, exact_display_addresses=[]
+        )
+        self.assertEqual([], candidates)
+        self.assertEqual(len(payload), reasons["not_proven_display"])
+        self.assertEqual({x["value"] for x in payload}, {x["value"] for x in filtered})
+
     def test_trans_json_replaces_only_whole_text_dictionary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -407,6 +407,8 @@ def resend_batch(
             usage_items.append(usage)
         parsed = strategy.parse_response(content)
         expected_ids = {item_id for item_id, _text in sub_batch}
+        if set(parsed) - expected_ids:
+            raise ValueError("AI response contains unexpected IDs; refusing potentially shifted translations")
         accepted = {
             item_id: translation
             for item_id, translation in parsed.items()
@@ -532,6 +534,8 @@ def patch_trans_from_response(request_path: Path, response_path: Path, trans_pat
     id_to_source = load_request_items(request_path)
     content = response_content(response_path)
     parsed = strategy.parse_response(content)
+    if set(parsed) - set(id_to_source):
+        raise ValueError("AI response contains unexpected IDs; refusing to patch trans.json")
     if not parsed:
         raise RuntimeError(f"response 中没有解析到任何翻译: {response_path}")
 

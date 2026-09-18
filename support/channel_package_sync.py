@@ -241,7 +241,12 @@ def sync_import_result_to_channel_package(
 
     if final_result_files <= 0:
         raise RuntimeError(f"FinalResult 没有可同步到渠道包的文件: {final_root}")
-    dictionary_entries = sync_generated_dictionary(cfg, target)
+    # The generated Hook dictionary is an inspection/export artifact.  Importing
+    # translated Unity resources must not mutate the project's hand-maintained
+    # native Hook source, because that file can contain project-specific entries
+    # and code that are intentionally independent from this import run.
+    dictionary_entries = 0
+    print("[字典同步] 已关闭自动合并；保留项目 native_unity_translation_dictionary.cpp。", flush=True)
     print(
         f"\033[92m[渠道包同步][完成] {target.name}: "
         f"原 aa={source_aa_files}，导入结果={final_result_files}，"

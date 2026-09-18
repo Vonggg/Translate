@@ -69,6 +69,21 @@ class TmpMaterialMainTextureTests(unittest.TestCase):
             }
 
             font_path.write_text(json.dumps(font), encoding="utf-8")
+            # A runtime-only preset shares the replaced atlas but is not the
+            # font default and is absent from translated component references.
+            preset_path = material_path.with_name("RuntimePreset_301.json")
+            preset = json.loads(json.dumps(material))
+            preset["m_SavedProperties"]["m_Floats"]["Array"] = [
+                {"first": key, "second": value} for key, value in
+                [("_GradientScale", 5), ("_TextureWidth", 512), ("_TextureHeight", 512),
+                 ("_WeightNormal", 0), ("_WeightBold", 0.75), ("_UnderlayOffsetY", -1)]
+            ]
+            preset["m_SavedProperties"]["m_Colors"] = {"Array": [
+                {"first": "_FaceColor", "second": {"r": 1, "g": 1, "b": 1, "a": 1}},
+                {"first": "_UnderlayColor", "second": {"r": 0, "g": 0, "b": 0, "a": 1}},
+            ]}
+            preset["m_ValidKeywords"] = {"Array": ["UNDERLAY_ON"]}
+            preset_path.write_text(json.dumps(preset), encoding="utf-8")
             material_path.write_text(json.dumps(material), encoding="utf-8")
             generated_json_path.write_text(json.dumps(generated_font), encoding="utf-8")
             font_atlas_path.write_bytes(PNG_1X1)
@@ -102,6 +117,7 @@ class TmpMaterialMainTextureTests(unittest.TestCase):
                 },
             ]
             input_root.mkdir(parents=True, exist_ok=True)
+            items.append({"PathId": 301, "TypeName": "Material", "RelativePath": "bundle/CAB-test/Material/RuntimePreset_301.json", "BundleEntryName": "CAB-test"})
             (input_root / "manifest.json").write_text(
                 json.dumps({"Items": items}),
                 encoding="utf-8",
@@ -117,7 +133,7 @@ class TmpMaterialMainTextureTests(unittest.TestCase):
                 unity_font_project=root / "unity",
             )
 
-            with mock.patch(
+            with mock.patch("pipeline.tmp_pipeline._load_path_id_map_for_tmp", return_value={}), mock.patch(
                 "pipeline.translation.collect_translated_text_effect_material_sources",
                 return_value={},
             ):
@@ -128,6 +144,8 @@ class TmpMaterialMainTextureTests(unittest.TestCase):
                 )
 
             expected = generated_atlas_path.read_bytes()
+            repaired = json.loads((overlay_dir / preset_path.relative_to(input_root)).read_text())
+            self.assertEqual(repaired["m_SavedProperties"]["m_Colors"]["Array"][1]["second"]["a"], 0)
             self.assertEqual(summary["font_replacements"], 1)
             self.assertEqual(summary["texture_replacements"], 2)
             self.assertEqual(summary["material_main_texture_replacements"], 1)

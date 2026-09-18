@@ -2523,6 +2523,11 @@ def _translate_ai_batch(
                 )
         parsed = strategy.parse_response(str(message.get("content", "")))
         expected_ids = {item_id for item_id, _text in request_batch}
+        unexpected_ids = set(parsed) - expected_ids
+        if unexpected_ids:
+            raise ValueError(
+                f"AI response contains unexpected IDs (possible translation shift): {sorted(unexpected_ids)}"
+            )
         return {
             item_id: translated
             for item_id, translated in parsed.items()

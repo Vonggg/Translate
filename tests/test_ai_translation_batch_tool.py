@@ -54,6 +54,32 @@ def _response(items: list[dict[str, object]]) -> dict[str, object]:
 
 
 class AITranslationBatchToolTests(unittest.TestCase):
+    def test_main_batch_rejects_extra_id_and_retries_entire_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = SimpleNamespace(
+                ai_translation_base_url="https://example.invalid", ai_translation_api_key="key",
+                ai_translation_model="test-model", ai_translation_proxy_http="",
+                ai_translation_proxy_https="", ai_translation_timeout=10, stage_record_dir=Path(directory),
+            )
+            requested = []
+            payloads = iter([
+                _response([{"id":686,"translation":"兔子皮肤8"},{"id":687,"translation":"猫皮肤0"}]),
+                _response([{"id":686,"translation":"猫皮肤0"}]),
+            ])
+            session = mock.Mock()
+            def post(*args, **kwargs):
+                requested.append(json.loads(kwargs["json"]["messages"][-1]["content"])["items"])
+                response = mock.Mock()
+                response.status_code = 200
+                response.json.return_value = next(payloads)
+                return response
+            session.post.side_effect = post
+            with mock.patch("requests.Session", return_value=session):
+                result = translation._translate_ai_batch([(686,"skincat0")], cfg, _FakeStrategy(), 1, 1)
+            self.assertEqual(result, {686:"猫皮肤0"})
+            self.assertEqual(len(requested), 2)
+            self.assertEqual(requested[0], requested[1])
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.temp_dir.name)

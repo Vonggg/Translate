@@ -560,6 +560,109 @@ def test_generated_add_event_method_is_followed_across_methods() -> None:
     assert result["stats"]["delegate_add_method_count"] == 1
 
 
+def test_static_delegate_field_behind_typeinfo_is_followed_across_cast() -> None:
+    """A static Action field survives type-info indirection and castclass."""
+
+    subscribe = 0x1000
+    caller = 0x1080
+    invoke = 0x1100
+    callback = 0x1200
+    action_ctor = 0x9100
+    delegate_combine = 0x9110
+    castclass = 0x9120
+    typeinfo_slot = 0x5000
+    delegate_class_slot = 0x5010
+    method_slot = 0x5020
+    text_slot = 0x5030
+    typeinfo = 0x7000
+    delegate_class = 0x7010
+    metadata_cell = 0x7020
+
+    subscribe_words = [
+        _adrp(subscribe, typeinfo_slot, 23),
+        _ldr(23, 23, typeinfo_slot & 0xFFF),
+        _adrp(subscribe + 8, delegate_class_slot, 27),
+        _ldr(27, 27, delegate_class_slot & 0xFFF),
+        _ldr(8, 23),
+        _ldr(8, 8, 0xB8),
+        _ldr(20, 8, 0x70),
+        _ldr(0, 27),
+        _bl(subscribe + 32, 0x9200),
+        _adrp(subscribe + 36, method_slot, 8),
+        _ldr(8, 8, method_slot & 0xFFF),
+        _mov(1, 19),
+        _mov(21, 0),
+        _ldr(2, 8),
+        _bl(subscribe + 56, action_ctor),
+        _mov(0, 20),
+        _mov(1, 21),
+        _bl(subscribe + 68, delegate_combine),
+        _mov(20, 0),
+        _ldr(1, 27),
+        _bl(subscribe + 80, castclass),
+        _ldr(8, 23),
+        _ldr(21, 8, 0xB8),
+        _str(0, 21, 0x70),
+        RET,
+    ]
+    caller_words = [
+        _adrp(caller, text_slot, 0),
+        _ldr(0, 0, text_slot & 0xFFF),
+        _ldr(0, 0),
+        _bl(caller + 12, invoke),
+        RET,
+    ]
+    invoke_words = [
+        _mov(19, 0),
+        _adrp(invoke, typeinfo_slot, 21),
+        _ldr(21, 21, typeinfo_slot & 0xFFF),
+        _ldr(8, 21),
+        _ldr(8, 8, 0xB8),
+        _ldr(8, 8, 0x70),
+        _ldr(3, 8, 0x18),
+        _ldr(0, 8, 0x40),
+        _ldr(2, 8, 0x28),
+        _mov(1, 19),
+        _blr(3),
+        RET,
+    ]
+    callback_words = [_bl(callback, 0x9000), RET]
+    section = _make_section(
+        {
+            subscribe: _words(*subscribe_words),
+            caller: _words(*caller_words),
+            invoke: _words(*invoke_words),
+            callback: _words(*callback_words),
+        },
+        end=0x1300,
+    )
+    result = analyze_arm64_display_usage(
+        code_sections=[(0x1000, section)],
+        method_payload=[
+            _method(subscribe, "Game.MainScene$$Awake", "void Game_MainScene__Awake (Game_MainScene_o* __this, const MethodInfo* method);"),
+            _method(caller, "Game.MainScene$$OpenLevel", "void Game_MainScene__OpenLevel (Game_MainScene_o* __this, const MethodInfo* method);"),
+            _method(invoke, "Game.Controller$$ShowNotice", "void Game_Controller__ShowNotice (System_String_o* message, const MethodInfo* method);"),
+            _method(callback, "Game.MainScene$$OnNotice", "void Game_MainScene__OnNotice (Game_MainScene_o* __this, System_String_o* message, const MethodInfo* method);"),
+            _method(action_ctor, "System.Action<object>$$.ctor", "void System_Action_object____ctor (System_Action_object__o* __this, Il2CppObject* target, intptr_t method, const MethodInfo* method);"),
+            _method(delegate_combine, "System.Delegate$$Combine", "System_Delegate_o* System_Delegate__Combine (System_Delegate_o* a, System_Delegate_o* b, const MethodInfo* method);"),
+            TMP_SET_TEXT,
+        ],
+        addresses=[subscribe, caller, invoke, callback, 0x1300, action_ctor, delegate_combine, castclass, 0x9200, 0x9000],
+        literals={0x6000: "UNLOCK AT LEVEL {0}"},
+        slot_to_cell={text_slot: 0x6000},
+        pointer_slots={
+            typeinfo_slot: typeinfo,
+            delegate_class_slot: delegate_class,
+            method_slot: metadata_cell,
+        },
+        metadata_method_targets={metadata_cell: callback},
+    )
+
+    assert [item["value"] for item in result["exact_literals"]] == [
+        "UNLOCK AT LEVEL {0}"
+    ]
+
+
 def test_csel_and_cfg_backedge_preserve_both_displayed_literals() -> None:
     start = 0x1000
     cold = 0x1020
@@ -1123,6 +1226,160 @@ def test_virtual_tail_setter_requires_verified_slot(slot, expected):
     assert bool(result["exact_literals"]) is expected
 
 
+@pytest.mark.parametrize('clobbered', [False, True])
+def test_switch_table_index_copy_preserves_bound_but_arithmetic_does_not(clobbered) -> None:
+    start, case, slot = 0x1000, 0x1040, 0x5010
+    adr_pc = start + 20
+    adr_delta = case - adr_pc
+    section = _make_section({
+        start: _words(
+            0x7100001F | (1 << 10) | (22 << 5),  # cmp w22, #1
+            0x2A0003E0 | (22 << 16) | 8,       # mov w8, w22
+            (0x11000000 | (1 << 10) | (8 << 5) | 8) if clobbered else NOP,
+            _adrp(start + 12, 0x7000, 9), _add_immediate(9, 9, 0),
+            0x10000000 | ((adr_delta & 3) << 29) | ((adr_delta >> 2) << 5) | 10,
+            0x38606800 | (8 << 16) | (9 << 5) | 11,  # ldrb w11, [x9,x8]
+            0x8B000000 | (11 << 16) | (2 << 10) | (10 << 5) | 10,
+            0xD61F0000 | (10 << 5), RET,
+        ),
+        case: _words(_adrp(case, slot, 8), _ldr(8, 8, slot & 0xFFF), _ldr(1, 8), _bl(case + 12, 0x9000), RET),
+    }, end=0x1100)
+    result = analyze_arm64_display_usage(
+        code_sections=[(start, section)], memory_sections=[(start, section), (0x7000, b'\0\0')],
+        method_payload=[_method(start, 'Panel$$Show', 'void Panel__Show (Panel_o* __this, const MethodInfo* method);'), TMP_SET_TEXT],
+        addresses=[start, 0x1100, 0x9000], literals={0x6000: 'Copper'}, slot_to_cell={slot: 0x6000},
+    )
+    assert bool(result['exact_literals']) is not clobbered
+
+
+def test_bounded_native_string_pointer_table_reaches_display() -> None:
+    caller, table = 0x1000, 0x7000
+    words = _words(
+        _ldr(8, 0, 0x10),
+        0x7100001F | (3 << 10) | (8 << 5),  # cmp w8, #3
+        _adrp(caller + 8, table, 9),
+        _add_immediate(9, 9, table & 0xFFF),
+        _ldr_indexed(1, 9, 8) | 0x1000,  # ldr x1, [x9, x8, lsl #3]
+        _ldr(1, 1),
+        _bl(caller + 24, 0x9000),
+        RET,
+    )
+    result = analyze_arm64_display_usage(
+        code_sections=[(caller, _make_section({caller: words}, end=0x1100))],
+        method_payload=[
+            _method(caller, 'PlayerData$$Show', 'void PlayerData__Show (PlayerData_o* __this, const MethodInfo* method);'),
+            TMP_SET_TEXT,
+        ],
+        addresses=[caller, 0x1100, 0x9000],
+        literals={0x6000: 'Selina', 0x6010: 'Devil', 0x6020: 'Lifeline', 0x6030: 'Sunshine'},
+        slot_to_cell={},
+        pointer_slots={table: 0x6000, table + 8: 0x6010, table + 16: 0x6020, table + 24: 0x6030},
+    )
+    assert {row['value'] for row in result['exact_literals']} == {'Selina', 'Devil', 'Lifeline', 'Sunshine'}
+
+
+def test_freshly_constructed_concrete_model_field_connects_to_its_writer() -> None:
+    ui, constructor, writer, allocator, slot = 0x1000, 0x1100, 0x1200, 0x1300, 0x5010
+    section = _make_section({
+        ui: _words(_bl(ui, allocator), _mov(20, 0), _mov(0, 20), _bl(ui + 12, constructor),
+                   _ldr(1, 20, 0x18), _bl(ui + 20, 0x9000), RET),
+        constructor: _words(RET),
+        writer: _words(_adrp(writer, slot, 8), _ldr(8, 8, slot & 0xFFF), _ldr(1, 8),
+                       _str(1, 0, 0x18), RET),
+    }, end=0x1400)
+    result = analyze_arm64_display_usage(
+        code_sections=[(ui, section)],
+        method_payload=[
+            _method(ui, 'Panel$$Show', 'void Panel__Show (Panel_o* __this, const MethodInfo* method);'),
+            _method(constructor, 'Data.Skin$$.ctor', 'void Data_Skin___ctor (Data_Skin_o* __this, const MethodInfo* method);'),
+            _method(writer, 'Data.Skin$$SetDefaults', 'void Data_Skin__SetDefaults (Data_Skin_o* __this, const MethodInfo* method);'),
+            _method(allocator, 'Native$$Allocate', 'void* Native__Allocate (const MethodInfo* method);'),
+            TMP_SET_TEXT,
+        ],
+        addresses=[ui, constructor, writer, allocator, 0x1400, 0x9000],
+        literals={0x6000: 'Devil'}, slot_to_cell={slot: 0x6000},
+    )
+    assert [row['value'] for row in result['exact_literals']] == ['Devil']
+
+
+def test_carrier_layout_parser_rejects_ambiguous_and_static_fields(tmp_path) -> None:
+    dump = tmp_path / 'dump.cs'
+    dump.write_text('''// Namespace: A
+public class Record // TypeDefIndex: 1
+{
+    // Fields
+    public string text; // 0x18
+}
+// Namespace: B
+public class Record // TypeDefIndex: 2
+{
+    // Fields
+    public string text; // 0x18
+}
+// Namespace:
+public class Panel // TypeDefIndex: 3
+{
+    // Fields
+    private A.Record model; // 0x60
+    private Record ambiguous; // 0x68
+    private static A.Record global; // 0x0
+    private string[] names; // 0x70
+    private List<string> selected; // 0x78
+    private static string[] globalNames; // 0x8
+}
+''', encoding='utf-8')
+    layouts = DISPLAY_USAGE._parse_dump_carrier_field_types(dump)
+    assert layouts[('panel',)] == {
+        0x60: ('a', 'record'),
+        0x70: ('__string_collection__',),
+        0x78: ('__string_collection__',),
+    }
+
+
+@pytest.mark.parametrize('through_field', [False, True])
+@pytest.mark.parametrize('transformed', [False, True])
+@pytest.mark.parametrize('unrelated_owner', ['Internal.Record', 'Data.Record.Internal'])
+def test_typed_lookup_return_connects_model_constructor_to_virtual_text_setter(through_field, transformed, unrelated_owner) -> None:
+    consumer, writer, caller, lookup, unrelated = 0x1000, 0x1100, 0x1200, 0x1300, 0x1400
+    slot = 0x5010
+    section = _make_section({
+        consumer: _words(
+            _mov(19, 0), _ldr(0, 19, 0x60) if through_field else _bl(consumer + 4, lookup), _mov(20, 0),
+            _ldr(0, 19, 0x58), _ldr(8, 0), _ldr(9, 8, 0x558),
+            _ldr(1, 20, 0x18),
+            *([_bl(consumer + 28, 0x1600), _mov(1, 0), _ldr(0, 19, 0x58), _ldr(8, 0), _ldr(9, 8, 0x558)] if transformed else []),
+            _blr(9), RET),
+        writer: _words(_str_pre(2, 0, 0x18), RET),
+        unrelated: _words(_str(2, 0, 0x18), RET),
+        caller: _words(
+            _adrp(caller, slot, 8), _ldr(8, 8, slot & 0xFFF), _ldr(2, 8),
+            _bl(caller + 12, writer),
+            _adrp(caller + 16, slot + 8, 8), _ldr(8, 8, (slot + 8) & 0xFFF), _ldr(2, 8),
+            _bl(caller + 28, unrelated), RET),
+        lookup: _words(RET),
+    }, end=0x1500)
+    result = analyze_arm64_display_usage(
+        code_sections=[(0x1000, section)],
+        method_payload=[
+            _method(consumer, 'Panel$$Refresh', 'void Panel__Refresh (Panel_o* __this, const MethodInfo* method);'),
+            _method(writer, 'Data.Record$$.ctor', 'void Data_Record___ctor (Data_Record_o* __this, int32_t id, System_String_o* text, const MethodInfo* method);'),
+            _method(unrelated, unrelated_owner + '$$.ctor', f'void Internal_Record___ctor ({unrelated_owner.replace(".", "_")}_o* __this, int32_t id, System_String_o* text, const MethodInfo* method);'),
+            _method(caller, 'Data$$Load', 'void Data__Load (Data_o* __this, const MethodInfo* method);'),
+            _method(lookup, 'Data$$Lookup', 'Data_Record_o* Data__Lookup (Data_o* __this, const MethodInfo* method);'),
+            _method(0x1600, 'System.String$$Concat', 'System_String_o* System_String__Concat (System_String_o* a, System_String_o* b, const MethodInfo* method);'),
+        ], addresses=[consumer, writer, caller, lookup, unrelated, 0x1500, 0x1600],
+        literals={0x6000: 'An arbitrary objective without a number', 0x6008: 'internal_key'},
+        slot_to_cell={slot: 0x6000, slot + 8: 0x6008},
+        display_fields_by_method={consumer: {0x58: 'UnityEngine.UI.Text'}},
+        carrier_field_types={('panel',): {0x60: ('data', 'record')}},
+    )
+    rows = result['derived_influence' if transformed else 'exact_literals']
+    assert [row['value'] for row in rows] == ['An arbitrary objective without a number']
+    if not through_field:
+        assert any('Data$$Lookup returns Data_Record_o*' in e['path']
+                   for e in rows[0]['evidence'])
+
+
 def test_persisted_model_string_field_reaches_later_popup_consumer() -> None:
     consumer = 0x1000
     writer = 0x1100
@@ -1252,6 +1509,76 @@ def test_literal_written_directly_to_model_field_reaches_consumer() -> None:
     assert "persisted confirmable field +0x38" in result["exact_literals"][0][
         "evidence"
     ][0]["path"]
+
+
+def test_list_getter_to_second_model_field_reaches_display() -> None:
+    ui, writer, loader, getter, get_item, producer, add, allocate = range(0x1000, 0x1800, 0x100)
+    slot = 0x5010
+    code = _make_section({
+        ui: _words(_ldr(1, 1, 0x18), _bl(ui + 4, 0x9000), RET),
+        writer: _words(_str(1, 0, 0x18), RET),
+        loader: _words(_bl(loader, getter), _bl(loader + 4, get_item), _mov(1, 0), _bl(loader + 12, writer), RET),
+        getter: _words(_ldr(0, 0, 0x60), RET),
+        producer: _words(_mov(19, 0), _bl(producer + 4, allocate), _mov(20, 0),
+                         _adrp(producer + 12, slot, 8), _ldr(8, 8, slot & 0xFFF), _ldr(1, 8),
+                         _mov(0, 20), _bl(producer + 28, add), _str(20, 19, 0x60), RET),
+    }, end=0x1800)
+    result = analyze_arm64_display_usage(
+        code_sections=[(ui, code)],
+        method_payload=[
+            _method(ui, 'Panel$$Show', 'void Panel__Show (Panel_o* __this, Row_o* row, const MethodInfo* method);'),
+            _method(writer, 'Row$$.ctor', 'void Row___ctor (Row_o* __this, System_String_o* name, const MethodInfo* method);'),
+            _method(loader, 'Store$$Load', 'void Store__Load (Store_o* __this, const MethodInfo* method);'),
+            _method(getter, 'Store$$Names', 'System_Collections_Generic_List_string__o* Store__Names (Store_o* __this, const MethodInfo* method);'),
+            _method(get_item, 'System.Collections.Generic.List<string>$$get_Item', 'System_String_o* List__get_Item (System_Collections_Generic_List_string__o* __this, int32_t index, const MethodInfo* method);'),
+            _method(producer, 'Store$$.ctor', 'void Store___ctor (Store_o* __this, const MethodInfo* method);'),
+            _method(add, 'System.Collections.Generic.List<string>$$Add', 'void List__Add (System_Collections_Generic_List_string__o* __this, System_String_o* value, const MethodInfo* method);'),
+            _method(allocate, 'Native$$Allocate', 'void* Native__Allocate (const MethodInfo* method);'), TMP_SET_TEXT,
+        ], addresses=[ui, writer, loader, getter, get_item, producer, add, allocate, 0x1800, 0x9000],
+        literals={0x6000: 'Brittany'}, slot_to_cell={slot: 0x6000},
+    )
+    assert 'Brittany' in {r['value'] for k in ('exact_literals', 'derived_influence') for r in result[k]}
+
+
+def test_array_to_random_list_to_model_display_preserves_owner() -> None:
+    ui, writer, loader, getter, get_item, producer, add, allocate, setter, reset, to_list = range(0x1000, 0x1B00, 0x100)
+    slot, noise_slot = 0x5010, 0x5020
+    code = _make_section({
+        ui: _words(_ldr(1, 1, 0x18), _bl(ui + 4, 0x9000), RET),
+        writer: _words(_str(1, 0, 0x18), RET),
+        loader: _words(_bl(loader, getter), _bl(loader + 4, get_item), _mov(1, 0), _bl(loader + 12, writer), RET),
+        getter: _words(_ldr(0, 0, 0x60), RET),
+        setter: _words(_str(1, 0, 0x60), RET),
+        producer: _words(_mov(19, 0), _bl(producer + 4, allocate), _mov(20, 0),
+                         _adrp(producer + 12, slot, 8), _ldr(8, 8, slot & 0xFFF), _ldr(1, 8),
+                         _str(1, 20, 0x20), _str(20, 19, 0x50),
+                         _bl(producer + 32, allocate), _mov(20, 0),
+                         _adrp(producer + 40, noise_slot, 8), _ldr(8, 8, noise_slot & 0xFFF), _ldr(1, 8),
+                         _str(1, 20, 0x60), RET),
+        reset: _words(_mov(19, 0), _ldr(0, 19, 0x50), _bl(reset + 8, to_list),
+                      _bl(reset + 12, get_item), _mov(21, 0), _bl(reset + 20, allocate),
+                      _mov(20, 0), _mov(1, 21), _bl(reset + 32, add),
+                      _mov(0, 19), _mov(1, 20), _bl(reset + 44, setter), RET),
+    }, end=0x1B00)
+    result = analyze_arm64_display_usage(
+        code_sections=[(ui, code)],
+        method_payload=[
+            _method(ui, 'Panel$$Show', 'void Panel__Show (Panel_o* __this, Row_o* row, const MethodInfo* method);'),
+            _method(writer, 'Row$$.ctor', 'void Row___ctor (Row_o* __this, System_String_o* name, const MethodInfo* method);'),
+            _method(loader, 'Store$$Load', 'void Store__Load (Store_o* __this, const MethodInfo* method);'),
+            _method(getter, 'Store$$Names', 'System_Collections_Generic_List_string__o* Store__Names (Store_o* __this, const MethodInfo* method);'),
+            _method(setter, 'Store$$SetNames', 'void Store__SetNames (Store_o* __this, System_Collections_Generic_List_string__o* value, const MethodInfo* method);'),
+            _method(reset, 'Store$$Reset', 'void Store__Reset (Store_o* __this, const MethodInfo* method);'),
+            _method(get_item, 'System.Collections.Generic.List<object>$$get_Item', 'Il2CppObject* List__get_Item (System_Collections_Generic_List_object__o* __this, int32_t index, const MethodInfo* method);'),
+            _method(producer, 'Store$$.ctor', 'void Store___ctor (Store_o* __this, const MethodInfo* method);'),
+            _method(add, 'System.Collections.Generic.List<object>$$AddWithResize', 'void List__AddWithResize (System_Collections_Generic_List_object__o* __this, Il2CppObject* value, const MethodInfo* method);'),
+            _method(to_list, 'System.Linq.Enumerable$$ToList<object>', 'System_Collections_Generic_List_object__o* Enumerable__ToList (System_Collections_Generic_IEnumerable_object__o* source, const MethodInfo* method);'),
+            _method(allocate, 'Native$$Allocate', 'void* Native__Allocate (const MethodInfo* method);'), TMP_SET_TEXT,
+        ], addresses=[*range(ui, 0x1C00, 0x100), 0x9000],
+        literals={0x6000: 'Brittany', 0x6010: 'InternalKey'}, slot_to_cell={slot: 0x6000, noise_slot: 0x6010},
+        carrier_field_types={('store',): {0x50: ('__string_collection__',)}},
+    )
+    assert {r['value'] for k in ('exact_literals', 'derived_influence') for r in result[k]} == {'Brittany'}
 
 
 def test_instance_dictionary_contents_reach_display_across_methods() -> None:
@@ -1858,6 +2185,34 @@ public enum AmmoTypes
         }
     ]
     assert result["display_enum_types"][0]["evidence"]
+
+
+@pytest.mark.parametrize('displayed', [True, False])
+def test_enum_return_helper_preserves_type_until_virtual_display(displayed) -> None:
+    caller, helper, enum_to_string, enum_slot = 0x1000, 0x1100, 0x1200, 0x5010
+    caller_words = [
+        _mov(19, 0), _bl(caller + 4, helper), _mov(1, 0),
+        _ldr(0, 19, 0x58), _ldr(8, 0), _ldr(9, 8, 0x558),
+        _blr(9) if displayed else NOP, RET,
+    ]
+    helper_words = [
+        _adrp(helper, enum_slot, 8), _ldr(8, 8, enum_slot & 0xFFF),
+        _ldr(8, 8), _str(8, 31), _add_immediate(0, 31, 0),
+        _bl(helper + 20, enum_to_string), RET,
+    ]
+    result = analyze_arm64_display_usage(
+        code_sections=[(caller, _make_section({caller: _words(*caller_words), helper: _words(*helper_words)}, end=0x1300))],
+        method_payload=[
+            _method(caller, 'Panel$$Refresh', 'void Panel__Refresh (Panel_o* __this, const MethodInfo* method);'),
+            _method(helper, 'Panel$$Title', 'System_String_o* Panel__Title (Panel_o* __this, const MethodInfo* method);'),
+            _method(enum_to_string, 'System.Enum$$ToString', 'System_String_o* System_Enum__ToString (System_Enum_o* __this, const MethodInfo* method);'),
+        ], addresses=[caller, helper, enum_to_string, 0x1300],
+        literals={}, slot_to_cell={}, pointer_slots={enum_slot: 0x7000},
+        enum_type_by_pointer_slot={enum_slot: 'Ability'},
+        enum_members_by_type={'Ability': ('SuperSpeed', 'DoubleCoin')},
+        display_fields_by_method={caller: {0x58: 'UnityEngine.UI.Text'}},
+    )
+    assert [r['enum_type'] for r in result['display_enum_types']] == (['Ability'] if displayed else [])
 
 
 def test_enum_tostring_not_reaching_display_is_not_selected() -> None:

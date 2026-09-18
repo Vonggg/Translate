@@ -22,6 +22,9 @@ _ARRAY_INDEX_RE = re.compile(r"\[\]")
 _TRUSTED_VISIBLE_FIELDS = {
     "m_text",
     "m_Text",
+    # NGUI UILabel 的序列化显示文本。它不像 UGUI/TMP 使用下划线命名，
+    # 但同样是直接呈现在界面上的内容，不能交给 unknown 字段筛选丢弃。
+    "mText",
 }
 
 _TRUSTED_EMBEDDED_VISIBLE_LEAVES = {
@@ -243,7 +246,7 @@ def classify_local_string_field(
     samples = tuple(value for value in sample_values if isinstance(value, str))
 
     if field_path in _TRUSTED_VISIBLE_FIELDS:
-        return LocalFieldDecision("allow", "Unity Text/TMP 直接文本字段")
+        return LocalFieldDecision("allow", "Unity Text/TMP/NGUI 直接文本字段")
     if (
         field_path.startswith("m_Script.json.")
         and _semantic_names(field_path) & _TRUSTED_EMBEDDED_VISIBLE_LEAVES

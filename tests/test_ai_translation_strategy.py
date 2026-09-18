@@ -8,6 +8,15 @@ from pipeline.deepseek_translation_strategy import DeepSeekTranslationStrategy
 
 
 class AITranslationStrategyTests(unittest.TestCase):
+    def test_duplicate_and_boolean_ids_are_rejected(self):
+        strategy = DefaultAITranslationStrategy(SimpleNamespace())
+        for content in (
+            '{"items":[{"id":1,"translation":"a"},{"id":1,"translation":"b"}]}',
+            '{"items":[{"id":true,"translation":"a"}]}',
+        ):
+            with self.assertRaises(ValueError):
+                strategy.parse_response(content)
+
     def test_display_person_names_require_chinese_in_batch_prompts(self) -> None:
         cfg = SimpleNamespace()
         for strategy in (DefaultAITranslationStrategy(cfg), DeepSeekTranslationStrategy(cfg)):
