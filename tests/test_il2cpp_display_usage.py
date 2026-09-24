@@ -476,7 +476,8 @@ def test_custom_delegate_subscription_chain_reaches_display_callback() -> None:
     assert result["stats"]["delegate_subscription_field_count"] == 1
 
 
-def test_generated_add_event_method_is_followed_across_methods() -> None:
+@pytest.mark.parametrize("atomic_subscription", ["store", "cas", "cas_tail", "not_cas"])
+def test_generated_add_event_method_is_followed_across_methods(atomic_subscription) -> None:
     """Delegate.Combine inside add_Event is connected to its subscribing caller."""
 
     add_event = 0x1000
@@ -497,6 +498,29 @@ def test_generated_add_event_method_is_followed_across_methods() -> None:
         _str(0, 19, 0x40),
         RET,
     ]
+    wrapper, atomic = 0xA000, 0xA100
+    native_sections = []
+    if atomic_subscription != "store":
+        # ldr x21, [x19, #0x40]! leaves a field ADDRESS in x19,
+        # not the field value. A native cast follows Delegate.Combine.
+        add_words = [
+            _mov(19, 0), 0xF8440E75, _mov(0, 21),
+            _bl(add_event + 12, delegate_combine),
+            _bl(add_event + 16, 0xB000), _mov(1, 0),
+            _mov(0, 19), _mov(2, 21), _bl(add_event + 32, wrapper), RET,
+        ]
+        native_sections = [
+            (wrapper, _words(0xF81E0FFE, 0xA9014FF4, _mov(20, 0), _mov(19, 2),
+                             _mov(0, 2), _mov(2, 20), _bl(wrapper + 24, atomic),
+                             0xEB13001F, 0xD5033BBF, 0x9A800273, _mov(0, 20),
+                             _bl(wrapper + 44, 0xB100), _mov(0, 19),
+                             0xA9414FF4, 0xF84207FE, RET)),
+            (atomic, _words(0xD503245F, _adrp(atomic + 4, 0xC000, 16),
+                            0x39600210, 0x34000070,
+                            0xC8E0FC41 if atomic_subscription != "not_cas" else 0xD503201F,
+                            RET, _mov(16, 0), 0xC85FFC40, 0xEB10001F,
+                            0x54000061, 0xC811FC41, 0x35FFFF91, RET)),
+        ]
     subscribe_words = [
         _adrp(subscribe, object_slot, 23),
         _ldr(23, 23, object_slot & 0xFFF),
@@ -526,6 +550,12 @@ def test_generated_add_event_method_is_followed_across_methods() -> None:
         _blr(9),
         RET,
     ]
+    if atomic_subscription == "cas_tail":
+        # UI.this -> handler field -> tail add_Message; Raise receives the
+        # handler itself. The owning UI type must not become the event key.
+        subscribe_words[:3] = [_mov(23, 0), _ldr(23, 23, 0x40), 0xD503201F]
+        subscribe_words[11] = _b(subscribe + 44, add_event)
+        invoke_words[:3] = [_mov(8, 0), 0xD503201F, 0xD503201F]
     callback_words = [_bl(callback, 0x9000), RET]
     section = _make_section(
         {
@@ -537,7 +567,7 @@ def test_generated_add_event_method_is_followed_across_methods() -> None:
         end=0x1400,
     )
     result = analyze_arm64_display_usage(
-        code_sections=[(0x1000, section)],
+        code_sections=[(0x1000, section), *native_sections],
         method_payload=[
             _method(add_event, "Game.EventBus$$add_Message", "void Game_EventBus__add_Message (Game_EventBus_o* __this, Game_MessageDelegate_o* value, const MethodInfo* method);"),
             _method(subscribe, "Game.PlayUI$$Start", "void Game_PlayUI__Start (Game_PlayUI_o* __this, const MethodInfo* method);"),
@@ -554,6 +584,10 @@ def test_generated_add_event_method_is_followed_across_methods() -> None:
         metadata_method_targets={metadata_cell: callback},
     )
 
+    if atomic_subscription == "not_cas":
+        assert not result["exact_literals"]
+        assert result["stats"]["delegate_add_method_count"] == 0
+        return
     assert [item["value"] for item in result["exact_literals"]] == [
         "Cross-method event"
     ]

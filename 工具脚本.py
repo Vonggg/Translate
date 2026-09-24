@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -900,6 +901,8 @@ def _sprite_render_data_with_scope(
         if atlas_scope is not None and atlas_path_id and isinstance(render_key, dict):
             atlas_entry = _scope_entry(atlas_scope, ("SpriteAtlas",), atlas_path_id)
             atlas_data = _entry_data(atlas_entry) if atlas_entry else None
+            if atlas_data is None:
+                atlas_data = _recover_preview_sprite_atlas(atlas_scope, atlas_path_id)
             if isinstance(atlas_data, dict):
                 render_map = atlas_data.get("m_RenderDataMap")
                 if isinstance(render_map, dict):
@@ -915,6 +918,31 @@ def _sprite_render_data_with_scope(
     if not isinstance(value, dict):
         value = sprite_data.get("m_RenderData")
     return (value if isinstance(value, dict) else {}), scope
+
+
+def _recover_preview_sprite_atlas(scope: dict, path_id: int) -> dict | None:
+    """Older exports omit SpriteAtlas; read its exact metadata from staging."""
+    from support.sprite_atlas_recovery import recover_sprite_atlas
+
+    relative_source = str(scope.get("source", ""))
+    if not relative_source:
+        return None
+    staging = (
+        _DEFAULT_CONFIG.resource_staging_root
+        if _DEFAULT_CONFIG is not None else DEFAULT_WORKSPACE_ROOT / "input_sources"
+    )
+    source = Path(staging) / relative_source
+    if not source.is_file():
+        return None
+    try:
+        return recover_sprite_atlas(source, str(scope.get("bundle_entry", "")), path_id)
+    except Exception as exc:
+        # Missing optional decoder/type support must not abort the entire tree.
+        warned = scope.setdefault("_atlas_recovery_warnings", set())
+        if path_id not in warned:
+            warned.add(path_id)
+            print(f"[层级预览][图集] 无法补读 {source.name} / {path_id}: {exc}")
+        return None
 
 
 def _number(value: object, default: float = 0.0) -> float:
@@ -3463,7 +3491,7 @@ def _preview_split_image_path(
     bundle_entry: str,
     sprite_name: str = "",
 ) -> str:
-    mapping = _safe_read_json(DEFAULT_ALL_SPRITE_MAP)
+    mapping = _preview_mapping(DEFAULT_ALL_SPRITE_MAP)
     items = mapping.get("items") if isinstance(mapping, dict) else None
     if not isinstance(items, list):
         return ""
@@ -3502,25 +3530,44 @@ def _preview_split_image_path(
     return ""
 
 
+@lru_cache(maxsize=4)
+def _read_preview_mapping(path: str, modified_ns: int, size: int):
+    return _safe_read_json(Path(path))
+
+
+def _preview_mapping(path: Path):
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return _read_preview_mapping(str(path), stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=4)
+def _preview_allpng_index(path: str, modified_ns: int, size: int, source_default: str):
+    mapping = _read_preview_mapping(path, modified_ns, size)
+    if not isinstance(mapping, dict):
+        return {}
+    source_root = Path(str(mapping.get("source_root", source_default)))
+    return {
+        os.path.normcase(os.path.abspath(source_root / item["original_relative_path"])): item["flat_name"]
+        for item in mapping.get("items", [])
+        if isinstance(item, dict) and item.get("original_relative_path") and item.get("flat_name")
+    }
+
+
 def _preview_allpng_path(export_path: str) -> str:
     if not export_path:
         return ""
-    mapping = _safe_read_json(DEFAULT_ALL_IMAGE_MAP)
-    if not isinstance(mapping, dict):
+    try:
+        stat = DEFAULT_ALL_IMAGE_MAP.stat()
+    except OSError:
         return ""
-    source_root = Path(str(mapping.get("source_root", DEFAULT_SOURCE_ROOT)))
+    index = _preview_allpng_index(str(DEFAULT_ALL_IMAGE_MAP), stat.st_mtime_ns,
+                                 stat.st_size, str(DEFAULT_SOURCE_ROOT))
     wanted = os.path.normcase(os.path.abspath(export_path))
-    for item in mapping.get("items", []):
-        if not isinstance(item, dict):
-            continue
-        original_relative = str(item.get("original_relative_path", "")).strip()
-        flat_name = str(item.get("flat_name", "")).strip()
-        if not original_relative or not flat_name:
-            continue
-        original_path = source_root / Path(original_relative)
-        if os.path.normcase(os.path.abspath(original_path)) == wanted:
-            return str(DEFAULT_ALL_IMAGE_PNG_ROOT / flat_name)
-    return ""
+    flat_name = index.get(wanted)
+    return str(DEFAULT_ALL_IMAGE_PNG_ROOT / flat_name) if flat_name else ""
 
 
 def _preview_sprite_resource_records(scope: dict, sprite_path_id: int) -> list[dict]:
@@ -3768,8 +3815,29 @@ def _preview_component(scope: dict, game_object_data: dict) -> tuple[dict, objec
                 continue
             image = _preview_sprite_image(sprite_scope, sprite_path_id)
             if image is not None:
-                return data, image
+                return {**data, "_preview_component_type": component_type}, image
     return None
+
+
+def _preview_sprite_renderer_rect(scope, component, image, rect, scale):
+    file_id, path_id = _pptr(component.get("m_Sprite"))
+    sprite_scope = _resolve_pointer_scope(scope, file_id)
+    entry = _scope_entry(sprite_scope, ("Sprite",), path_id) if sprite_scope else None
+    data = _entry_data(entry) if entry else None
+    if not data:
+        return rect
+    ppu = max(0.001, _number(data.get("m_PixelsToUnits"), 100.0))
+    original = data.get("m_Rect", {})
+    pivot = _vec2(data.get("m_Pivot"), (0.5, 0.5))
+    render = _sprite_render_data(data, sprite_scope)
+    offset = _vec2(render.get("textureRectOffset"), (0.0, 0.0))
+    width, height = image.size
+    # Transform origin is the original sprite pivot, not its trimmed center.
+    cx = (offset[0] + width / 2 - _number(original.get("width"), width) * pivot[0]) / ppu
+    cy = (offset[1] + height / 2 - _number(original.get("height"), height) * pivot[1]) / ppu
+    w, h = width * abs(scale[0]) / ppu, height * abs(scale[1]) / ppu
+    return (rect[0] + rect[2] / 2 + cx * scale[0] - w / 2,
+            rect[1] + rect[3] / 2 + cy * scale[1] - h / 2, w, h)
 
 
 def _has_unresolved_preview_sprite(scope: dict, game_object_data: dict) -> bool:
@@ -3995,10 +4063,16 @@ def _create_object_hierarchy_preview(match: dict, root_level: int, scopes: dict)
         if component:
             component_data, sprite = component
             component_rect = visual_rect
+            if component_data.get("_preview_component_type") == "SpriteRenderer":
+                component_rect = _preview_sprite_renderer_rect(
+                    scope, component_data, sprite, rect, world_scale
+                )
+                node_rects[object_id] = component_rect
             # LayoutGroup/Slider-driven RectTransforms can serialize as 0x0 and
             # only receive their size at runtime.  Keep those images inspectable
             # by falling back to their decoded native dimensions.
-            if component_rect[2] <= 2.0 and component_rect[3] <= 2.0:
+            if (component_data.get("_preview_component_type") != "SpriteRenderer"
+                    and component_rect[2] <= 2.0 and component_rect[3] <= 2.0):
                 native_width = max(1.0, float(sprite.width) * abs(world_scale[0]))
                 native_height = max(1.0, float(sprite.height) * abs(world_scale[1]))
                 if parent_rect is not None:
@@ -5969,6 +6043,8 @@ def _show_interactive_object_preview(target: Path, scopes: dict | None = None) -
             f"{'所在链路' if mode == 'chain' else '完整子树'}，"
             f"框选节点={len(nodes)}，图片上下文节点={len(image_nodes)}"
         )
+        if not any(node.get("image_resources") or node.get("texts") for node in image_nodes):
+            status.set("此子树没有可绘制图片；右键选择“查看完整图片上下文”可查看并列分支。")
         _print_preview_tree_selection(metadata, selected_copy, nodes, mode)
 
     def on_entry_selected(_event=None) -> None:
@@ -6036,6 +6112,11 @@ def _show_interactive_object_preview(target: Path, scopes: dict | None = None) -
         if not isinstance(region, dict):
             return "break"
         menu = tk.Menu(window, tearoff=False)
+        menu.add_command(
+            label="查看完整图片上下文（包含并列分支）",
+            command=lambda: refresh_for_path_id(int(metadata.get("root_object_id", 0))),
+        )
+        menu.add_separator()
         blocked = is_blocked_node(region)
         menu.add_command(
             label="屏蔽此层级 Object",

@@ -16,12 +16,28 @@ from pipeline.dynamic_translation_dictionary import (
     STRINGLITERAL_FILTERED_OUT_FILENAME,
     STRINGLITERAL_TRANSLATIONS_FILENAME,
     cpp_utf16_literal,
+    extract_native_unity_translation_dictionary_entries_by_role,
     extract_stringliteral_candidates,
     generate_dynamic_translation_dictionary,
     render_dynamic_translation_dictionary,
     select_whole_text_dictionary_entries,
     write_trans_json_to_whole_text_dictionary,
 )
+
+
+def test_countdown_format_fragments_preserve_runtime_number_and_color(tmp_path):
+    source = "The floor will become lava in<color=red> {0} </color>seconds"
+    translation = "距离地面变成熔岩还有<color=red> {0} </color>秒"
+    cpp = render_dynamic_translation_dictionary(
+        {source: translation}, whole_sources=[], substring_sources=[source]
+    )
+    path = tmp_path / "countdown.cpp"
+    path.write_text(cpp, encoding="utf-8")
+    entries = extract_native_unity_translation_dictionary_entries_by_role(path)
+    text = source.format(23)
+    for original, translated in entries["substring"]:
+        text = text.replace(original, translated)
+    assert text == translation.format(23)
 
 
 class DynamicTranslationDictionaryTests(unittest.TestCase):

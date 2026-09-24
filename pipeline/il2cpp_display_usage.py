@@ -28,7 +28,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 AARCH64_RELATIVE_RELOCATION = 1027
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 # Large UI refresh methods frequently merge dozens of independent labels before
 # reaching a shared setter.  A budget of 32 dropped most of those values at CFG
 # joins (and made the later sink list look much smaller than the real UI).  Keep
@@ -1620,6 +1620,45 @@ def _canonical_register(md: Any, register_id: int) -> str:
     return name
 
 
+def _is_native_reference_compare_exchange(code_sections, target: int, md: Any) -> bool:
+    """Prove the ARM64 IL2CPP reference CAS wrapper and its atomic callee.
+
+    No symbol/name/address heuristic: reject wrappers whose instructions or
+    argument permutation differ. The second call is the GC write barrier.
+    """
+    def read(address, count):
+        part = _find_code_slice(code_sections, MethodRecord(address, address + count * 4, "", ""))
+        return list(md.disasm(part[1], address)) if part else []
+
+    ins = read(target, 16)
+    expected = [
+        ("str", "x30, [sp, #-0x20]!"), ("stp", "x20, x19, [sp, #0x10]"),
+        ("mov", "x20, x0"), ("mov", "x19, x2"), ("mov", "x0, x2"),
+        ("mov", "x2, x20"), ("bl", None), ("cmp", "x0, x19"),
+        ("dmb", "ish"), ("csel", "x19, x19, x0, eq"),
+        ("mov", "x0, x20"), ("bl", None), ("mov", "x0, x19"),
+        ("ldp", "x20, x19, [sp, #0x10]"), ("ldr", "x30, [sp], #0x20"), ("ret", ""),
+    ]
+    if len(ins) != len(expected) or any(i.mnemonic != name or (args is not None and i.op_str != args)
+                                           for i, (name, args) in zip(ins, expected)):
+        return False
+    atomic = read(ins[6].operands[0].imm, 13)
+    if len(atomic) != 13:
+        return False
+    # Runtime CPU feature check selects LSE CAS or the equivalent exclusive loop.
+    fixed = {0: ("bti", "c"), 4: ("casal", "x0, x1, [x2]"), 5: ("ret", ""),
+             6: ("mov", "x16, x0"), 7: ("ldaxr", "x0, [x2]"),
+             8: ("cmp", "x0, x16"), 10: ("stlxr", "w17, x1, [x2]"), 12: ("ret", "")}
+    return (all((atomic[n].mnemonic, atomic[n].op_str) == pair for n, pair in fixed.items())
+            and atomic[1].mnemonic == "adrp" and atomic[1].op_str.startswith("x16, ")
+            and atomic[2].mnemonic == "ldrb" and atomic[2].op_str.startswith("w16, [x16")
+            and atomic[3].mnemonic == "cbz" and atomic[3].op_str.startswith("w16, ")
+            and atomic[3].operands[-1].imm == atomic[6].address
+            and atomic[9].mnemonic == "b.ne" and atomic[9].operands[-1].imm == atomic[12].address
+            and atomic[11].mnemonic == "cbnz" and atomic[11].op_str.startswith("w17, ")
+            and atomic[11].operands[-1].imm == atomic[7].address)
+
+
 def _create_arm64_disassembler() -> Any:
     try:
         from capstone import CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN, Cs
@@ -2407,6 +2446,24 @@ def _analyse_method(
             return (root, path) if root is not None else None
         return None
 
+    def record_delegate_add(target: int, state: AbstractState) -> None:
+        for delegate_register, field_path in delegate_add_sinks_by_address.get(target, ()):
+            callbacks = {v.source for v in _state_values(state, delegate_register)
+                         if v.kind in {"delegate_target", "delegate_combined"}}
+            if not callbacks:
+                continue
+            callee = methods_by_address.get(target)
+            for receiver in _state_values(state, "x0"):
+                # For a typed instance call, the field belongs to the callee's
+                # receiver type, not the view which stores that receiver.
+                if receiver.kind in {"object_this", "object_param"} and callee is not None:
+                    root = _event_family_root(_method_object_family(callee))
+                    key = (root, tuple(f"{n:X}" for n in field_path)) if root is not None else None
+                else:
+                    key = event_key_for_value(receiver, field_path)
+                if key is not None:
+                    result.delegate_subscriptions[key].update(callbacks)
+
     def container_keys(
         values: Iterable[AbstractValue],
     ) -> tuple[tuple[str, int, tuple[str, ...]], ...]:
@@ -2510,6 +2567,9 @@ def _analyse_method(
             return
         updated: set[AbstractValue] = set()
         for value in _state_values(state, base_register):
+            if value.kind == "object_this":
+                updated.add(AbstractValue("instance_field_address", value.source, value.origin,
+                                          value.transforms + (f"{displacement:X}",)))
             if value.kind in {"address", "stack_address", "this"}:
                 updated.add(
                     AbstractValue(
@@ -2857,19 +2917,7 @@ def _analyse_method(
                 call_x0 = _state_values(state, "x0")
                 for sink in sinks_by_address.get(target, ()):
                     record_sink(pc, sink, _state_values(state, sink.argument_register))
-                for delegate_register, field_path in delegate_add_sinks_by_address.get(
-                    target, ()
-                ):
-                    callback_targets = {
-                        value.source
-                        for value in _state_values(state, delegate_register)
-                        if value.kind in {"delegate_target", "delegate_combined"}
-                    }
-                    if callback_targets:
-                        for receiver in call_x0:
-                            key = event_key_for_value(receiver, field_path)
-                            if key is not None:
-                                result.delegate_subscriptions[key].update(callback_targets)
+                record_delegate_add(target, state)
 
                 transform = transforms_by_address.get(target)
                 transformed_values: set[AbstractValue] = set()
@@ -3043,6 +3091,14 @@ def _analyse_method(
                                     value.origin,
                                 )
                             )
+                combined_parameters = [v for v in _state_values(state, "x1")
+                                       if v.kind == "delegate_combined_param"]
+                field_addresses = [v for v in call_x0 if v.kind == "instance_field_address"]
+                if combined_parameters and field_addresses and _is_native_reference_compare_exchange(code_sections, target, md):
+                    for address in field_addresses:
+                        path = tuple(int(part, 16) for part in address.transforms)
+                        for value in combined_parameters:
+                            result.delegate_parameter_field_writes.append((value.source, path, pc))
                 for returned in return_summaries_by_address.get(target, ()):
                     if returned.kind in {"exact", "derived", "enum_text"}:
                         transformed_values.add(
@@ -3134,7 +3190,7 @@ def _analyse_method(
                     transformed_values.update(
                         value
                         for value in call_x0
-                        if value.kind in {"delegate_combined", "delegate_target"}
+                        if value.kind in {"delegate_combined", "delegate_target", "delegate_combined_param"}
                     )
                     transformed_values.add(AbstractValue("call_result", pc, pc))
                 _set_register(state, "x0", transformed_values)
@@ -3419,6 +3475,7 @@ def _analyse_method(
             if target in instruction_map:
                 successors = [target]
             else:
+                record_delegate_add(target, state)
                 for sink in sinks_by_address.get(target, ()):
                     record_sink(pc, sink, _state_values(state, sink.argument_register))
                 target_method = methods_by_address.get(target)
